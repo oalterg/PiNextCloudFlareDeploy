@@ -1,5 +1,5 @@
 #!/bin/bash
-# setup.sh — Raspberry Pi Nextcloud + Cloudflare Tunnel full setup
+# setup.sh — Raspberry Pi Nextcloud + Cloudflare Tunnel full setup (merged & optimized)
 
 set -e
 
@@ -49,19 +49,12 @@ MYSQL_DATABASE="nextcloud"
 USER_HOME=$(eval echo "~$SUDO_USER")
 NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
 
-if [[ ! -d "$NEXTCLOUD_DATA_DIR" ]]; then
-    echo "Nextcloud data directory $NEXTCLOUD_DATA_DIR not found — creating..."
-    mkdir -p "$NEXTCLOUD_DATA_DIR"
-    chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
-fi
+[[ -d "$NEXTCLOUD_DATA_DIR" ]] || mkdir -p "$NEXTCLOUD_DATA_DIR"
+chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
 
 read -rp "Backup directory [/mnt/backupssd]: " BACKUP_DIR
 BACKUP_DIR=${BACKUP_DIR:-/mnt/backupssd}
-
-if [[ ! -d "$BACKUP_DIR" ]]; then
-    echo "Backup directory $BACKUP_DIR not found — creating..."
-    mkdir -p "$BACKUP_DIR"
-fi
+[[ -d "$BACKUP_DIR" ]] || mkdir -p "$BACKUP_DIR"
 
 read -rp "Cloudflare API token: " CF_API_TOKEN
 
@@ -110,10 +103,7 @@ ZONE_ID=$(curl -s -X GET "$CF_API_BASE/zones?name=$BASE_DOMAIN" \
   -H "Authorization: Bearer $CF_API_TOKEN" \
   -H "Content-Type: application/json" | jq -r '.result[0].id')
 
-if [[ "$ZONE_ID" == "null" || -z "$ZONE_ID" ]]; then
-    echo "Error: Could not find Zone ID for $BASE_DOMAIN"
-    exit 1
-fi
+[[ -z "$ZONE_ID" || "$ZONE_ID" == "null" ]] && { echo "Error: Could not find Zone ID for $BASE_DOMAIN"; exit 1; }
 
 RECORD_ID=$(curl -s -X GET "$CF_API_BASE/zones/$ZONE_ID/dns_records?name=$NEXTCLOUD_TRUSTED_DOMAINS" \
   -H "Authorization: Bearer $CF_API_TOKEN" \
@@ -125,17 +115,12 @@ if [[ "$RECORD_ID" != "null" && -n "$RECORD_ID" ]]; then
     CURRENT_TARGET=$(curl -s -X GET "$CF_API_BASE/zones/$ZONE_ID/dns_records/$RECORD_ID" \
       -H "Authorization: Bearer $CF_API_TOKEN" \
       -H "Content-Type: application/json" | jq -r '.result.content')
-    if [[ "$CURRENT_TARGET" != "$DESIRED_TARGET" ]]; then
-        echo "Updating DNS..."
-        curl -s -X PUT "$CF_API_BASE/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-          -H "Authorization: Bearer $CF_API_TOKEN" \
-          -H "Content-Type: application/json" \
-          --data "{\"type\":\"CNAME\",\"name\":\"$NEXTCLOUD_TRUSTED_DOMAINS\",\"content\":\"$DESIRED_TARGET\",\"ttl\":1,\"proxied\":true}" >/dev/null
-    else
-        echo "DNS already correct."
-    fi
+    [[ "$CURRENT_TARGET" != "$DESIRED_TARGET" ]] && \
+      curl -s -X PUT "$CF_API_BASE/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"CNAME\",\"name\":\"$NEXTCLOUD_TRUSTED_DOMAINS\",\"content\":\"$DESIRED_TARGET\",\"ttl\":1,\"proxied\":true}" >/dev/null
 else
-    echo "Creating DNS..."
     curl -s -X POST "$CF_API_BASE/zones/$ZONE_ID/dns_records" \
       -H "Authorization: Bearer $CF_API_TOKEN" \
       -H "Content-Type: application/json" \
@@ -159,41 +144,8 @@ CF_API_TOKEN=$CF_API_TOKEN
 EOF
 
 # --- Docker compose ---
-echo "[7/12] Writing docker-compose.yml..."
-cat > "$REPO_DIR/docker-compose.yml" <<EOF
-services:
-  nextcloud:
-    image: nextcloud:latest
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-    environment:
-      - NEXTCLOUD_ADMIN_USER=\${NEXTCLOUD_ADMIN_USER}
-      - NEXTCLOUD_ADMIN_PASSWORD=\${NEXTCLOUD_ADMIN_PASSWORD}
-      - NEXTCLOUD_TRUSTED_DOMAINS=\${NEXTCLOUD_TRUSTED_DOMAINS}
-      - MYSQL_PASSWORD=\${MYSQL_PASSWORD}
-      - MYSQL_DATABASE=\${MYSQL_DATABASE}
-      - MYSQL_USER=\${MYSQL_USER}
-      - MYSQL_HOST=db
-    volumes:
-      - nextcloud:/var/www/html
-      - \${NEXTCLOUD_DATA_DIR}:/var/www/html/data
-    depends_on:
-      - db
-  db:
-    image: mariadb:latest
-    restart: unless-stopped
-    environment:
-      - MYSQL_ROOT_PASSWORD=\${MYSQL_ROOT_PASSWORD}
-      - MYSQL_PASSWORD=\${MYSQL_PASSWORD}
-      - MYSQL_DATABASE=\${MYSQL_DATABASE}
-      - MYSQL_USER=\${MYSQL_USER}
-    volumes:
-      - db_data:/var/lib/mysql
-volumes:
-  nextcloud:
-  db_data:
-EOF
+echo "[7/12] Writing docker-compose.yml from template..."
+envsubst < "$REPO_DIR/docker-compose.yml.tpl" > "$REPO_DIR/docker-compose.yml"
 
 # --- Deploy ---
 echo "[8/12] Deploying Docker stack..."
