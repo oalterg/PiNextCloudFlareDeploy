@@ -1,16 +1,38 @@
-# Raspberry Pi Nextcloud + Cloudflare Tunnel Setup
+# Raspberry Pi Nextcloud Setup Using Docker and Cloudflare
 
-This project fully automates deployment of Nextcloud on a Raspberry Pi with:
+This repository automates deployment of **Nextcloud** on a **Raspberry Pi 5** using **Docker Compose**, optional **Cloudflare Tunnel** for secure remote access, and a robust **backup system**.
 
-- NVMe boot
-- Raspbian Lite
-- Dockerized Nextcloud + MariaDB
-- Cloudflare Tunnel for SSL and remote access
-- Automated weekly backups
+It aims to provide a production-ready Nextcloud environment with minimal manual setup and automated maintenance.
 
-## Quick Install
+---
 
-On a fresh Raspberry Pi (Raspbian Lite):
+## Prerequisites
+
+- Domain registered with **Cloudflare**
+- Raspberry Pi 4 or 5 with **Raspberry Pi OS Lite** (fresh installation recommended)
+- SSH access to the Raspberry Pi for headless setup
+- (Optional) Separate SSD or USB drive for backups
+- Internet connection for package installation and Docker setup
+
+---
+
+## Features
+
+- **Nextcloud + MariaDB** fully containerized with Docker Compose  
+- **Cloudflare Tunnel** for remote HTTPS access with automatic DNS updates  
+- **Local-only mode**: access via `http://<raspi-ip>:8080` if Cloudflare is not used  
+- **Automatic backups** of Nextcloud data and database (compressed, timestamped)  
+- Weekly cron job for unattended backups with disk space management  
+- **Maintenance mode** automation during backup  
+- Minimal manual configuration; fully bootstrapped via `install.sh`
+
+---
+
+## Quickstart
+
+### 1. Bootstrap on a Fresh Raspberry Pi
+
+Run the following on a clean Raspberry Pi OS Lite installation:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/YOURUSER/raspi-nextcloud-setup/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/install.sh | sudo bash

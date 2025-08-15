@@ -1,11 +1,13 @@
 #!/bin/bash
-# setup.sh — Raspberry Pi Nextcloud + Cloudflare Tunnel full setup
+# setup.sh — Raspberry Pi Nextcloud + Cloudflare Tunnel (no API token required)
 
-set -e
+set -euo pipefail
 
 REPO_DIR="/opt/raspi-nextcloud-setup"
 ENV_FILE="$REPO_DIR/.env"
-CF_API_BASE="https://api.cloudflare.com/client/v4"
+ENV_TEMPLATE="$REPO_DIR/.env.template"
+COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+BACKUP_DIR="/mnt/backup"
 
 echo "=== Raspberry Pi Nextcloud Setup ==="
 
@@ -14,31 +16,52 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-mkdir -p "$REPO_DIR"
+# ensure interactive prompts even if script is piped
+exec < /dev/tty
+
 cd "$REPO_DIR"
 
 # --- OS preparation ---
-echo "[1/12] Updating system..."
+echo "[1/9] Updating system..."
 apt-get update -y && apt-get upgrade -y
 
 echo "[2/12] Installing dependencies..."
-apt-get install -y \
-    docker.io docker-compose-plugin \
-    cloudflared \
-    cron git curl jq
+# Docker (official repo + compose plugin)
+apt-get install -y ca-certificates curl gnupg lsb-release
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+    apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Cloudflared
+# Add cloudflare gpg key
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+# Add this repo to your apt repositories
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+# install cloudflared
+sudo apt-get update && sudo apt-get install cloudflared
+
+# Other tools
+apt-get install -y cron git jq moreutils
 
 systemctl enable docker
 systemctl start docker
 
-grep -q "dtparam=pciex1_gen=3" /boot/config.txt || echo "dtparam=pciex1_gen=3" >> /boot/config.txt
-grep -q "dtoverlay=disable-wifi" /boot/config.txt || echo "dtoverlay=disable-wifi" >> /boot/config.txt
-
 # --- Gather parameters ---
-echo "[3/12] Gathering configuration..."
+echo "[3/9] Gathering configuration..."
 read -rp "Nextcloud admin username [admin]: " NEXTCLOUD_ADMIN_USER
 NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER:-admin}
 read -rp "Nextcloud admin password: " NEXTCLOUD_ADMIN_PASSWORD
-read -rp "Nextcloud domain (e.g., cloud.example.com): " NEXTCLOUD_TRUSTED_DOMAINS
+
+read -rp "Nextcloud domain(s) (space-separated, e.g. pinextcloud.local cloud.example.com): " NEXTCLOUD_TRUSTED_DOMAINS
+DOMAIN_ARRAY=($NEXTCLOUD_TRUSTED_DOMAINS)
+PRIMARY_DOMAIN="${DOMAIN_ARRAY[0]}"
 
 read -rp "MySQL root password: " MYSQL_ROOT_PASSWORD
 read -rp "MySQL user [nextcloud]: " MYSQL_USER
@@ -48,159 +71,110 @@ MYSQL_DATABASE="nextcloud"
 
 USER_HOME=$(eval echo "~$SUDO_USER")
 NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
+NEXTCLOUD_PORT="8080"
 
 if [[ ! -d "$NEXTCLOUD_DATA_DIR" ]]; then
-    echo "Nextcloud data directory $NEXTCLOUD_DATA_DIR not found — creating..."
+    echo "Creating Nextcloud data directory $NEXTCLOUD_DATA_DIR..."
     mkdir -p "$NEXTCLOUD_DATA_DIR"
     chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
 fi
 
-read -rp "Backup directory [/mnt/backupssd]: " BACKUP_DIR
-BACKUP_DIR=${BACKUP_DIR:-/mnt/backupssd}
-
-if [[ ! -d "$BACKUP_DIR" ]]; then
-    echo "Backup directory $BACKUP_DIR not found — creating..."
-    mkdir -p "$BACKUP_DIR"
-fi
-
-read -rp "Cloudflare API token: " CF_API_TOKEN
-
-BASE_DOMAIN=$(echo "$NEXTCLOUD_TRUSTED_DOMAINS" | sed 's/.*\.\([^.]*\.[^.]*\)$/\1/')
-
-# --- Validate Cloudflare API token ---
-echo "[4/12] Validating Cloudflare API token..."
-if ! curl -s -X GET "$CF_API_BASE/user/tokens/verify" \
-    -H "Authorization: Bearer $CF_API_TOKEN" \
-    -H "Content-Type: application/json" | jq -e '.success' >/dev/null; then
-    echo "Error: Invalid Cloudflare API token"
-    exit 1
-fi
+mkdir -p "$BACKUP_DIR"
 
 # --- Cloudflare Tunnel setup ---
-TUNNEL_NAME="nextcloud-tunnel"
-echo "[5/12] Cloudflare tunnel setup..."
-cloudflared tunnel login
+echo "[4/9] Cloudflare tunnel setup..."
+read -rp "Use Cloudflare Tunnel? [y/N]: " USE_CF
+USE_CF=${USE_CF:-n}
 
-EXISTING_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
-if [[ -n "$EXISTING_TUNNEL_ID" && "$EXISTING_TUNNEL_ID" != "null" ]]; then
-    CF_TUNNEL_ID="$EXISTING_TUNNEL_ID"
-    echo "Reusing tunnel ID: $CF_TUNNEL_ID"
-else
-    CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | grep -oP "(?<=Created tunnel ).*")
-fi
+CF_TUNNEL_ID=""
+CF_HOSTNAME=""
 
-CF_CERT_PATH="/root/.cloudflared/cert.pem"
-mkdir -p /etc/cloudflared
-cat > /etc/cloudflared/config.yml <<EOF
+if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
+    echo "Logging into Cloudflare (a URL will open in your browser)..."
+    cloudflared tunnel login
+
+    read -rp "Enter your base domain (already in Cloudflare, e.g. example.com): " BASE_DOMAIN
+    read -rp "Enter desired subdomain (e.g. nextcloud): " SUBDOMAIN
+    CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+
+    TUNNEL_NAME="nextcloud-tunnel"
+    EXISTING_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+
+    if [[ -n "$EXISTING_TUNNEL_ID" && "$EXISTING_TUNNEL_ID" != "null" ]]; then
+        CF_TUNNEL_ID="$EXISTING_TUNNEL_ID"
+        echo "Reusing tunnel ID: $CF_TUNNEL_ID"
+    else
+        #CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | grep -oP "(?<=Created tunnel ).*")
+        CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $3}')
+    fi
+
+    # Path to credentials JSON generated by cloudflared
+    CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
+
+    echo "Routing DNS for $CF_HOSTNAME..."
+    cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_HOSTNAME"
+
+    mkdir -p /etc/cloudflared
+    cat > /etc/cloudflared/config.yml <<EOF
 tunnel: $CF_TUNNEL_ID
-credentials-file: $CF_CERT_PATH
+credentials-file: $CREDENTIALS_FILE
 
 ingress:
-  - hostname: $NEXTCLOUD_TRUSTED_DOMAINS
-    service: http://localhost:8080
+  - hostname: $CF_HOSTNAME
+    service: http://localhost:$NEXTCLOUD_PORT
   - service: http_status:404
 EOF
 
-systemctl enable cloudflared
-systemctl restart cloudflared
 
-# --- DNS setup ---
-echo "[6/12] Configuring DNS..."
-ZONE_ID=$(curl -s -X GET "$CF_API_BASE/zones?name=$BASE_DOMAIN" \
-  -H "Authorization: Bearer $CF_API_TOKEN" \
-  -H "Content-Type: application/json" | jq -r '.result[0].id')
+    # Create systemd service for cloudflared
+    echo "Creating systemd service for cloudflared..."
+    cat >/etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
 
-if [[ "$ZONE_ID" == "null" || -z "$ZONE_ID" ]]; then
-    echo "Error: Could not find Zone ID for $BASE_DOMAIN"
-    exit 1
-fi
+[Service]
+TimeoutStartSec=0
+Type=notify
+ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run
+Restart=on-failure
+RestartSec=5s
+User=root
 
-RECORD_ID=$(curl -s -X GET "$CF_API_BASE/zones/$ZONE_ID/dns_records?name=$NEXTCLOUD_TRUSTED_DOMAINS" \
-  -H "Authorization: Bearer $CF_API_TOKEN" \
-  -H "Content-Type: application/json" | jq -r '.result[0].id')
-
-DESIRED_TARGET="$CF_TUNNEL_ID.cfargotunnel.com"
-
-if [[ "$RECORD_ID" != "null" && -n "$RECORD_ID" ]]; then
-    CURRENT_TARGET=$(curl -s -X GET "$CF_API_BASE/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-      -H "Authorization: Bearer $CF_API_TOKEN" \
-      -H "Content-Type: application/json" | jq -r '.result.content')
-    if [[ "$CURRENT_TARGET" != "$DESIRED_TARGET" ]]; then
-        echo "Updating DNS..."
-        curl -s -X PUT "$CF_API_BASE/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-          -H "Authorization: Bearer $CF_API_TOKEN" \
-          -H "Content-Type: application/json" \
-          --data "{\"type\":\"CNAME\",\"name\":\"$NEXTCLOUD_TRUSTED_DOMAINS\",\"content\":\"$DESIRED_TARGET\",\"ttl\":1,\"proxied\":true}" >/dev/null
-    else
-        echo "DNS already correct."
-    fi
-else
-    echo "Creating DNS..."
-    curl -s -X POST "$CF_API_BASE/zones/$ZONE_ID/dns_records" \
-      -H "Authorization: Bearer $CF_API_TOKEN" \
-      -H "Content-Type: application/json" \
-      --data "{\"type\":\"CNAME\",\"name\":\"$NEXTCLOUD_TRUSTED_DOMAINS\",\"content\":\"$DESIRED_TARGET\",\"ttl\":1,\"proxied\":true}" >/dev/null
-fi
-
-# --- Save env ---
-cat > "$ENV_FILE" <<EOF
-NEXTCLOUD_DATA_DIR=$NEXTCLOUD_DATA_DIR
-BACKUP_DIR=$BACKUP_DIR
-NEXTCLOUD_ADMIN_USER=$NEXTCLOUD_ADMIN_USER
-NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD
-NEXTCLOUD_TRUSTED_DOMAINS=$NEXTCLOUD_TRUSTED_DOMAINS
-MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
-MYSQL_PASSWORD=$MYSQL_PASSWORD
-MYSQL_DATABASE=$MYSQL_DATABASE
-MYSQL_USER=$MYSQL_USER
-CF_TUNNEL_ID=$CF_TUNNEL_ID
-CF_CERT_PATH=$CF_CERT_PATH
-CF_API_TOKEN=$CF_API_TOKEN
+[Install]
+WantedBy=multi-user.target
 EOF
 
-# --- Docker compose ---
-echo "[7/12] Writing docker-compose.yml..."
-cat > "$REPO_DIR/docker-compose.yml" <<EOF
-services:
-  nextcloud:
-    image: nextcloud:latest
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-    environment:
-      - NEXTCLOUD_ADMIN_USER=\${NEXTCLOUD_ADMIN_USER}
-      - NEXTCLOUD_ADMIN_PASSWORD=\${NEXTCLOUD_ADMIN_PASSWORD}
-      - NEXTCLOUD_TRUSTED_DOMAINS=\${NEXTCLOUD_TRUSTED_DOMAINS}
-      - MYSQL_PASSWORD=\${MYSQL_PASSWORD}
-      - MYSQL_DATABASE=\${MYSQL_DATABASE}
-      - MYSQL_USER=\${MYSQL_USER}
-      - MYSQL_HOST=db
-    volumes:
-      - nextcloud:/var/www/html
-      - \${NEXTCLOUD_DATA_DIR}:/var/www/html/data
-    depends_on:
-      - db
-  db:
-    image: mariadb:latest
-    restart: unless-stopped
-    environment:
-      - MYSQL_ROOT_PASSWORD=\${MYSQL_ROOT_PASSWORD}
-      - MYSQL_PASSWORD=\${MYSQL_PASSWORD}
-      - MYSQL_DATABASE=\${MYSQL_DATABASE}
-      - MYSQL_USER=\${MYSQL_USER}
-    volumes:
-      - db_data:/var/lib/mysql
-volumes:
-  nextcloud:
-  db_data:
-EOF
+    systemctl daemon-reload
+    systemctl enable cloudflared
+    systemctl restart cloudflared
+
+
+fi
+
+# --- Generate .env ---
+echo "[5/9] Writing .env..."
+cp "$ENV_TEMPLATE" "$ENV_FILE"
+sed -i \
+    -e "s|NEXTCLOUD_DATA_DIR=.*|NEXTCLOUD_DATA_DIR=$NEXTCLOUD_DATA_DIR|" \
+    -e "s|NEXTCLOUD_ADMIN_USER=.*|NEXTCLOUD_ADMIN_USER=$NEXTCLOUD_ADMIN_USER|" \
+    -e "s|NEXTCLOUD_ADMIN_PASSWORD=.*|NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD|" \
+    -e "s|NEXTCLOUD_TRUSTED_DOMAINS=.*|NEXTCLOUD_TRUSTED_DOMAINS=$NEXTCLOUD_TRUSTED_DOMAINS|" \
+    -e "s|NEXTCLOUD_PORT=.*|NEXTCLOUD_PORT=$NEXTCLOUD_PORT|" \
+    -e "s|MYSQL_ROOT_PASSWORD=.*|MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD|" \
+    -e "s|MYSQL_PASSWORD=.*|MYSQL_PASSWORD=$MYSQL_PASSWORD|" \
+    -e "s|MYSQL_DATABASE=.*|MYSQL_DATABASE=$MYSQL_DATABASE|" \
+    -e "s|MYSQL_USER=.*|MYSQL_USER=$MYSQL_USER|" \
+    -e "s|CF_TUNNEL_ID=.*|CF_TUNNEL_ID=$CF_TUNNEL_ID|" \
+    "$ENV_FILE"
 
 # --- Deploy ---
-echo "[8/12] Deploying Docker stack..."
-docker compose --env-file "$ENV_FILE" -f "$REPO_DIR/docker-compose.yml" up -d
+echo "[6/9] Deploying Docker stack..."
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
 
 # --- Backup setup ---
-echo "[9/12] Installing backup script..."
+echo "[7/9] Installing backup script..."
 chmod +x "$REPO_DIR/backup.sh"
 
 if mountpoint -q "$BACKUP_DIR"; then
@@ -210,8 +184,9 @@ else
     echo "Warning: Backup directory is not mounted. Skipping cron job."
 fi
 
-echo "[10/12] Installation complete."
-echo "[11/12] Access Nextcloud at: https://$NEXTCLOUD_TRUSTED_DOMAINS"
-echo "[12/12] Rebooting in 5 seconds..."
-sleep 5
-reboot
+echo "[8/9] Installation complete."
+if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
+    echo "[9/9] Access Nextcloud at: https://$CF_HOSTNAME"
+else
+    echo "[9/9] Access Nextcloud locally at: http://$PRIMARY_DOMAIN:$NEXTCLOUD_PORT"
+fi

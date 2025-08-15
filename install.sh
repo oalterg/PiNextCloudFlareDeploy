@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-REPO_URL="https://github.com/YOURUSER/raspi-nextcloud-setup.git"
+REPO_URL="https://github.com/oalterg/pinextcloudflaredeploy.git"
 REPO_DIR="/opt/raspi-nextcloud-setup"
 LOG_DIR="/var/log/raspi-nextcloud"
 LOG_FILE="$LOG_DIR/bootstrap.log"
