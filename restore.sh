@@ -1,103 +1,91 @@
 #!/bin/bash
+# restore.sh — Restore Nextcloud (data + DB) from a .tar.gz backup
 set -euo pipefail
 
 REPO_DIR="/opt/raspi-nextcloud-setup"
 ENV_FILE="$REPO_DIR/.env"
-BACKUP_DIR=/mnt/backup
-BACKUP_LABEL="BackupDrive" 
+BACKUP_LABEL="${BACKUP_LABEL:-BackupDrive}"
 
-if [[ ! -f "$ENV_FILE" ]]; then
-    echo "Error: $ENV_FILE not found. Run setup.sh first."
-    exit 1
-fi
+[[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE"; exit 1; }
+# shellcheck disable=SC1090
 source "$ENV_FILE"
 
-# === DETECT AND MOUNT BACKUP PARTITION BY LABEL ===
-echo "[*] Detecting backup partition with label '$BACKUP_LABEL'..."
-BACKUP_PARTITION=$(lsblk -o NAME,LABEL -nr | awk -v label="$BACKUP_LABEL" '$2 == label {print "/dev/"$1}')
-
-if [ -z "$BACKUP_PARTITION" ]; then
-    echo "[!] No partition with label '$BACKUP_LABEL' found. Aborting."
-    exit 1
-fi
-echo "[*] Found backup partition: $BACKUP_PARTITION"
+: "${BACKUP_DIR:?BACKUP_DIR not set in .env}"
+: "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
+: "${MYSQL_USER:?}"
+: "${MYSQL_PASSWORD:?}"
+: "${MYSQL_DATABASE:?}"
 
 mkdir -p "$BACKUP_DIR"
-if mountpoint -q "$BACKUP_DIR"; then
-    echo "[*] $BACKUP_DIR is already mounted."
+
+# Mount backup drive by label if not mounted
+if ! mountpoint -q "$BACKUP_DIR"; then
+  if blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
+    echo "[*] Mounting backup drive label '$BACKUP_LABEL' to $BACKUP_DIR..."
+    mount -L "$BACKUP_LABEL" "$BACKUP_DIR"
+  else
+    echo "[!] Backup drive with label '$BACKUP_LABEL' not found. Aborting."
+    exit 1
+  fi
+fi
+
+# Choose backup file
+if [[ $# -ge 1 ]]; then
+  BACKUP_FILE="$1"
 else
-    echo "[*] Mounting partition with label $BACKUP_LABEL at $BACKUP_DIR..."
-    mount -L "$BACKUP_LABEL" "$BACKUP_DIR" || {
-        echo "[!] Failed to mount partition $BACKUP_LABEL. Exiting."
-        exit 1
-    }
+  BACKUP_FILE="$(ls -t "$BACKUP_DIR"/nextcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)"
+  [[ -n "$BACKUP_FILE" ]] || { echo "No backups found in $BACKUP_DIR"; exit 1; }
 fi
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <backup_file.tar.gz>"
-    echo "Available backups in $BACKUP_DIR:"
-    ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null || echo "No backups found."
-    exit 1
-fi
-
-BACKUP_FILE="$1"
-
-if [[ ! -f "$BACKUP_FILE" ]]; then
-    echo "Error: Backup file not found: $BACKUP_FILE"
-    exit 1
-fi
+[[ -f "$BACKUP_FILE" ]] || { echo "Backup not found: $BACKUP_FILE"; exit 1; }
 
 echo "WARNING: This will overwrite:"
 echo "  - Nextcloud data directory: $NEXTCLOUD_DATA_DIR"
 echo "  - MariaDB database: $MYSQL_DATABASE"
-echo
-read -p "Are you absolutely sure you want to proceed? (yes/NO): " CONFIRM
-if [[ "$CONFIRM" != "yes" ]]; then
-    echo "Restore aborted."
-    exit 0
+read -rp "Type 'yes' to proceed: " CONFIRM
+[[ "$CONFIRM" == "yes" ]] || { echo "Restore aborted."; exit 0; }
+
+TMP="/tmp/nextcloud-restore-$$"
+mkdir -p "$TMP"
+
+echo "[1/6] Enabling maintenance mode..."
+NC_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q nextcloud || true)"
+if [[ -n "$NC_CID" ]]; then
+  docker exec -u www-data "$NC_CID" php occ maintenance:mode --on || true
 fi
 
-TMP_DIR="/tmp/nextcloud-restore-$$"
+echo "[2/6] Stopping Nextcloud service (db stays up)..."
+docker compose -f "$REPO_DIR/docker-compose.yml" stop nextcloud || true
 
-echo "[1/6] Stopping Nextcloud stack..."
-docker compose -f "$REPO_DIR/docker-compose.yml" down
+echo "[3/6] Extracting backup..."
+tar -xzf "$BACKUP_FILE" -C "$TMP"
+[[ -d "$TMP/data" ]] || { echo "Backup missing data/ directory"; exit 1; }
+[[ -f "$TMP/db/nextcloud.sql" ]] || { echo "Backup missing db/nextcloud.sql"; exit 1; }
 
-echo "[2/6] Extracting backup..."
-mkdir -p "$TMP_DIR"
-tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
+echo "[4/6] Restoring data directory..."
+mkdir -p "$NEXTCLOUD_DATA_DIR"
+rsync -a --delete "$TMP/data/" "$NEXTCLOUD_DATA_DIR/"
 
-echo "[3/6] Restoring data directory..."
-rsync -a --delete "$TMP_DIR/data/" "$NEXTCLOUD_DATA_DIR/"
-
-echo "[4/6] Restoring database..."
-# Ensure DB container is up
+echo "[5/6] Restoring database..."
 docker compose -f "$REPO_DIR/docker-compose.yml" up -d db
-echo "Waiting for database container to become ready..."
+echo "Waiting for DB to be ready..."
 sleep 20
+DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
+[[ -n "$DB_CID" ]] || { echo "DB container not found"; exit 1; }
 
-DB_CONTAINER=$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)
-if [[ -z "$DB_CONTAINER" ]]; then
-    echo "Error: Could not determine DB container ID"
-    exit 1
-fi
+# Import using mysql:8 over container network
+docker run --rm \
+  --network container:"$DB_CID" \
+  -e MYSQL_PWD="$MYSQL_PASSWORD" \
+  mysql:8 \
+  sh -c "mysql -h 127.0.0.1 -u '$MYSQL_USER' '$MYSQL_DATABASE'" < "$TMP/db/nextcloud.sql"
 
-LATEST_SQL="$TMP_DIR/db.sql"
-if [[ -f "$LATEST_SQL" ]]; then
-    echo "Importing SQL dump $LATEST_SQL..."
-    docker run --rm \
-      --network container:"$DB_CONTAINER" \
-      -e MYSQL_PWD="$MYSQL_PASSWORD" \
-      mysql:8 \
-      mysql -h 127.0.0.1 -u "$MYSQL_USER" "$MYSQL_DATABASE" < "$LATEST_SQL"
-    echo "[*] Database restore complete."
-else
-    echo "[!] No SQL dump found in backup. Skipping DB restore."
-fi
+echo "[6/6] Restarting Nextcloud..."
+docker compose -f "$REPO_DIR/docker-compose.yml" up -d nextcloud
 
-echo "[5/6] Restarting Nextcloud stack..."
-docker compose -f "$REPO_DIR/docker-compose.yml" up -d
+echo "[*] Disabling maintenance mode..."
+NC_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q nextcloud)"
+docker exec -u www-data "$NC_CID" php occ maintenance:mode --off || true
 
-rm -rf "$TMP_DIR"
-
-echo "=== Restore complete! ==="
-echo "Restored from: $BACKUP_FILE"
+rm -rf "$TMP"
+echo "=== Restore complete from: $BACKUP_FILE ==="
