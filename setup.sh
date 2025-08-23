@@ -9,7 +9,7 @@ REPO_DIR="/opt/raspi-nextcloud-setup"
 ENV_FILE="$REPO_DIR/.env"
 ENV_TEMPLATE="$REPO_DIR/.env.template"
 COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
-BACKUP_DIR="/mnt/backup"
+BACKUP_MOUNTDIR="/mnt/backup"
 BACKUP_LABEL="${BACKUP_LABEL:-BackupDrive}"   # consistent across scripts
 
 echo "=== Raspberry Pi Nextcloud Setup ==="
@@ -81,9 +81,9 @@ mkdir -p "$NEXTCLOUD_DATA_DIR"
 chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
 
 # Default backup dir (can be remounted to a labeled drive later)
-read -rp "Backup directory [$(${ECHO_BACKUP_DIR:-echo /mnt/backupssd})]: " BACKUP_DIR_INPUT
-BACKUP_DIR="${BACKUP_DIR_INPUT:-/mnt/backupssd}"
-mkdir -p "$BACKUP_DIR"
+read -rp "Backup directory [$(${ECHO_BACKUP_MOUNTDIR:-echo /mnt/backup})]: " BACKUP_MOUNTDIR_INPUT
+BACKUP_MOUNTDIR="${BACKUP_MOUNTDIR_INPUT:-/mnt/backupssd}"
+mkdir -p "$BACKUP_MOUNTDIR"
 
 # --- Cloudflare Tunnel (optional, tokenless) ---
 echo "[4/14] Cloudflare tunnel setup..."
@@ -100,7 +100,7 @@ if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
   read -rp "Enter desired subdomain (e.g. nextcloud): " SUBDOMAIN
   CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
 
-  TUNNEL_NAME="nextcloud-tunnel"
+  TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
   EXISTING_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
   if [[ -n "$EXISTING_TUNNEL_ID" && "$EXISTING_TUNNEL_ID" != "null" ]]; then
     CF_TUNNEL_ID="$EXISTING_TUNNEL_ID"
@@ -111,7 +111,7 @@ if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
   fi
 
   echo "Routing DNS for $CF_HOSTNAME..."
-  cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_HOSTNAME"
+  cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_HOSTNAME" || echo "DNS route already exists, continuing..."
 
   CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
   mkdir -p /etc/cloudflared
@@ -154,7 +154,7 @@ echo "[5/14] Writing .env..."
 cp "$ENV_TEMPLATE" "$ENV_FILE"
 sed -i \
   -e "s|NEXTCLOUD_DATA_DIR=.*|NEXTCLOUD_DATA_DIR=$NEXTCLOUD_DATA_DIR|" \
-  -e "s|BACKUP_DIR=.*|BACKUP_DIR=$BACKUP_DIR|" \
+  -e "s|BACKUP_MOUNTDIR=.*|BACKUP_MOUNTDIR=$BACKUP_MOUNTDIR|" \
   -e "s|NEXTCLOUD_ADMIN_USER=.*|NEXTCLOUD_ADMIN_USER=$NEXTCLOUD_ADMIN_USER|" \
   -e "s|NEXTCLOUD_ADMIN_PASSWORD=.*|NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD|" \
   -e "s|NEXTCLOUD_TRUSTED_DOMAINS=.*|NEXTCLOUD_TRUSTED_DOMAINS=$NEXTCLOUD_TRUSTED_DOMAINS|" \
@@ -175,17 +175,17 @@ sleep 10
 
 # --- Backup drive: auto-detect & (optional) format ---
 echo "[8/14] Backup drive detection..."
-# If BACKUP_DIR not a mountpoint, offer to prep a drive
-if ! mountpoint -q "$BACKUP_DIR"; then
+# If BACKUP_MOUNTDIR not a mountpoint, offer to prep a drive
+if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
   # Prefer labeled partition
   if blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
-    echo "Found partition with label '$BACKUP_LABEL'. Mounting to $BACKUP_DIR..."
-    mkdir -p "$BACKUP_DIR"
-    mount -L "$BACKUP_LABEL" "$BACKUP_DIR" || echo "Mount by label failed."
+    echo "Found partition with label '$BACKUP_LABEL'. Mounting to $BACKUP_MOUNTDIR..."
+    mkdir -p "$BACKUP_MOUNTDIR"
+    mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || echo "Mount by label failed."
   fi
 fi
 
-if ! mountpoint -q "$BACKUP_DIR"; then
+if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
   CANDIDATE_DRIVE=$(lsblk -dpno NAME,TYPE,MOUNTPOINT | awk '$2=="disk" && $3=="" {print $1}' | head -n1 || true)
   if [[ -n "${CANDIDATE_DRIVE:-}" ]]; then
     echo "Detected unmounted drive: $CANDIDATE_DRIVE"
@@ -197,11 +197,11 @@ if ! mountpoint -q "$BACKUP_DIR"; then
       sleep 2
       PARTITION="${CANDIDATE_DRIVE}1"
       mkfs.ext4 -F -L "$BACKUP_LABEL" "$PARTITION"
-      mkdir -p "$BACKUP_DIR"
-      mount -L "$BACKUP_LABEL" "$BACKUP_DIR"
+      mkdir -p "$BACKUP_MOUNTDIR"
+      mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR"
       UUID=$(blkid -s UUID -o value "$PARTITION")
-      grep -q "$UUID" /etc/fstab || echo "UUID=$UUID $BACKUP_DIR ext4 defaults 0 2" >> /etc/fstab
-      echo "Backup drive mounted at $BACKUP_DIR."
+      grep -q "$UUID" /etc/fstab || echo "UUID=$UUID $BACKUP_MOUNTDIR ext4 defaults 0 2" >> /etc/fstab
+      echo "Backup drive mounted at $BACKUP_MOUNTDIR."
     else
       echo "Skipping drive preparation. You can mount manually later."
     fi
@@ -209,12 +209,12 @@ if ! mountpoint -q "$BACKUP_DIR"; then
     echo "No spare unmounted drive detected."
   fi
 else
-  echo "Backup directory is mounted: $BACKUP_DIR"
+  echo "Backup directory is mounted: $BACKUP_MOUNTDIR"
 fi
 
 # --- Offer restore (AFTER stack is running) ---
 echo "[9/14] Checking for existing backups to restore..."
-LATEST_BACKUP="$(ls -t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | head -n1 || true)"
+LATEST_BACKUP="$(ls -t "$BACKUP_MOUNTDIR"/*.tar.gz 2>/dev/null | head -n1 || true)"
 if [[ -n "${LATEST_BACKUP:-}" ]]; then
   echo "Latest backup found: $LATEST_BACKUP"
   read -rp "Do you want to restore this backup now? [y/N]: " DO_RESTORE
@@ -224,13 +224,13 @@ if [[ -n "${LATEST_BACKUP:-}" ]]; then
     "$REPO_DIR/restore.sh" "$LATEST_BACKUP"
   fi
 else
-  echo "No backups found in $BACKUP_DIR."
+  echo "No backups found in $BACKUP_MOUNTDIR."
 fi
 
 # --- Install backup job ---
 echo "[10/14] Installing backup script + cron..."
 
-if mountpoint -q "$BACKUP_DIR"; then
+if mountpoint -q "$BACKUP_MOUNTDIR"; then
   chmod +x "$REPO_DIR/backup.sh"
   cat >/etc/cron.d/nextcloud-backup <<EOF
 # Run weekly Sunday 03:00 as root
@@ -238,7 +238,7 @@ if mountpoint -q "$BACKUP_DIR"; then
 EOF
   chmod 644 /etc/cron.d/nextcloud-backup
 else
-  echo "Warning: $BACKUP_DIR is not mounted. Cron job not installed."
+  echo "Warning: $BACKUP_MOUNTDIR is not mounted. Cron job not installed."
 fi
 
 

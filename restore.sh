@@ -10,19 +10,19 @@ BACKUP_LABEL="${BACKUP_LABEL:-BackupDrive}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-: "${BACKUP_DIR:?BACKUP_DIR not set in .env}"
+: "${BACKUP_MOUNTDIR:?BACKUP_MOUNTDIR not set in .env}"
 : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
 : "${MYSQL_USER:?}"
 : "${MYSQL_PASSWORD:?}"
 : "${MYSQL_DATABASE:?}"
 
-mkdir -p "$BACKUP_DIR"
+mkdir -p "$BACKUP_MOUNTDIR"
 
 # Mount backup drive by label if not mounted
-if ! mountpoint -q "$BACKUP_DIR"; then
+if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
   if blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
-    echo "[*] Mounting backup drive label '$BACKUP_LABEL' to $BACKUP_DIR..."
-    mount -L "$BACKUP_LABEL" "$BACKUP_DIR"
+    echo "[*] Mounting backup drive label '$BACKUP_LABEL' to $BACKUP_MOUNTDIR..."
+    mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR"
   else
     echo "[!] Backup drive with label '$BACKUP_LABEL' not found. Aborting."
     exit 1
@@ -33,8 +33,8 @@ fi
 if [[ $# -ge 1 ]]; then
   BACKUP_FILE="$1"
 else
-  BACKUP_FILE="$(ls -t "$BACKUP_DIR"/nextcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)"
-  [[ -n "$BACKUP_FILE" ]] || { echo "No backups found in $BACKUP_DIR"; exit 1; }
+  BACKUP_FILE="$(ls -t "$BACKUP_MOUNTDIR"/nextcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)"
+  [[ -n "$BACKUP_FILE" ]] || { echo "No backups found in $BACKUP_MOUNTDIR"; exit 1; }
 fi
 
 [[ -f "$BACKUP_FILE" ]] || { echo "Backup not found: $BACKUP_FILE"; exit 1; }
