@@ -38,8 +38,34 @@ mkdir -p "$STAGING/data" "$STAGING/db" "$STAGING/config"
 # === DYNAMIC DISK SPACE CHECK ===
 echo "[*] Estimating backup size..."
 ESTIMATED_DATA_KB=$(du -sk "$NEXTCLOUD_DATA_DIR" | awk '{print $1}')
-# Add 20% for DB + config + overhead
-ESTIMATED_TOTAL_KB=$((ESTIMATED_DATA_KB + ESTIMATED_DATA_KB / 5))
+# Add 100MB for db and config
+ESTIMATED_TOTAL_KB=$((ESTIMATED_DATA_KB + 102400))
+check_space_and_cleanup() {
+    AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
+    echo "[*] Available space: $((AVAILABLE_KB / 1024)) MB, Needed: $((ESTIMATED_TOTAL_KB / 1024)) MB"
+    
+    if [ "$AVAILABLE_KB" -lt "$ESTIMATED_TOTAL_KB" ]; then
+        echo "[!] Not enough free space for backup."
+        
+        OLDEST_BACKUP=$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -type d -name "nextcloud_backup_*" | sort | head -n 1)
+        BACKUP_COUNT=$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -type d -name "nextcloud_backup_*" | wc -l)
+        
+        if [ -n "$OLDEST_BACKUP" ]; then
+            echo "[*] Removing oldest backup: $OLDEST_BACKUP"
+            rm -rf "$OLDEST_BACKUP"
+            
+            if [ "$BACKUP_COUNT" -eq 1 ]; then
+                echo \"[!] WARNING: Had to delete the last existing backup. Backup drive capacity is too low to retain old snapshots.\"
+            fi
+            
+            echo "[*] Retrying space check..."
+            check_space_and_cleanup
+        else
+            echo "[!] No backups found to delete, still insufficient space. Aborting."
+            exit 1
+        fi
+    fi
+}
 
 check_space_and_cleanup() {
     AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
@@ -51,17 +77,23 @@ check_space_and_cleanup() {
         OLDEST_BACKUP=$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -type d -name "nextcloud_backup_*" | sort | head -n 1)
         BACKUP_COUNT=$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -type d -name "nextcloud_backup_*" | wc -l)
         
-        if [ "$BACKUP_COUNT" -gt 1 ] && [ -n "$OLDEST_BACKUP" ]; then
+        if [ -n "$OLDEST_BACKUP" ]; then
             echo "[*] Removing oldest backup: $OLDEST_BACKUP"
             rm -rf "$OLDEST_BACKUP"
+            
+            if [ "$BACKUP_COUNT" -eq 1 ]; then
+                echo \"[!] WARNING: Had to delete the last existing backup. Backup drive capacity is too low to retain old snapshots.\"
+            fi
+            
             echo "[*] Retrying space check..."
             check_space_and_cleanup
         else
-            echo "[!] Only one or no backups exist. Cannot delete further. Aborting."
+            echo "[!] No backups found to delete, still insufficient space. Aborting."
             exit 1
         fi
     fi
 }
+
 check_space_and_cleanup
 
 # Maintenance ON
