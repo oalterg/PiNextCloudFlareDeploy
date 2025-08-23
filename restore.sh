@@ -15,6 +15,7 @@ source "$ENV_FILE"
 : "${MYSQL_USER:?}"
 : "${MYSQL_PASSWORD:?}"
 : "${MYSQL_DATABASE:?}"
+: "${MYSQL_ROOT_PASSWORD:?}"
 
 mkdir -p "$BACKUP_MOUNTDIR"
 
@@ -48,39 +49,70 @@ read -rp "Type 'yes' to proceed: " CONFIRM
 TMP="/tmp/nextcloud-restore-$$"
 mkdir -p "$TMP"
 
-echo "[1/6] Enabling maintenance mode..."
+echo "[1/7] Enabling maintenance mode..."
 NC_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q nextcloud || true)"
 if [[ -n "$NC_CID" ]]; then
   docker exec -u www-data "$NC_CID" php occ maintenance:mode --on || true
 fi
 
-echo "[2/6] Stopping Nextcloud service (db stays up)..."
+echo "[2/7] Stopping Nextcloud service (db stays up)..."
 docker compose -f "$REPO_DIR/docker-compose.yml" stop nextcloud || true
 
-echo "[3/6] Extracting backup..."
+echo "[3/7] Extracting backup..."
 tar -xzf "$BACKUP_FILE" -C "$TMP"
 [[ -d "$TMP/data" ]] || { echo "Backup missing data/ directory"; exit 1; }
 [[ -f "$TMP/db/nextcloud.sql" ]] || { echo "Backup missing db/nextcloud.sql"; exit 1; }
+[[ -d "$TMP/config" ]] || { echo "Backup missing config/ directory"; exit 1; }
 
-echo "[4/6] Restoring data directory..."
+echo "[4/7] Restoring nextcloud data directory..."
 mkdir -p "$NEXTCLOUD_DATA_DIR"
 rsync -a --delete "$TMP/data/" "$NEXTCLOUD_DATA_DIR/"
 
-echo "[5/6] Restoring database..."
+echo "[5/7] Restoring nextcloud config directory into nextcloud_html volume..."
+# NC_HTML_VOLUME="raspi-nextcloud-setup_nextcloud_html"
+NC_HTML_VOLUME=$(docker inspect "$NC_CID" \
+  --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+docker run --rm -v ${NC_HTML_VOLUME}:/volume -v "$TMP/config":/backup alpine \
+    sh -c "rm -rf /volume/config/* && cp -a /backup/. /volume/config/"
+
+echo "[6/7] Restoring database..."
 docker compose -f "$REPO_DIR/docker-compose.yml" up -d db
 echo "Waiting for DB to be ready..."
 sleep 20
 DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
 [[ -n "$DB_CID" ]] || { echo "DB container not found"; exit 1; }
 
-# Import using mysql:8 over container network
-docker run --rm \
-  --network container:"$DB_CID" \
-  -e MYSQL_PWD="$MYSQL_PASSWORD" \
-  mysql:8 \
-  sh -c "mysql -h 127.0.0.1 -u '$MYSQL_USER' '$MYSQL_DATABASE'" < "$TMP/db/nextcloud.sql"
+# Detect compose network
+NETWORK_NAME=$(docker inspect "$DB_CID" --format='{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
 
-echo "[6/6] Restarting Nextcloud..."
+# Drop and recreate database to ensure idempotent restore
+docker run --rm \
+  --network "$NETWORK_NAME" \
+  -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+  mysql:8 \
+  sh -c "mysql -h db -u root -e \"DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;\""
+
+# Import dump using mysql:8 client container
+docker run --rm \
+  --network "$NETWORK_NAME" \
+  -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+  -v "$TMP/db/nextcloud.sql:/restore.sql" \
+  mysql:8 \
+  sh -c "mysql -h db -u root $MYSQL_DATABASE < /restore.sql"
+
+# Sanity check: confirm oc_users table exists and has entries
+USER_COUNT=$(docker run --rm \
+  --network "$NETWORK_NAME" \
+  -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+  mysql:8 \
+  sh -c "mysql -N -s -h db -u root $MYSQL_DATABASE -e 'SELECT COUNT(*) FROM oc_users;'" 2>/dev/null || echo 0)
+if [[ "$USER_COUNT" -eq 0 ]]; then
+  echo "[!] Warning: Database restore may have failed — no users found in oc_users."
+else
+  echo "[*] Database restore verified: $USER_COUNT user(s) in oc_users."
+fi
+
+echo "[7/7] Restarting Nextcloud..."
 docker compose -f "$REPO_DIR/docker-compose.yml" up -d nextcloud
 
 echo "[*] Disabling maintenance mode..."

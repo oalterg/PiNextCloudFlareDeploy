@@ -33,13 +33,13 @@ DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
 STAGING="$BACKUP_MOUNTDIR/.staging_$DATE"
 ARCHIVE="$BACKUP_MOUNTDIR/nextcloud_backup_${DATE}.tar.gz"
 
-mkdir -p "$STAGING/data" "$STAGING/db"
+mkdir -p "$STAGING/data" "$STAGING/db" "$STAGING/config"
 
 # === DYNAMIC DISK SPACE CHECK ===
 echo "[*] Estimating backup size..."
 ESTIMATED_DATA_KB=$(du -sk "$NEXTCLOUD_DATA_DIR" | awk '{print $1}')
-# Add 10% for DB + overhead
-ESTIMATED_TOTAL_KB=$((ESTIMATED_DATA_KB + ESTIMATED_DATA_KB / 10))
+# Add 20% for DB + config + overhead
+ESTIMATED_TOTAL_KB=$((ESTIMATED_DATA_KB + ESTIMATED_DATA_KB / 5))
 
 check_space_and_cleanup() {
     AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
@@ -80,12 +80,20 @@ docker run --rm \
   > "$STAGING/db/nextcloud.sql"
 
 # Data copy (bind-mounted)
-echo "[3/5] Copying data directory..."
+echo "[3/5] Copying nextcloud data directory..."
 rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING/data/"
+
+# Config copy from nextcloud_html
+echo "[3b/5] Copying nextcloud config directory..."
+# NC_HTML_VOLUME="raspi-nextcloud-setup_nextcloud_html"
+NC_HTML_VOLUME=$(docker inspect "$NC_CID" \
+  --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+docker run --rm -v ${NC_HTML_VOLUME}:/volume -v "$STAGING/config":/backup alpine \
+    sh -c "cp -a /volume/config/. /backup/"
 
 # Package atomically
 echo "[4/5] Creating archive..."
-tar -C "$STAGING" -czf "$ARCHIVE" data db
+tar -C "$STAGING" -czf "$ARCHIVE" data db config
 sync
 
 # Maintenance OFF
