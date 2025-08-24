@@ -147,7 +147,7 @@ setup_cloudflare() {
 
     if [[ -z "$CF_TUNNEL_ID" || "$CF_TUNNEL_ID" == "null" ]]; then
         echo "Creating new tunnel: $TUNNEL_NAME"
-        CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $3}')
+        CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $NF}')
     else
         echo "Reusing existing tunnel ID: $CF_TUNNEL_ID"
     fi
@@ -159,7 +159,7 @@ setup_cloudflare() {
     mkdir -p /etc/cloudflared
     
     cat > /etc/cloudflared/config.yml <<EOF
-tunnel: $CF_TUNNEL_ID
+tunnel: $TUNNEL_NAME
 credentials-file: $CREDENTIALS_FILE
 ingress:
   - hostname: $CF_HOSTNAME
