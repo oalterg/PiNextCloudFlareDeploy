@@ -232,10 +232,15 @@ configure_nextcloud_https() {
     NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
     docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https
     
+    docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="172.18.0.1"
+    docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="127.0.0.1"
+
     echo "Restarting Nextcloud service to apply changes..."
     docker compose -f "$COMPOSE_FILE" restart nextcloud
     
     wait_for_healthy "nextcloud" 120
+
+
 }
 
 setup_backup_drive() {
