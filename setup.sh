@@ -25,7 +25,7 @@ exec < /dev/tty
 cd "$REPO_DIR"
 
 # --- OS preparation ---
-echo "[1/14] Updating system..."
+echo "[1/12] Updating system..."
 apt-get update -y && apt-get upgrade -y
 
 echo "[2/12] Installing dependencies..."
@@ -57,15 +57,10 @@ systemctl enable docker
 systemctl start docker
 
 # --- Gather parameters ---
-echo "[3/14] Gathering configuration..."
+echo "[3/12] Gathering configuration..."
 read -rp "Nextcloud admin username [admin]: " NEXTCLOUD_ADMIN_USER
 NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER:-admin}
 read -rp "Nextcloud admin password: " NEXTCLOUD_ADMIN_PASSWORD
-
-# multiple domains allowed (space-separated)
-read -rp "Nextcloud domain(s) (space-separated, e.g. pinextcloud.local cloud.example.com): " NEXTCLOUD_TRUSTED_DOMAINS
-DOMAIN_ARRAY=($NEXTCLOUD_TRUSTED_DOMAINS)
-PRIMARY_DOMAIN="${DOMAIN_ARRAY[0]}"
 
 read -rp "MySQL root password: " MYSQL_ROOT_PASSWORD
 read -rp "MySQL user [nextcloud]: " MYSQL_USER
@@ -85,37 +80,33 @@ read -rp "Backup directory [$(${ECHO_BACKUP_MOUNTDIR:-echo /mnt/backup})]: " BAC
 BACKUP_MOUNTDIR="${BACKUP_MOUNTDIR_INPUT:-/mnt/backupssd}"
 mkdir -p "$BACKUP_MOUNTDIR"
 
-# --- Cloudflare Tunnel (optional, tokenless) ---
-echo "[4/14] Cloudflare tunnel setup..."
-read -rp "Use Cloudflare Tunnel? [y/N]: " USE_CF
-USE_CF=${USE_CF:-n}
-
+# --- Cloudflare Tunnel ---
+echo "[4/12] Cloudflare tunnel setup..."
 CF_TUNNEL_ID=""
-CF_HOSTNAME=""
-if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
-  echo "Logging into Cloudflare (a URL will open in your browser)..."
-  cloudflared tunnel login
+echo "Logging into Cloudflare (a URL will open in your browser)..."
+cloudflared tunnel login
 
-  read -rp "Enter your base domain (already in Cloudflare, e.g. example.com): " BASE_DOMAIN
-  read -rp "Enter desired subdomain (e.g. nextcloud): " SUBDOMAIN
-  CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+read -rp "Enter your base domain (already in Cloudflare, e.g. example.com): " BASE_DOMAIN
+read -rp "Enter desired subdomain (e.g. nextcloud): " SUBDOMAIN
+CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME $(hostname).local"
 
-  TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
-  EXISTING_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
-  if [[ -n "$EXISTING_TUNNEL_ID" && "$EXISTING_TUNNEL_ID" != "null" ]]; then
-    CF_TUNNEL_ID="$EXISTING_TUNNEL_ID"
-    echo "Reusing tunnel ID: $CF_TUNNEL_ID"
-  else
-    CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $3}')
-    echo "Created new tunnel: $CF_TUNNEL_ID"
-  fi
+TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+EXISTING_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+if [[ -n "$EXISTING_TUNNEL_ID" && "$EXISTING_TUNNEL_ID" != "null" ]]; then
+  CF_TUNNEL_ID="$EXISTING_TUNNEL_ID"
+  echo "Reusing tunnel ID: $CF_TUNNEL_ID"
+else
+  CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $3}')
+  echo "Created new tunnel: $CF_TUNNEL_ID"
+fi
 
-  echo "Routing DNS for $CF_HOSTNAME..."
-  cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_HOSTNAME" || echo "DNS route already exists, continuing..."
+echo "Routing DNS for $CF_HOSTNAME..."
+cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_HOSTNAME" || echo "DNS route already exists, continuing..."
 
-  CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
-  mkdir -p /etc/cloudflared
-  cat > /etc/cloudflared/config.yml <<EOF
+CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
+mkdir -p /etc/cloudflared
+cat > /etc/cloudflared/config.yml <<EOF
 tunnel: $CF_TUNNEL_ID
 credentials-file: $CREDENTIALS_FILE
 
@@ -125,8 +116,8 @@ ingress:
   - service: http_status:404
 EOF
 
-  # Create a reliable systemd service
-  cat >/etc/systemd/system/cloudflared.service <<EOF
+# Create a reliable systemd service
+cat >/etc/systemd/system/cloudflared.service <<EOF
 [Unit]
 Description=Cloudflare Tunnel
 After=network-online.target
@@ -144,13 +135,13 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable cloudflared
-  systemctl restart cloudflared
-fi
+systemctl daemon-reload
+systemctl enable cloudflared
+systemctl restart cloudflared
+
 
 # --- Generate .env ---
-echo "[5/14] Writing .env..."
+echo "[5/12] Writing .env file..."
 cp "$ENV_TEMPLATE" "$ENV_FILE"
 sed -i \
   -e "s|NEXTCLOUD_DATA_DIR=.*|NEXTCLOUD_DATA_DIR=$NEXTCLOUD_DATA_DIR|" \
@@ -168,13 +159,22 @@ sed -i \
   "$ENV_FILE"
 
 # --- Deploy ---
-echo "[6/9] Deploying Docker stack..."
+echo "[6/12] Deploying Docker stack..."
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
-echo "Waiting a moment for containers to settle..."
+echo "Waiting for containers to initialize..."
+sleep 30 # Increased wait time for initial setup
+
+# --- Post-Deploy Configuration ---
+echo "[7/12] Configuring HTTPS proxy settings..."
+NC_CID="$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)"
+docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https
+
+echo "[8/12] Restarting Nextcloud service to apply changes..."
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" restart nextcloud
 sleep 10
 
 # --- Backup drive: auto-detect & (optional) format ---
-echo "[8/14] Backup drive detection..."
+echo "[9/12] Backup drive detection..."
 # If BACKUP_MOUNTDIR not a mountpoint, offer to prep a drive
 if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
   # Prefer labeled partition
@@ -213,7 +213,7 @@ else
 fi
 
 # --- Offer restore (AFTER stack is running) ---
-echo "[9/14] Checking for existing backups to restore..."
+echo "[10/12] Checking for existing backups to restore..."
 LATEST_BACKUP="$(ls -t "$BACKUP_MOUNTDIR"/*.tar.gz 2>/dev/null | head -n1 || true)"
 if [[ -n "${LATEST_BACKUP:-}" ]]; then
   echo "Latest backup found: $LATEST_BACKUP"
@@ -228,7 +228,7 @@ else
 fi
 
 # --- Install backup job ---
-echo "[10/14] Installing backup script + cron..."
+echo "[11/12] Installing backup script + cron job..."
 
 if mountpoint -q "$BACKUP_MOUNTDIR"; then
   chmod +x "$REPO_DIR/backup.sh"
@@ -242,9 +242,5 @@ else
 fi
 
 
-echo "[11-14/14] Installation complete."
-if [[ "$USE_CF" =~ ^[Yy]$ ]]; then
-  echo "Access Nextcloud at: https://$CF_HOSTNAME"
-else
-  echo "Access Nextcloud locally at: http://$PRIMARY_DOMAIN:$NEXTCLOUD_PORT"
-fi
+echo "[12/12] Installation complete."
+echo "Access Nextcloud at: https://$CF_HOSTNAME"
