@@ -184,7 +184,13 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now cloudflared
+    if systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+        echo "[*] Service already enabled, restarting..."
+        systemctl restart cloudflared
+    else
+        echo "[*] Enabling and starting service..."
+        systemctl enable --now cloudflared
+    fi
 }
 
 generate_env_file() {
