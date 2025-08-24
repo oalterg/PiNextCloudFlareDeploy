@@ -1,9 +1,12 @@
 services:
   nextcloud:
-    image: nextcloud:latest
+    image: nextcloud:31-apache # Pinned to a specific major version for stability
     restart: unless-stopped
     ports:
       - "${NEXTCLOUD_PORT}:80"
+    volumes:
+      - nextcloud_html:/var/www/html
+      - ${NEXTCLOUD_DATA_DIR}:/var/www/html/data
     environment:
       - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER}
       - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
@@ -12,22 +15,51 @@ services:
       - MYSQL_DATABASE=${MYSQL_DATABASE}
       - MYSQL_USER=${MYSQL_USER}
       - MYSQL_HOST=db
-    volumes:
-      - nextcloud_html:/var/www/html
-      - ${NEXTCLOUD_DATA_DIR}:/var/www/html/data
     depends_on:
-      - db
+      db:
+        condition: service_healthy # Waits for the DB to be ready
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/status.php || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    # deploy: # Optional: Uncomment to limit resources on a Swarm cluster or with 'docker compose --with-deploy'
+    #   resources:
+    #     limits:
+    #       cpus: '1.0'
+    #       memory: 1G
 
   db:
-    image: mariadb:latest
+    image: mariadb:11.2 # Pinned to a specific major version
     restart: unless-stopped
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+    volumes:
+      - db_data:/var/lib/mysql
     environment:
       - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
       - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - MYSQL_DATABASE=${MYSQL_DATABASE}
       - MYSQL_USER=${MYSQL_USER}
-    volumes:
-      - db_data:/var/lib/mysql
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--su-mysql", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1.0'
+    #       memory: 1.5G
 
 volumes:
   nextcloud_html:
