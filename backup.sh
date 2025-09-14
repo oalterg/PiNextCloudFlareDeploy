@@ -20,13 +20,37 @@ source "$ENV_FILE"
 : "${MYSQL_PASSWORD:?}"
 : "${MYSQL_DATABASE:?}"
 
+auto_mount_backup() {
+    if mountpoint -q "$BACKUP_MOUNTDIR"; then return 0; fi
+    if [[ -n "$BACKUP_LABEL" ]] && blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
+        mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || {
+            echo "[!] Failed to mount $BACKUP_LABEL."
+            exit 1
+        }
+        return 0
+    fi
+    # Auto-scan fallback
+    local usb_dev
+    usb_dev=$(lsblk -o NAME,TYPE,RM,MOUNTPOINT | grep 'disk\|part' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $4=="" {print "/dev/"$1; exit}')  # Removable, unmounted
+    if [[ -n "$usb_dev" ]]; then
+        echo "[*] Auto-detected backup drive: $usb_dev"
+        BACKUP_LABEL="BackupDrive_$(date +%Y%m%d)"
+        mkfs.ext4 -F -L "$BACKUP_LABEL" "$usb_dev"  # Auto-format if empty (add --confirm flag for prod)
+        mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || exit 1
+        echo "BACKUP_LABEL=$BACKUP_LABEL" >> "$ENV_FILE"  # Update .env idempotently
+    else
+        echo "[!] No external drive found. Using local fallback: $BACKUP_MOUNTDIR (limited space!)"
+        mkdir -p "$BACKUP_MOUNTDIR"
+    fi
+}
+
 # --- Locking ---
 exec 200>"$LOCK_FILE"
 flock -n 200 || { echo "Backup is already running."; exit 1; }
 
 # --- Staging and Cleanup ---
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
-STAGING_DIR="$BACKUP_MOUNTDIR/.staging_$DATE"
+STAGING_DIR=$(mktemp -d -p "$BACKUP_MOUNTDIR" staging_XXXXXX)  # Secure temp
 ARCHIVE_PATH="$BACKUP_MOUNTDIR/nextcloud_backup_${DATE}.tar.gz"
 
 # TRAP to ensure cleanup and maintenance mode is turned off on exit/error
@@ -42,20 +66,12 @@ cleanup() {
         rm -rf "$STAGING_DIR"
         echo "[*] Staging directory removed."
     fi
+    rm -f "$LOCK_FILE"  # Ensure lock release
 }
 trap cleanup EXIT INT TERM
 
 # --- Mount Backup Drive ---
-mkdir -p "$BACKUP_MOUNTDIR"
-if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
-  if blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
-    echo "[*] Mounting backup drive '$BACKUP_LABEL' to $BACKUP_MOUNTDIR..."
-    mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR"
-  else
-    echo "[!] Backup drive with label '$BACKUP_LABEL' not found. Aborting."
-    exit 1
-  fi
-fi
+auto_mount_backup
 
 # --- Main Backup Logic ---
 echo "=== Starting Nextcloud Backup: $DATE ==="

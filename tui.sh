@@ -15,8 +15,18 @@ HEIGHT=20
 WIDTH=70
 CHOICE_HEIGHT=8
 
-# --- Ensure scripts are executable ---
-chmod +x "$REPO_DIR/setup.sh" "$REPO_DIR/backup.sh" "$REPO_DIR/restore.sh"
+# --- Ensure dependencies and scripts are ready (idempotent) ---
+if ! command -v dialog >/dev/null 2>&1; then
+    echo "Error: 'dialog' is required but not installed." >&2
+    exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Error: 'docker' is required but not installed." >&2
+    exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+chmod +x "$REPO_DIR/setup.sh" "$REPO_DIR/backup.sh" "$REPO_DIR/restore.sh" 2>/dev/null || true
 
 # --- Helper Functions ---
 get_nc_cid() {
@@ -27,19 +37,14 @@ is_stack_running() {
     [[ -n "$(get_nc_cid)" ]]
 }
 
-show_progress() {
+# Simple wait function (replaces simulated progress bar for user feedback)
+wait_for_completion() {
     local pid=$1
     local title=$2
     local text=$3
-    local progress=0
-
-    while [ -d "/proc/$pid" ]; do
-        echo "$progress"
-        echo -e "XXX\n$progress\n$text\nXXX"
-        progress=$(((progress + 5) % 101))
-        sleep 0.5
-    done | dialog --title "$title" --gauge "$text" 10 70 0
-
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+    done
     wait "$pid"
     return $?
 }
@@ -47,10 +52,27 @@ show_progress() {
 # --- TUI Main Functions ---
 
 run_initial_setup() {
-    # This function will now pass variables to a non-interactive setup script
+    # Check if stack is already running (idempotent: warn on re-run)
+    if is_stack_running; then
+        dialog --title "Warning" --yesno "Stack is already running. Re-run setup? (May reset config)" 8 50
+        [[ $? -ne 0 ]] && return
+    fi
+
+    # In run_initial_setup(), before the dialog form:
+    # Auto-scan backup drive
+    local backup_label detected_dev
+    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
+    if [[ -n "$detected_dev" ]]; then
+        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
+        dialog --msgbox "Detected external drive: $detected_dev\nSuggested label: $backup_label\nFormat if needed?" 8 60
+        export AUTO_FORMAT_BACKUP=true  # Enable if confirmed
+    else
+        backup_label="LocalFallback"
+        export AUTO_FORMAT_BACKUP=false
+    fi
+
     exec 3>&1
     local values
-    # Run dialog safely (don’t let set -e kill the script)
     if ! values=$(dialog --backtitle "Nextcloud Initial Setup" \
         --title "Configuration" \
         --form "Enter your configuration details below." \
@@ -60,6 +82,7 @@ run_initial_setup() {
         "DB User Password:" 3 1 ""            3 25 40 0 \
         "Base Domain:"      4 1 "example.com" 4 25 40 0 \
         "Subdomain:"        5 1 "nextcloud"   5 25 40 0 \
+        "Backup Label:"     6 1 "$backup_label" 6 25 40 0 \
         2>&1 1>&3); then
         exec 3>&-
         echo "[INFO] User canceled or dialog failed at $(date)" >> "$MAIN_LOG_FILE"
@@ -70,10 +93,9 @@ run_initial_setup() {
     [[ -z "$values" ]] && return # User pressed cancel
 
     mapfile -t values_array <<< "$values"
-    # Validate that we received all expected inputs
     if [ "${#values_array[@]}" -lt 5 ]; then
         dialog --title "Input Error" --msgbox "All fields are required. Please try again." 8 50
-        return
+        return 1
     fi
 
     local ADMIN_PASS="${values_array[0]}"
@@ -81,46 +103,47 @@ run_initial_setup() {
     local DB_USER_PASS="${values_array[2]}"
     local BASE_DOMAIN="${values_array[3]}"
     local SUBDOMAIN="${values_array[4]}"
+    local BACKUP_LABEL="${values_array[5]}"  # Index 5 for new field
+    export BACKUP_LABEL="${BACKUP_LABEL:-$backup_label}"  # Fallback to auto
+    export AUTO_FORMAT_BACKUP=true  # Or from confirmation
+
     
-    # Proactively create and set permissions on the log file to rule out redirection errors
+    # Safeguard empty vars
+    if [[ -z "$ADMIN_PASS" || -z "$DB_ROOT_PASS" || -z "$DB_USER_PASS" || -z "$BASE_DOMAIN" ]]; then
+        dialog --title "Input Error" --msgbox "One or more fields are empty. Please try again." 8 50
+        return 1
+    fi
+
+    # Ensure log file exists and is writable
     touch "$MAIN_LOG_FILE"
     chmod 644 "$MAIN_LOG_FILE"
 
     (
-        # Enable verbose tracing and add a marker to see if the subshell starts
         set -x
         echo "--- TUI: Subshell for setup started at $(date) ---"
-
-        # Check for empty variables as a safeguard
-        if [[ -z "$ADMIN_PASS" || -z "$DB_ROOT_PASS" || -z "$DB_USER_PASS" || -z "$BASE_DOMAIN" ]]; then
-            echo "[FATAL] One or more required variables from the form are empty. Aborting." >&2
-            exit 1
-        fi
-
         export NEXTCLOUD_ADMIN_PASSWORD="$ADMIN_PASS"
         export MYSQL_ROOT_PASSWORD="$DB_ROOT_PASS"
         export MYSQL_PASSWORD="$DB_USER_PASS"
         export BASE_DOMAIN="$BASE_DOMAIN"
         export SUBDOMAIN="${SUBDOMAIN:-nextcloud}"
         "$REPO_DIR/setup.sh" --non-interactive
-    ) >"$MAIN_LOG_FILE" 2>&1 &
+    ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
     local pid=$!
-
 
     dialog --title "Initial Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
     local tail_pid=$!
 
-    show_progress "$pid" "Setup in Progress" "Running initial setup..."
+    wait_for_completion "$pid" "Setup in Progress" "Running initial setup... (Check log for details)"
     local exit_code=$?
     
-    # Wait a moment before killing tailbox to ensure final logs are displayed
-    sleep 2
+    # Clean up tailbox
+    sleep 1
     kill "$tail_pid" 2>/dev/null || true
     
     if [ $exit_code -eq 0 ]; then
         dialog --title "Success" --msgbox "Setup completed successfully!" 8 40
     else
-        dialog --title "Error" --msgbox "Setup failed. A detailed log has been saved to:\n\n$MAIN_LOG_FILE" 10 70
+        dialog --title "Error" --msgbox "Setup failed. Detailed log saved to:\n\n$MAIN_LOG_FILE" 10 70
     fi
 }
 
@@ -129,16 +152,16 @@ trigger_backup() {
     if [ $? -eq 0 ]; then
         (
             "$REPO_DIR/backup.sh"
-        ) >"$BACKUP_LOG_FILE" 2>&1 &
+        ) >> "$BACKUP_LOG_FILE" 2>&1 &  # Append for history
         local pid=$!
 
         dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 &
         local tail_pid=$!
 
-        show_progress $pid "Backup in Progress" "Creating backup archive..."
+        wait_for_completion "$pid" "Backup in Progress" "Creating backup archive... (Check log for details)"
         local exit_code=$?
         
-        kill $tail_pid 2>/dev/null || true
+        kill "$tail_pid" 2>/dev/null || true
 
         if [ $exit_code -eq 0 ]; then
             dialog --title "Success" --msgbox "Backup completed successfully!" 8 40
@@ -149,13 +172,14 @@ trigger_backup() {
 }
 
 trigger_restore() {
-    source "$ENV_FILE" 2>/dev/null || true # Suppress error if file doesn't exist yet
+    source "$ENV_FILE" 2>/dev/null || true
     local backup_dir="${BACKUP_MOUNTDIR:-/mnt/backup}"
-    mapfile -t backups < <(find "$backup_dir" -maxdepth 1 -name 'nextcloud_backup_*.tar.gz' -printf "%f\n" 2>/dev/null | sort -r)
+    # Use time-based sort for newest-first, limit to 20 for usability
+    mapfile -t backups < <(ls -t "$backup_dir"/nextcloud_backup_*.tar.gz 2>/dev/null | xargs -n1 basename | head -20)
 
     if [ ${#backups[@]} -eq 0 ]; then
         dialog --title "Error" --msgbox "No backup files found in $backup_dir." 8 50
-        return
+        return 1
     fi
 
     local options=()
@@ -174,16 +198,16 @@ trigger_restore() {
         if [ $? -eq 0 ]; then
             (
                 "$REPO_DIR/restore.sh" "$backup_dir/$selected_file"
-            ) >"$RESTORE_LOG_FILE" 2>&1 &
+            ) >> "$RESTORE_LOG_FILE" 2>&1 &  # Append for history
             local pid=$!
 
             dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 &
             local tail_pid=$!
 
-            show_progress $pid "Restore in Progress" "Restoring data from backup..."
+            wait_for_completion "$pid" "Restore in Progress" "Restoring data from backup... (Check log for details)"
             local exit_code=$?
             
-            kill $tail_pid 2>/dev/null || true
+            kill "$tail_pid" 2>/dev/null || true
             
             if [ $exit_code -eq 0 ]; then
                 dialog --title "Success" --msgbox "Restore completed successfully!" 8 40
@@ -197,35 +221,47 @@ trigger_restore() {
 toggle_maintenance_mode() {
     if ! is_stack_running; then
         dialog --title "Error" --msgbox "Nextcloud stack is not running." 8 50
-        return
+        return 1
     fi
 
     local nc_cid
     nc_cid=$(get_nc_cid)
-    local current_status
-    current_status=$(docker exec -u www-data "$nc_cid" php occ maintenance:mode)
-
-    local new_mode
-    local new_status
-    if [[ "$current_status" == *"Maintenance mode is currently enabled"* ]]; then
-        new_mode="--off"
-        new_status="Disabled"
-    else
-        new_mode="--on"
-        new_status="Enabled"
+    if [[ -z "$nc_cid" ]]; then
+        dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
+        return 1
     fi
 
-    dialog --title "Confirm" --yesno "Maintenance mode is currently ${current_status##*is }. Do you want to turn it ${new_mode##*--}?" 10 60
+    local current_status
+    if ! current_status=$(docker exec -u www-data "$nc_cid" php occ maintenance:mode 2>&1); then
+        dialog --title "Error" --msgbox "Failed to query maintenance mode: $current_status" 8 50
+        return 1
+    fi
+
+    local status new_mode new_status
+    if echo "$current_status" | grep -q "enabled"; then
+        status="enabled"
+        new_mode="--off"
+        new_status="disabled"
+    else
+        status="disabled"
+        new_mode="--on"
+        new_status="enabled"
+    fi
+
+    dialog --title "Confirm" --yesno "Maintenance mode is currently $status. Do you want to turn it $new_status?" 10 60
     if [ $? -eq 0 ]; then
-        docker exec -u www-data "$nc_cid" php occ maintenance:mode "$new_mode" > /dev/null
-        dialog --title "Success" --msgbox "Maintenance mode is now $new_status." 8 40
+        if docker exec -u www-data "$nc_cid" php occ maintenance:mode "$new_mode" >/dev/null 2>&1; then
+            dialog --title "Success" --msgbox "Maintenance mode is now $new_status." 8 40
+        else
+            dialog --title "Error" --msgbox "Failed to toggle maintenance mode." 8 50
+        fi
     fi
 }
 
 run_files_scan() {
     if ! is_stack_running; then
         dialog --title "Error" --msgbox "Nextcloud stack is not running." 8 50
-        return
+        return 1
     fi
     
     exec 3>&1
@@ -238,17 +274,22 @@ run_files_scan() {
         if [ $? -eq 0 ]; then
             local nc_cid
             nc_cid=$(get_nc_cid)
+            if [[ -z "$nc_cid" ]]; then
+                dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
+                return 1
+            fi
             (
-                echo "Starting file scan for '$user' at $(date)..."
+                echo "=== File Scan Started at $(date) ===" 
                 docker exec -u www-data "$nc_cid" php occ files:scan "$user"
-            ) > "$MAIN_LOG_FILE" 2>&1 &
+                echo "=== File Scan Completed at $(date) ===" 
+            ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
             local pid=$!
             
             dialog --title "File Scan Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
             local tail_pid=$!
             
-            show_progress $pid "Scan in Progress" "Scanning user files..."
-            kill $tail_pid 2>/dev/null || true
+            wait_for_completion "$pid" "Scan in Progress" "Scanning user files... (Check log for details)"
+            kill "$tail_pid" 2>/dev/null || true
             
             dialog --title "Complete" --msgbox "File scan for '$user' finished. Check log for details." 8 60
         fi
@@ -275,7 +316,7 @@ main_menu() {
         if [ $exit_status -ne 0 ]; then
             clear
             echo "Exiting."
-            exit
+            exit 0
         fi
 
         case "$choice" in
@@ -349,13 +390,19 @@ logs_menu() {
             1) dialog --title "Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 ;;
             2) dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 ;;
             3) dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 ;;
-            4) docker compose -f "$COMPOSE_FILE" logs --tail="100" 2>&1 | dialog --title "Docker Logs" --programbox 25 80 ;;
+            4) 
+                local temp_log=$(mktemp /tmp/dockerlogs.XXXXXX)
+                if docker compose -f "$COMPOSE_FILE" logs --tail=100 > "$temp_log" 2>&1; then
+                    dialog --title "Docker Logs" --tailbox "$temp_log" 25 80
+                else
+                    dialog --title "Error" --msgbox "Failed to fetch Docker logs." 8 50
+                fi
+                rm -f "$temp_log"
+                ;;
         esac
     done
 }
 
-
 # --- Script Entrypoint ---
 cd "$REPO_DIR"
-mkdir -p "$LOG_DIR"
 main_menu
