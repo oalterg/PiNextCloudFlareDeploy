@@ -313,11 +313,17 @@ main_menu() {
         local exit_status=$?
         exec 3>&-
 
-        if [ $exit_status -ne 0 ]; then
-            clear
-            echo "Exiting."
-            exit 0
-        fi
+        case $exit_status in
+            0) ;;  # OK pressed, handle choice
+            1)  # Cancel pressed
+                clear
+                echo "Exiting."
+                exit 0
+                ;;
+            255)  # ESC pressed
+                continue  # redisplay main menu
+                ;;
+        esac
 
         case "$choice" in
             1) run_initial_setup ;;
@@ -339,8 +345,11 @@ backup_restore_menu() {
             2>&1 1>&3)
         local exit_status=$?
         exec 3>&-
-        
-        [[ $exit_status -ne 0 ]] && break
+
+        case $exit_status in
+            0) ;;  # OK
+            1|255) break ;;  # Back or ESC
+        esac
 
         case "$choice" in
             1) trigger_backup ;;
@@ -361,7 +370,10 @@ maintenance_menu() {
         local exit_status=$?
         exec 3>&-
 
-        [[ $exit_status -ne 0 ]] && break
+        case $exit_status in
+            0) ;;  # OK
+            1|255) break ;;  # Back or ESC
+        esac
 
         case "$choice" in
             1) toggle_maintenance_mode ;;
@@ -384,14 +396,18 @@ logs_menu() {
         local exit_status=$?
         exec 3>&-
 
-        [[ $exit_status -ne 0 ]] && break
+        case $exit_status in
+            0) ;;  # OK
+            1|255) break ;;  # Back or ESC
+        esac
         
         case "$choice" in
             1) dialog --title "Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 ;;
             2) dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 ;;
             3) dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 ;;
             4) 
-                local temp_log=$(mktemp /tmp/dockerlogs.XXXXXX)
+                local temp_log
+                temp_log=$(mktemp /tmp/dockerlogs.XXXXXX)
                 if docker compose -f "$COMPOSE_FILE" logs --tail=100 > "$temp_log" 2>&1; then
                     dialog --title "Docker Logs" --tailbox "$temp_log" 25 80
                 else
@@ -402,6 +418,7 @@ logs_menu() {
         esac
     done
 }
+
 
 # --- Script Entrypoint ---
 cd "$REPO_DIR"
