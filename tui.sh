@@ -49,6 +49,12 @@ wait_for_completion() {
     return $?
 }
 
+# Reset terminal after background dialogs (robustness)
+reset_terminal() {
+    sleep 0.5  # Brief pause for cleanup
+    stty sane 2>/dev/null || true
+}
+
 # --- TUI Main Functions ---
 
 run_initial_setup() {
@@ -58,7 +64,6 @@ run_initial_setup() {
         [[ $? -ne 0 ]] && return
     fi
 
-    # In run_initial_setup(), before the dialog form:
     # Auto-scan backup drive
     local backup_label detected_dev
     detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
@@ -71,9 +76,9 @@ run_initial_setup() {
         export AUTO_FORMAT_BACKUP=false
     fi
 
-    exec 3>&1
     local values
-    if ! values=$(dialog --backtitle "Nextcloud Initial Setup" \
+    values=$(dialog --backtitle "Nextcloud Initial Setup" \
+        --stdout \
         --title "Configuration" \
         --form "Enter your configuration details below." \
         25 60 16 \
@@ -82,15 +87,12 @@ run_initial_setup() {
         "DB User Password:" 3 1 ""            3 25 40 0 \
         "Base Domain:"      4 1 "example.com" 4 25 40 0 \
         "Subdomain:"        5 1 "nextcloud"   5 25 40 0 \
-        "Backup Label:"     6 1 "$backup_label" 6 25 40 0 \
-        2>&1 1>&3); then
-        exec 3>&-
+        "Backup Label:"     6 1 "$backup_label" 6 25 40 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
         echo "[INFO] User canceled or dialog failed at $(date)" >> "$MAIN_LOG_FILE"
         return 1
     fi
-    exec 3>&-
-
-    [[ -z "$values" ]] && return # User pressed cancel
 
     mapfile -t values_array <<< "$values"
     if [ "${#values_array[@]}" -lt 5 ]; then
@@ -107,7 +109,6 @@ run_initial_setup() {
     export BACKUP_LABEL="${BACKUP_LABEL:-$backup_label}"  # Fallback to auto
     export AUTO_FORMAT_BACKUP=true  # Or from confirmation
 
-    
     # Safeguard empty vars
     if [[ -z "$ADMIN_PASS" || -z "$DB_ROOT_PASS" || -z "$DB_USER_PASS" || -z "$BASE_DOMAIN" ]]; then
         dialog --title "Input Error" --msgbox "One or more fields are empty. Please try again." 8 50
@@ -139,6 +140,7 @@ run_initial_setup() {
     # Clean up tailbox
     sleep 1
     kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
     
     if [ $exit_code -eq 0 ]; then
         dialog --title "Success" --msgbox "Setup completed successfully!" 8 40
@@ -162,6 +164,7 @@ trigger_backup() {
         local exit_code=$?
         
         kill "$tail_pid" 2>/dev/null || true
+        reset_terminal
 
         if [ $exit_code -eq 0 ]; then
             dialog --title "Success" --msgbox "Backup completed successfully!" 8 40
@@ -187,33 +190,37 @@ trigger_restore() {
         options+=("$((i+1))" "${backups[$i]}")
     done
     
-    exec 3>&1
     local choice
-    choice=$(dialog --title "Select Backup to Restore" --menu "Choose a backup file:" $HEIGHT $WIDTH $CHOICE_HEIGHT "${options[@]}" 2>&1 1>&3)
-    exec 3>&-
+    choice=$(dialog --stdout \
+        --title "Select Backup to Restore" \
+        --menu "Choose a backup file:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+        "${options[@]}")
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$choice" ]; then
+        return 0
+    fi
 
-    if [ -n "$choice" ]; then
-        local selected_file="${backups[$((choice-1))]}"
-        dialog --title "Confirm Restore" --yesno "This will OVERWRITE all current data. Are you absolutely sure you want to restore from:\n\n$selected_file?" 12 60
-        if [ $? -eq 0 ]; then
-            (
-                "$REPO_DIR/restore.sh" "$backup_dir/$selected_file"
-            ) >> "$RESTORE_LOG_FILE" 2>&1 &  # Append for history
-            local pid=$!
+    local selected_file="${backups[$((choice-1))]}"
+    dialog --title "Confirm Restore" --yesno "This will OVERWRITE all current data. Are you absolutely sure you want to restore from:\n\n$selected_file?" 12 60
+    if [ $? -eq 0 ]; then
+        (
+            "$REPO_DIR/restore.sh" "$backup_dir/$selected_file"
+        ) >> "$RESTORE_LOG_FILE" 2>&1 &  # Append for history
+        local pid=$!
 
-            dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 &
-            local tail_pid=$!
+        dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 &
+        local tail_pid=$!
 
-            wait_for_completion "$pid" "Restore in Progress" "Restoring data from backup... (Check log for details)"
-            local exit_code=$?
-            
-            kill "$tail_pid" 2>/dev/null || true
-            
-            if [ $exit_code -eq 0 ]; then
-                dialog --title "Success" --msgbox "Restore completed successfully!" 8 40
-            else
-                dialog --title "Error" --msgbox "Restore failed. Check logs in $RESTORE_LOG_FILE" 8 60
-            fi
+        wait_for_completion "$pid" "Restore in Progress" "Restoring data from backup... (Check log for details)"
+        local exit_code=$?
+        
+        kill "$tail_pid" 2>/dev/null || true
+        reset_terminal
+        
+        if [ $exit_code -eq 0 ]; then
+            dialog --title "Success" --msgbox "Restore completed successfully!" 8 40
+        else
+            dialog --title "Error" --msgbox "Restore failed. Check logs in $RESTORE_LOG_FILE" 8 60
         fi
     fi
 }
@@ -256,6 +263,7 @@ toggle_maintenance_mode() {
             dialog --title "Error" --msgbox "Failed to toggle maintenance mode." 8 50
         fi
     fi
+    reset_terminal
 }
 
 run_files_scan() {
@@ -264,43 +272,45 @@ run_files_scan() {
         return 1
     fi
     
-    exec 3>&1
     local user
-    user=$(dialog --inputbox "Enter username to scan (or '--all' for all users):" 8 60 "" 2>&1 1>&3)
-    exec 3>&-
+    user=$(dialog --stdout \
+        --inputbox "Enter username to scan (or '--all' for all users):" 8 60 "")
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$user" ]; then
+        return 0
+    fi
 
-    if [ -n "$user" ]; then
-        dialog --title "Confirm Scan" --yesno "Scan files for user: '$user'?" 8 50
-        if [ $? -eq 0 ]; then
-            local nc_cid
-            nc_cid=$(get_nc_cid)
-            if [[ -z "$nc_cid" ]]; then
-                dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
-                return 1
-            fi
-            (
-                echo "=== File Scan Started at $(date) ===" 
-                docker exec -u www-data "$nc_cid" php occ files:scan "$user"
-                echo "=== File Scan Completed at $(date) ===" 
-            ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
-            local pid=$!
-            
-            dialog --title "File Scan Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
-            local tail_pid=$!
-            
-            wait_for_completion "$pid" "Scan in Progress" "Scanning user files... (Check log for details)"
-            kill "$tail_pid" 2>/dev/null || true
-            
-            dialog --title "Complete" --msgbox "File scan for '$user' finished. Check log for details." 8 60
+    dialog --title "Confirm Scan" --yesno "Scan files for user: '$user'?" 8 50
+    if [ $? -eq 0 ]; then
+        local nc_cid
+        nc_cid=$(get_nc_cid)
+        if [[ -z "$nc_cid" ]]; then
+            dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
+            return 1
         fi
+        (
+            echo "=== File Scan Started at $(date) ===" 
+            docker exec -u www-data "$nc_cid" php occ files:scan "$user"
+            echo "=== File Scan Completed at $(date) ===" 
+        ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
+        local pid=$!
+        
+        dialog --title "File Scan Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
+        local tail_pid=$!
+        
+        wait_for_completion "$pid" "Scan in Progress" "Scanning user files... (Check log for details)"
+        kill "$tail_pid" 2>/dev/null || true
+        reset_terminal
+        
+        dialog --title "Complete" --msgbox "File scan for '$user' finished. Check log for details." 8 60
     fi
 }
 
 main_menu() {
     while true; do
-        exec 3>&1
         local choice
         choice=$(dialog --backtitle "Nextcloud Pi Manager" \
+            --stdout \
             --title "Main Menu" \
             --cancel-label "Exit" \
             --menu "Select an option:" \
@@ -308,22 +318,13 @@ main_menu() {
             1 "Initial System Setup" \
             2 "Backup/Restore" \
             3 "Maintenance" \
-            4 "View Logs" \
-            2>&1 1>&3)
-        local exit_status=$?
-        exec 3>&-
-
-        case $exit_status in
-            0) ;;  # OK pressed, handle choice
-            1)  # Cancel pressed
-                clear
-                echo "Exiting."
-                exit 0
-                ;;
-            255)  # ESC pressed
-                continue  # redisplay main menu
-                ;;
-        esac
+            4 "View Logs")
+        local retval=$?
+        if [ $retval -ne 0 ]; then
+            clear
+            echo "Exiting."
+            exit 0
+        fi
 
         case "$choice" in
             1) run_initial_setup ;;
@@ -331,75 +332,69 @@ main_menu() {
             3) maintenance_menu ;;
             4) logs_menu ;;
         esac
+        reset_terminal  # Ensure clean state after actions
     done
 }
 
 backup_restore_menu() {
     while true; do
-        exec 3>&1
         local choice
-        choice=$(dialog --title "Backup/Restore Menu" --cancel-label "Back" \
-            --menu "Select an action:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+        choice=$(dialog --stdout \
+            --title "Backup/Restore Menu" \
+            --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            0 "Back to Main Menu" \
             1 "Trigger Manual Backup" \
-            2 "Restore From Backup" \
-            2>&1 1>&3)
-        local exit_status=$?
-        exec 3>&-
-
-        case $exit_status in
-            0) ;;  # OK
-            1|255) break ;;  # Back or ESC
-        esac
+            2 "Restore From Backup")
+        local retval=$?
+        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+            return 0  # Explicit back or cancel -> return to main
+        fi
 
         case "$choice" in
             1) trigger_backup ;;
             2) trigger_restore ;;
         esac
+        reset_terminal  # Clean after actions
     done
 }
 
 maintenance_menu() {
     while true; do
-        exec 3>&1
         local choice
-        choice=$(dialog --title "Maintenance Menu" --cancel-label "Back" \
-            --menu "Select an action:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+        choice=$(dialog --stdout \
+            --title "Maintenance Menu" \
+            --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            0 "Back to Main Menu" \
             1 "Toggle Maintenance Mode" \
-            2 "Scan User Files (files:scan)" \
-            2>&1 1>&3)
-        local exit_status=$?
-        exec 3>&-
-
-        case $exit_status in
-            0) ;;  # OK
-            1|255) break ;;  # Back or ESC
-        esac
+            2 "Scan User Files (files:scan)")
+        local retval=$?
+        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+            return 0  # Explicit back or cancel -> return to main
+        fi
 
         case "$choice" in
             1) toggle_maintenance_mode ;;
             2) run_files_scan ;;
         esac
+        reset_terminal  # Clean after actions
     done
 }
 
 logs_menu() {
     while true; do
-        exec 3>&1
         local choice
-        choice=$(dialog --title "View Logs" --cancel-label "Back" \
-            --menu "Select a log to view:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+        choice=$(dialog --stdout \
+            --title "View Logs" \
+            --menu "Select a log to view (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            0 "Back to Main Menu" \
             1 "Main Setup Log" \
             2 "Backup Log" \
             3 "Restore Log" \
-            4 "Docker Compose Logs" \
-            2>&1 1>&3)
-        local exit_status=$?
-        exec 3>&-
-
-        case $exit_status in
-            0) ;;  # OK
-            1|255) break ;;  # Back or ESC
-        esac
+            4 "Docker Compose Logs")
+        local retval=$?
+        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+            return 0  # Explicit back or cancel -> return to main
+        fi
         
         case "$choice" in
             1) dialog --title "Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 ;;
@@ -416,10 +411,10 @@ logs_menu() {
                 rm -f "$temp_log"
                 ;;
         esac
+        reset_terminal  # Clean after viewing
     done
 }
 
-
 # --- Script Entrypoint ---
-cd "$REPO_DIR"
+cd "$REPO_DIR" || { echo "Error: Cannot access $REPO_DIR"; exit 1; }
 main_menu
