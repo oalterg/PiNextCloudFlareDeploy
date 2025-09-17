@@ -11,6 +11,8 @@ BACKUP_LOG_FILE="$LOG_DIR/backup.log"
 RESTORE_LOG_FILE="$LOG_DIR/restore.log"
 ENV_FILE="$REPO_DIR/.env"
 COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+CRON_FILE="/etc/cron.d/nextcloud-backup"
+HEALTH_LOG_FILE="$LOG_DIR/health_check.log"
 HEIGHT=20
 WIDTH=70
 CHOICE_HEIGHT=8
@@ -53,6 +55,200 @@ wait_for_completion() {
 reset_terminal() {
     sleep 0.5  # Brief pause for cleanup
     stty sane 2>/dev/null || true
+}
+
+# Auto-detect backup drive (reusable)
+auto_detect_backup_drive() {
+    local detected_dev backup_label
+    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
+    if [[ -n "$detected_dev" ]]; then
+        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
+        echo "$detected_dev|$backup_label"
+    else
+        echo "|LocalFallback"
+    fi
+}
+
+# Update .env with new values (idempotent)
+update_env() {
+    local key="$1" value="$2"
+    if grep -q "^$key=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s/^$key=.*/$key=$value/" "$ENV_FILE"
+    else
+        echo "$key=$value" >> "$ENV_FILE"
+    fi
+}
+
+# Install/update cron job based on custom schedule
+install_backup_cron() {
+    local minute="$1" hour="$2" day_of_month="$3" month="$4" day_of_week="$5"
+    local cron_expr="$minute $hour $day_of_month $month $day_of_week"
+
+    local cron_content="# Run Nextcloud backup at $cron_expr\n$cron_expr root $REPO_DIR/backup.sh >> $BACKUP_LOG_FILE 2>&1\n"
+    if [[ -f "$CRON_FILE" && $(cat "$CRON_FILE") == *"$cron_expr"* ]]; then
+        echo "Cron job already up-to-date for schedule $cron_expr."
+    else
+        echo -e "$cron_content" > "$CRON_FILE"
+        chmod 644 "$CRON_FILE"
+        echo "Cron job updated for schedule $cron_expr."
+    fi
+}
+
+# Configure backup drive (mount/format)
+configure_backup_drive() {
+    local backup_label="$1" mount_dir="$2" auto_format="$3"
+    local detected_info auto_dev suggested_label
+
+    # Auto-detect suggestion
+    detected_info=$(auto_detect_backup_drive)
+    auto_dev=$(echo "$detected_info" | cut -d'|' -f1)
+    suggested_label=$(echo "$detected_info" | cut -d'|' -f2)
+
+    if [[ "$auto_dev" != "" && "$suggested_label" != "LocalFallback" ]]; then
+        dialog --msgbox "Detected external drive: $auto_dev\nSuggested label: $suggested_label\n(You can override below)" 10 60
+    fi
+
+    local values
+    values=$(dialog --backtitle "Backup Drive Configuration" \
+        --stdout \
+        --title "Configure Backup Drive" \
+        --form "Enter backup drive details:" \
+        15 60 8 \
+        "Mount Point:" 1 1 "$mount_dir" 1 20 40 0 \
+        "Label:"       2 1 "${backup_label:-$suggested_label}" 2 20 40 0 \
+        "Auto-Format? (Y/N):" 3 1 "${auto_format:-N}" 3 20 10 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
+        return 1
+    fi
+
+    mapfile -t values_array <<< "$values"
+    local new_mount="${values_array[0]}"
+    local new_label="${values_array[1]}"
+    local new_format="${values_array[2]}"
+
+    # Update .env
+    update_env "BACKUP_MOUNTDIR" "$new_mount"
+    update_env "BACKUP_LABEL" "$new_label"
+    update_env "AUTO_FORMAT_BACKUP" "$new_format"
+
+    mkdir -p "$new_mount"
+
+    # Format if requested and needed
+    if [[ "$new_format" == "Y" || "$new_format" == "y" ]]; then
+        dialog --title "WARNING" --yesno "Formatting will ERASE all data on the drive with label '$new_label'. Proceed?" 8 60
+        if [ $? -eq 0 ]; then
+            local dev
+            dev=$(blkid -L "$new_label" 2>/dev/null || echo "$auto_dev")
+            if [[ -n "$dev" ]]; then
+                mkfs.ext4 -F -L "$new_label" "$dev" >> "$BACKUP_LOG_FILE" 2>&1
+                echo "[INFO] Formatted drive $dev with label $new_label" >> "$BACKUP_LOG_FILE"
+            else
+                dialog --title "Error" --msgbox "Drive not found for formatting." 8 50
+                return 1
+            fi
+        else
+            return 0
+        fi
+    fi
+
+    # Mount
+    if ! mountpoint -q "$new_mount"; then
+        if blkid -L "$new_label" >/dev/null 2>&1; then
+            mount -L "$new_label" "$new_mount" || {
+                dialog --title "Error" --msgbox "Failed to mount drive." 8 50
+                return 1
+            }
+            # Add to fstab if not present
+            local uuid
+            uuid=$(blkid -o value -s UUID -L "$new_label")
+            if ! grep -q "$uuid" /etc/fstab; then
+                echo "UUID=$uuid $new_mount ext4 defaults,nofail 0 2" >> /etc/fstab
+            fi
+        else
+            dialog --title "Error" --msgbox "Drive with label '$new_label' not found." 8 50
+            return 1
+        fi
+    fi
+
+    dialog --title "Success" --msgbox "Backup drive configured and mounted at $new_mount." 8 50
+}
+
+# System Health Check
+system_health_check() {
+    touch "$HEALTH_LOG_FILE"
+    chmod 644 "$HEALTH_LOG_FILE"
+
+    (
+        echo "=== System Health Check Started at $(date) ==="
+
+        # Docker status
+        echo "[CHECK] Docker service:"
+        if systemctl is-active --quiet docker; then
+            echo "  ✅ Docker is running"
+        else
+            echo "  ❌ Docker is not running"
+        fi
+
+        # Stack status
+        echo "[CHECK] Nextcloud stack:"
+        if is_stack_running; then
+            echo "  ✅ Stack is running"
+            local nc_cid db_cid
+            nc_cid=$(get_nc_cid)
+            db_cid=$(docker compose -f "$COMPOSE_FILE" ps -q db 2>/dev/null)
+            if [[ -n "$nc_cid" && -n "$db_cid" ]]; then
+                local nc_health db_health
+                nc_health=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$nc_cid" 2>/dev/null || echo "unknown")
+                db_health=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$db_cid" 2>/dev/null || echo "unknown")
+                echo "  Nextcloud health: $nc_health"
+                echo "  DB health: $db_health"
+            fi
+        else
+            echo "  ❌ Stack is not running"
+        fi
+
+        # Disk space
+        echo "[CHECK] Disk usage:"
+        df -h / | tail -1 | awk '{print "  Root: " $5 " used (" $4 " available)"}'
+        source "$ENV_FILE" 2>/dev/null || true
+        local backup_dir="${BACKUP_MOUNTDIR:-/mnt/backup}"
+        if mountpoint -q "$backup_dir"; then
+            df -h "$backup_dir" | tail -1 | awk '{print "  Backup: " $5 " used (" $4 " available)"}'
+        else
+            echo "  Backup dir not mounted"
+        fi
+
+        # Backup drive mount
+        echo "[CHECK] Backup drive:"
+        if mountpoint -q "$backup_dir"; then
+            echo "  ✅ Mounted at $backup_dir"
+        else
+            echo "  ❌ Not mounted"
+        fi
+
+        # Cron job
+        echo "[CHECK] Backup cron:"
+        if [[ -f "$CRON_FILE" ]]; then
+            echo "  ✅ Installed: $(head -1 "$CRON_FILE")"
+        else
+            echo "  ❌ Not installed"
+        fi
+
+        # Log errors (last 50 lines)
+        echo "[CHECK] Recent errors in logs:"
+        grep -i "error\|fail\|warn" "$MAIN_LOG_FILE" "$BACKUP_LOG_FILE" "$RESTORE_LOG_FILE" 2>/dev/null | tail -20 || echo "  No recent errors"
+
+        # Nextcloud occ status (if running)
+        if [[ -n "$nc_cid" ]]; then
+            echo "[CHECK] Nextcloud status:"
+            docker exec -u www-data "$nc_cid" php occ status 2>/dev/null || echo "  Could not query"
+        fi
+
+        echo "=== Health Check Completed at $(date) ==="
+    ) >> "$HEALTH_LOG_FILE" 2>&1
+
+    dialog --title "System Health Check" --tailbox "$HEALTH_LOG_FILE" 25 80
 }
 
 # --- TUI Main Functions ---
@@ -147,6 +343,76 @@ run_initial_setup() {
     else
         dialog --title "Error" --msgbox "Setup failed. Detailed log saved to:\n\n$MAIN_LOG_FILE" 10 70
     fi
+}
+
+configure_backup_settings() {
+    source "$ENV_FILE" 2>/dev/null || true
+    local current_retention="${BACKUP_RETENTION:-8}"
+    local current_label="${BACKUP_LABEL:-BackupDrive}"
+    local current_mount="${BACKUP_MOUNTDIR:-/mnt/backup}"
+    local current_format="${AUTO_FORMAT_BACKUP:-false}"
+
+    # Custom schedule form
+    local schedule_values
+    schedule_values=$(dialog --backtitle "Backup Schedule Configuration" \
+        --stdout \
+        --title "Configure Backup Time and Day" \
+        --form "Enter cron-like schedule (defaults: weekly Sun 03:00):\nMinute (0-59): 0\nHour (0-23): 3\nDay of Month (* or 1-31): *\nMonth (* or 1-12): *\nDay of Week (0-7, 0=Sun): 0" \
+        20 70 12 \
+        "Minute:"    1 1 "0"     1 20 10 0 \
+        "Hour:"      2 1 "3"     2 20 10 0 \
+        "Day/Month:" 3 1 "*"     3 20 10 0 \
+        "Month:"     4 1 "*"     4 20 10 0 \
+        "Day/Week:"  5 1 "0"     5 20 10 0)
+    local sched_retval=$?
+    if [ $sched_retval -ne 0 ] || [ -z "$schedule_values" ]; then
+        return 1  # Canceled
+    fi
+
+    mapfile -t sched_array <<< "$schedule_values"
+    local new_minute="${sched_array[0]}"
+    local new_hour="${sched_array[1]}"
+    local new_day_month="${sched_array[2]}"
+    local new_month="${sched_array[3]}"
+    local new_day_week="${sched_array[4]}"
+
+    # Validate inputs (basic)
+    if ! [[ "$new_minute" =~ ^[0-5]?[0-9]$ ]] || ! [[ "$new_hour" =~ ^[0-2]?[0-9]$ ]]; then
+        dialog --title "Input Error" --msgbox "Invalid minute/hour. Use 0-59 for minute, 0-23 for hour." 8 60
+        return 1
+    fi
+
+    # Retention input
+    local retention_input
+    retention_input=$(dialog --stdout \
+        --inputbox "Retention (number of backups to keep, e.g., 7):" 8 50 "$current_retention")
+    local ret_retval=$?
+    if [ $ret_retval -ne 0 ]; then
+        return 1
+    fi
+    local new_retention="$retention_input"
+
+    # Drive config
+    configure_backup_drive "$current_label" "$current_mount" "$current_format"
+    local drive_retval=$?
+    if [ $drive_retval -ne 0 ]; then
+        return 1
+    fi
+
+    # Reload .env for updated drive values
+    source "$ENV_FILE"
+
+    # Apply changes
+    update_env "BACKUP_RETENTION" "$new_retention"
+    update_env "BACKUP_MINUTE" "$new_minute"
+    update_env "BACKUP_HOUR" "$new_hour"
+    update_env "BACKUP_DAY_MONTH" "$new_day_month"
+    update_env "BACKUP_MONTH" "$new_month"
+    update_env "BACKUP_DAY_WEEK" "$new_day_week"
+
+    install_backup_cron "$new_minute" "$new_hour" "$new_day_month" "$new_month" "$new_day_week"
+
+    dialog --title "Success" --msgbox "Backup settings updated:\nSchedule: $new_minute $new_hour $new_day_month $new_month $new_day_week\nRetention: $new_retention\nDrive: ${BACKUP_LABEL} at ${BACKUP_MOUNTDIR}" 12 70
 }
 
 trigger_backup() {
@@ -318,7 +584,8 @@ main_menu() {
             1 "Initial System Setup" \
             2 "Backup/Restore" \
             3 "Maintenance" \
-            4 "View Logs")
+            4 "View Logs" \
+            5 "System Health Check")
         local retval=$?
         if [ $retval -ne 0 ]; then
             clear
@@ -331,6 +598,7 @@ main_menu() {
             2) backup_restore_menu ;;
             3) maintenance_menu ;;
             4) logs_menu ;;
+            5) system_health_check ;;
         esac
         reset_terminal  # Ensure clean state after actions
     done
@@ -343,16 +611,18 @@ backup_restore_menu() {
             --title "Backup/Restore Menu" \
             --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
             0 "Back to Main Menu" \
-            1 "Trigger Manual Backup" \
-            2 "Restore From Backup")
+            1 "Configure Backup Settings" \
+            2 "Trigger Manual Backup" \
+            3 "Restore From Backup")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
             return 0  # Explicit back or cancel -> return to main
         fi
 
         case "$choice" in
-            1) trigger_backup ;;
-            2) trigger_restore ;;
+            1) configure_backup_settings ;;
+            2) trigger_backup ;;
+            3) trigger_restore ;;
         esac
         reset_terminal  # Clean after actions
     done
@@ -390,7 +660,8 @@ logs_menu() {
             1 "Main Setup Log" \
             2 "Backup Log" \
             3 "Restore Log" \
-            4 "Docker Compose Logs")
+            4 "Docker Compose Logs" \
+            5 "Health Check Log")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
             return 0  # Explicit back or cancel -> return to main
@@ -410,6 +681,7 @@ logs_menu() {
                 fi
                 rm -f "$temp_log"
                 ;;
+            5) dialog --title "Health Check Log" --tailbox "$HEALTH_LOG_FILE" 25 80 ;;
         esac
         reset_terminal  # Clean after viewing
     done
