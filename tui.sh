@@ -9,6 +9,8 @@ LOG_DIR="/var/log/raspi-nextcloud"
 MAIN_LOG_FILE="$LOG_DIR/main_setup.log"
 BACKUP_LOG_FILE="$LOG_DIR/backup.log"
 RESTORE_LOG_FILE="$LOG_DIR/restore.log"
+LVM_LOG_FILE="$LOG_DIR/lvm_migration.log"
+FLASH_LOG_FILE="$LOG_DIR/flash_to_nvme.log"
 ENV_FILE="$REPO_DIR/.env"
 COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
 CRON_FILE="/etc/cron.d/nextcloud-backup"
@@ -16,6 +18,7 @@ HEALTH_LOG_FILE="$LOG_DIR/health_check.log"
 HEIGHT=20
 WIDTH=70
 CHOICE_HEIGHT=8
+BOOT_PARTITION="/boot/firmware"  # Standard for Pi 5 Bookworm
 
 # --- Ensure dependencies and scripts are ready (idempotent) ---
 if ! command -v dialog >/dev/null 2>&1; then
@@ -31,6 +34,8 @@ mkdir -p "$LOG_DIR"
 chmod +x "$REPO_DIR/setup.sh" "$REPO_DIR/backup.sh" "$REPO_DIR/restore.sh" 2>/dev/null || true
 
 # --- Helper Functions ---
+die() { dialog --title "Error" --msgbox "$1" 8 60; exit 1; }
+
 get_nc_cid() {
     docker compose -f "$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true
 }
@@ -39,7 +44,6 @@ is_stack_running() {
     [[ -n "$(get_nc_cid)" ]]
 }
 
-# Simple wait function (replaces simulated progress bar for user feedback)
 wait_for_completion() {
     local pid=$1
     local title=$2
@@ -51,9 +55,8 @@ wait_for_completion() {
     return $?
 }
 
-# Reset terminal after background dialogs (robustness)
 reset_terminal() {
-    sleep 0.5  # Brief pause for cleanup
+    sleep 0.5
     stty sane 2>/dev/null || true
 }
 
@@ -248,10 +251,9 @@ system_health_check() {
         echo "=== Health Check Completed at $(date) ==="
     ) >> "$HEALTH_LOG_FILE" 2>&1
 
-    dialog --title "System Health Check" --tailbox "$HEALTH_LOG_FILE" 25 80
+    dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
 }
 
-# --- TUI Main Functions ---
 
 run_initial_setup() {
     # Check if stack is already running (idempotent: warn on re-run)
@@ -347,96 +349,86 @@ run_initial_setup() {
 
 configure_backup_settings() {
     source "$ENV_FILE" 2>/dev/null || true
-    local current_retention="${BACKUP_RETENTION:-8}"
-    local current_label="${BACKUP_LABEL:-BackupDrive}"
     local current_mount="${BACKUP_MOUNTDIR:-/mnt/backup}"
-    local current_format="${AUTO_FORMAT_BACKUP:-false}"
+    local current_label="${BACKUP_LABEL:-BackupDrive}"
+    local current_format="${AUTO_FORMAT_BACKUP:-N}"
+    local current_retention="${BACKUP_RETENTION:-8}"
+    local current_minute="0" current_hour="3" current_dom="*" current_month="*" current_dow="0"  # Default weekly Sunday 03:00
 
-    # Custom schedule form
-    local schedule_values
-    schedule_values=$(dialog --backtitle "Backup Schedule Configuration" \
+    # Parse current cron if exists
+    if [[ -f "$CRON_FILE" ]]; then
+        local cron_line=$(grep -v '^#' "$CRON_FILE" | head -1)
+        current_minute=$(echo "$cron_line" | awk '{print $1}')
+        current_hour=$(echo "$cron_line" | awk '{print $2}')
+        current_dom=$(echo "$cron_line" | awk '{print $3}')
+        current_month=$(echo "$cron_line" | awk '{print $4}')
+        current_dow=$(echo "$cron_line" | awk '{print $5}')
+    fi
+
+    local values
+    values=$(dialog --backtitle "Backup Configuration" \
         --stdout \
-        --title "Configure Backup Time and Day" \
-        --form "Enter cron-like schedule (defaults: weekly Sun 03:00):\nMinute (0-59): 0\nHour (0-23): 3\nDay of Month (* or 1-31): *\nMonth (* or 1-12): *\nDay of Week (0-7, 0=Sun): 0" \
-        20 70 12 \
-        "Minute:"    1 1 "0"     1 20 10 0 \
-        "Hour:"      2 1 "3"     2 20 10 0 \
-        "Day/Month:" 3 1 "*"     3 20 10 0 \
-        "Month:"     4 1 "*"     4 20 10 0 \
-        "Day/Week:"  5 1 "0"     5 20 10 0)
-    local sched_retval=$?
-    if [ $sched_retval -ne 0 ] || [ -z "$schedule_values" ]; then
-        return 1  # Canceled
+        --title "Configure Backup Settings" \
+        --form "Enter backup settings:" \
+        18 60 10 \
+        "Mount Point:" 1 1 "$current_mount" 1 20 40 0 \
+        "Label:" 2 1 "$current_label" 2 20 40 0 \
+        "Auto-Format? (Y/N):" 3 1 "$current_format" 3 20 10 0 \
+        "Retention (days):" 4 1 "$current_retention" 4 20 10 0 \
+        "Cron Minute (0-59):" 5 1 "$current_minute" 5 20 10 0 \
+        "Cron Hour (0-23):" 6 1 "$current_hour" 6 20 10 0 \
+        "Cron Day of Month (1-31):" 7 1 "$current_dom" 7 20 10 0 \
+        "Cron Month (1-12):" 8 1 "$current_month" 8 20 10 0 \
+        "Cron Day of Week (0-6):" 9 1 "$current_dow" 9 20 10 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
+        return 0
     fi
 
-    mapfile -t sched_array <<< "$schedule_values"
-    local new_minute="${sched_array[0]}"
-    local new_hour="${sched_array[1]}"
-    local new_day_month="${sched_array[2]}"
-    local new_month="${sched_array[3]}"
-    local new_day_week="${sched_array[4]}"
+    mapfile -t values_array <<< "$values"
+    local new_mount="${values_array[0]}"
+    local new_label="${values_array[1]}"
+    local new_format="${values_array[2]}"
+    local new_retention="${values_array[3]}"
+    local new_minute="${values_array[4]}"
+    local new_hour="${values_array[5]}"
+    local new_dom="${values_array[6]}"
+    local new_month="${values_array[7]}"
+    local new_dow="${values_array[8]}"
 
-    # Validate inputs (basic)
-    if ! [[ "$new_minute" =~ ^[0-5]?[0-9]$ ]] || ! [[ "$new_hour" =~ ^[0-2]?[0-9]$ ]]; then
-        dialog --title "Input Error" --msgbox "Invalid minute/hour. Use 0-59 for minute, 0-23 for hour." 8 60
-        return 1
-    fi
-
-    # Retention input
-    local retention_input
-    retention_input=$(dialog --stdout \
-        --inputbox "Retention (number of backups to keep, e.g., 7):" 8 50 "$current_retention")
-    local ret_retval=$?
-    if [ $ret_retval -ne 0 ]; then
-        return 1
-    fi
-    local new_retention="$retention_input"
-
-    # Drive config
-    configure_backup_drive "$current_label" "$current_mount" "$current_format"
-    local drive_retval=$?
-    if [ $drive_retval -ne 0 ]; then
-        return 1
-    fi
-
-    # Reload .env for updated drive values
-    source "$ENV_FILE"
-
-    # Apply changes
+    update_env "BACKUP_MOUNTDIR" "$new_mount"
+    update_env "BACKUP_LABEL" "$new_label"
+    update_env "AUTO_FORMAT_BACKUP" "$new_format"
     update_env "BACKUP_RETENTION" "$new_retention"
-    update_env "BACKUP_MINUTE" "$new_minute"
-    update_env "BACKUP_HOUR" "$new_hour"
-    update_env "BACKUP_DAY_MONTH" "$new_day_month"
-    update_env "BACKUP_MONTH" "$new_month"
-    update_env "BACKUP_DAY_WEEK" "$new_day_week"
 
-    install_backup_cron "$new_minute" "$new_hour" "$new_day_month" "$new_month" "$new_day_week"
-
-    dialog --title "Success" --msgbox "Backup settings updated:\nSchedule: $new_minute $new_hour $new_day_month $new_month $new_day_week\nRetention: $new_retention\nDrive: ${BACKUP_LABEL} at ${BACKUP_MOUNTDIR}" 12 70
+    configure_backup_drive "$new_label" "$new_mount" "$new_format"
+    install_backup_cron "$new_minute" "$new_hour" "$new_dom" "$new_month" "$new_dow"
 }
 
 trigger_backup() {
-    dialog --title "Confirm Backup" --yesno "Are you sure you want to start a manual backup?" 8 50
-    if [ $? -eq 0 ]; then
-        (
-            "$REPO_DIR/backup.sh"
-        ) >> "$BACKUP_LOG_FILE" 2>&1 &  # Append for history
-        local pid=$!
+    if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+        dialog --title "Error" --msgbox "Backup directory not mounted." 8 50
+        return 1
+    fi
 
-        dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 &
-        local tail_pid=$!
+    (
+        "$REPO_DIR/backup.sh"
+    ) >> "$BACKUP_LOG_FILE" 2>&1 &  # Append for history
+    local pid=$!
 
-        wait_for_completion "$pid" "Backup in Progress" "Creating backup archive... (Check log for details)"
-        local exit_code=$?
-        
-        kill "$tail_pid" 2>/dev/null || true
-        reset_terminal
+    dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 &
+    local tail_pid=$!
 
-        if [ $exit_code -eq 0 ]; then
-            dialog --title "Success" --msgbox "Backup completed successfully!" 8 40
-        else
-            dialog --title "Error" --msgbox "Backup failed. Check logs in $BACKUP_LOG_FILE" 8 60
-        fi
+    wait_for_completion "$pid" "Backup in Progress" "Backing up data... (Check log for details)"
+    local exit_code=$?
+    
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+    
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Backup completed successfully!" 8 40
+    else
+        dialog --title "Error" --msgbox "Backup failed. Check logs in $BACKUP_LOG_FILE" 8 60
     fi
 }
 
@@ -572,6 +564,184 @@ run_files_scan() {
     fi
 }
 
+# New: Flash OS to NVMe and Switch Boot (For Fresh SD to NVMe)
+flash_to_nvme() {
+    local root_dev
+    root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)
+    if [[ $root_dev != /dev/mmcblk* ]]; then
+        die "This option is only available when booted from SD card."
+    fi
+
+    dialog --title "Warning" --yesno "This will clone the current OS from SD to NVMe (/dev/nvme0n1), set boot priority to NVMe, and reboot. NVMe will be overwritten. Proceed?" 10 60
+    if [ $? -ne 0 ]; then return 0; fi
+
+    (
+        echo "=== Flash to NVMe Started at $(date) ===" >> "$FLASH_LOG_FILE"
+
+        apt update && apt install -y git rsync >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+        git clone https://github.com/billw2/rpi-clone.git /tmp/rpi-clone >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to clone rpi-clone."
+        cd /tmp/rpi-clone
+        make install >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install rpi-clone."
+        rpi-clone nvme0 -f -v >> "$FLASH_LOG_FILE" 2>&1 || die "Clone failed."
+        
+        # Add auto-start TUI on first NVMe boot
+        mkdir -p /mnt/nvme
+        mount /dev/nvme0n1p2 /mnt/nvme >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to mount new root."
+        echo "if [ -f /first_boot_tui ]; then sudo $REPO_DIR/tui.sh; rm /first_boot_tui; fi" >> /mnt/nvme/etc/rc.local
+        touch /mnt/nvme/first_boot_tui
+        umount /mnt/nvme
+
+        # Set boot order to NVMe (B4 for USB/NVMe)
+        raspi-config nonint do_boot_order B4 >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to set boot order."
+
+        echo "=== Flash to NVMe Completed at $(date) ===" >> "$FLASH_LOG_FILE"
+    ) & 
+    local pid=$!
+
+    dialog --title "Flash Log" --tailbox "$FLASH_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Flash to NVMe in Progress" "Cloning and configuring... (Check log)"
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    dialog --title "Complete" --yesno "Flash done. Reboot to NVMe now? (Remove SD card after shutdown)" 8 60
+    if [ $? -eq 0 ]; then sudo reboot; fi
+
+    dialog --title "Flash Log" --textbox "$FLASH_LOG_FILE" 25 80
+}
+
+# New: LVM Storage Extension Function (Phase-Aware, Automated)
+lvm_storage_extension() {
+    dialog --title "Warning" --yesno "This extends storage with LVM across dual NVMe (~1.8TB root). Requires SD card with Raspberry Pi OS Bookworm Lite. Backup data first. Proceed?" 12 60
+    if [ $? -ne 0 ]; then return 0; fi
+
+    local root_dev
+    root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)  # e.g., /dev/nvme0n1p2, /dev/mmcblk0p2, /dev/mapper/rpi-vg-root-lv
+
+    local original_root_partuuid
+    original_root_partuuid=$(blkid -o value -s PARTUUID /dev/nvme0n1p2 2>/dev/null || echo "357561ff-02")  # Auto-detect or fallback to your value
+
+    (
+        echo "=== LVM Migration Started at $(date) on root: $root_dev ===" >> "$LVM_LOG_FILE"
+
+        if [[ $root_dev == /dev/nvme0n1p* ]]; then
+            # Phase 1: Preparation on original NVMe
+            echo "[Phase 1] Preparing on original NVMe..." >> "$LVM_LOG_FILE"
+            apt update && apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
+            cat <<EOF >> /etc/initramfs-tools/modules
+nvme_core
+nvme
+dm-mod
+dm-crypt
+dm-snapshot
+dm-thin-pool
+dm-mirror
+dm-log
+dm-cache
+dm-raid
+EOF
+            sort -u /etc/initramfs-tools/modules -o /etc/initramfs-tools/modules
+            mkdir -p /etc/initramfs-tools/scripts/local-top
+            cat <<EOF > /etc/initramfs-tools/scripts/local-top/force_lvm
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "\$PREREQ"; }
+case "\$1" in prereqs) prereqs; exit 0;; esac
+. /scripts/functions
+modprobe -q nvme_core >/dev/null 2>&1
+modprobe -q nvme >/dev/null 2>&1
+modprobe -q dm-mod >/dev/null 2>&1
+log_begin_msg "Waiting for NVMe (up to 30s)"
+for i in \$(seq 1 30); do
+    if [ -b /dev/nvme1n1 ]; then
+        log_success_msg "NVMe found after \$i seconds"
+        break
+    fi
+    sleep 1
+done
+lvm pvscan --cache
+lvm vgscan --mknodes
+lvm vgchange -ay rpi-vg || true
+EOF
+            chmod +x /etc/initramfs-tools/scripts/local-top/force_lvm
+            update-initramfs -u -k $(uname -r) >> "$LVM_LOG_FILE" 2>&1 || die "Failed to update initramfs."
+            cp /boot/initrd.img-$(uname -r) $BOOT_PARTITION/ || die "Failed to copy initrd."
+            if ! grep -q "initramfs initrd.img-$(uname -r) followkernel" $BOOT_PARTITION/config.txt; then
+                echo "[all]" >> $BOOT_PARTITION/config.txt
+                echo "initramfs initrd.img-$(uname -r) followkernel" >> $BOOT_PARTITION/config.txt
+            fi
+            echo "[Phase 1 Complete] System prepared." >> "$LVM_LOG_FILE"
+
+        elif [[ $root_dev == /dev/mmcblk* ]]; then
+            # Phase 2: Migration on SD
+            echo "[Phase 2] Migrating on SD..." >> "$LVM_LOG_FILE"
+            apt update && apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            vgremove -f rpi-vg 2>/dev/null || true
+            pvremove -f /dev/nvme1n1 2>/dev/null || true
+            wipefs -a /dev/nvme1n1 2>/dev/null || true
+            parted /dev/nvme1n1 mklabel gpt 2>/dev/null || true
+            pvcreate -f /dev/nvme1n1 >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create PV."
+            vgcreate rpi-vg /dev/nvme1n1 >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create VG."
+            lvcreate -n root-lv -l 100%FREE rpi-vg >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create LV."
+            mkfs.ext4 -L root /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Failed to format LV."
+            e2fsck -f -y /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || true
+            mkdir -p /mnt/old /mnt/new
+            mount /dev/nvme0n1p2 /mnt/old >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount old root."
+            mount /dev/rpi-vg/root-lv /mnt/new >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount new root."
+            rsync -aAXv --delete /mnt/old/ /mnt/new/ >> "$LVM_LOG_FILE" 2>&1 || die "Rsync failed."
+            mount /dev/nvme0n1p1 /mnt/new$BOOT_PARTITION >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount boot."
+            sed -i "s|PARTUUID=$original_root_partuuid|/dev/mapper/rpi-vg-root-lv|" /mnt/new/etc/fstab || die "fstab update failed."
+            sed -i 's/root=PARTUUID=.* /root=\/dev\/mapper\/rpi-vg-root-lv rootfstype=ext4 rootdelay=30 /' /mnt/new$BOOT_PARTITION/cmdline.txt || die "cmdline update failed."
+            cp -r /etc/initramfs-tools/scripts/local-top/force_lvm /mnt/new/etc/initramfs-tools/scripts/local-top/ 2>/dev/null || true
+            chmod +x /mnt/new/etc/initramfs-tools/scripts/local-top/force_lvm
+            chroot /mnt/new update-initramfs -u -k $(uname -r) >> "$LVM_LOG_FILE" 2>&1 || die "Initramfs update on new root failed."
+            cp /mnt/new/boot/initrd.img-$(uname -r) /mnt/new$BOOT_PARTITION/ || die "Initrd copy failed."
+            umount /mnt/new$BOOT_PARTITION
+            umount /mnt/new
+            umount /mnt/old
+            echo "[Phase 2 Complete] Set boot to NVMe via raspi-config, remove SD, reboot." >> "$LVM_LOG_FILE"
+
+        elif [[ $root_dev == /dev/mapper/rpi-vg-root-lv ]]; then
+            # Phase 3: Finalization on new LVM
+            echo "[Phase 3] Finalizing on new LVM..." >> "$LVM_LOG_FILE"
+            wipefs -a /dev/nvme0n1p2 >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed."
+            pvcreate -f /dev/nvme0n1p2 >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed."
+            vgextend rpi-vg /dev/nvme0n1p2 >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
+            lvextend -l +100%FREE /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "LV extend failed."
+            resize2fs /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Resize failed."
+            e2fsck -f -y /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || true
+            echo "[Phase 3 Complete] Storage extended." >> "$LVM_LOG_FILE"
+
+        else
+            die "Unknown root device: $root_dev. Aborting."
+        fi
+
+        echo "=== LVM Migration Completed at $(date) ===" >> "$LVM_LOG_FILE"
+    ) & 
+    local pid=$!
+
+    dialog --title "LVM Log" --tailbox "$LVM_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "LVM Extension in Progress" "Processing phase... (Check log)"
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    # Phase-specific prompts
+    if [[ $root_dev == /dev/nvme0n1p* ]]; then
+        dialog --title "SD Card Prompt" --msgbox "Insert SD card with Raspberry Pi OS Bookworm Lite now. Then, boot to SD (raspi-config > Advanced > Boot Order > SD Card Boot). On SD, run:\ncurl -O https://github.com/oalterg/pinextcloudflaredeploy/raw/main/install.txt && sudo bash install.txt\nto install TUI repo. Then run sudo $REPO_DIR/tui.sh > Maintenance > Storage Extension for Phase 2." 15 70
+    elif [[ $root_dev == /dev/mmcblk* ]]; then
+        dialog --title "Next Steps" --msgbox "Phase 2 done. Run raspi-config > Advanced > Boot Order > NVMe/USB Boot, remove SD, reboot. If shell drops, manually activate: modprobe nvme_core nvme dm-mod; lvm pvscan --cache; vgscan --mknodes; vgchange -ay rpi-vg; exit." 12 60
+    elif [[ $root_dev == /dev/mapper/rpi-vg-root-lv ]]; then
+        dialog --title "Complete" --yesno "Phase 3 done. Reboot to confirm?" 8 50
+        if [ $? -eq 0 ]; then sudo reboot; fi
+    fi
+
+    dialog --title "LVM Extension Log" --textbox "$LVM_LOG_FILE" 25 80
+}
+
 main_menu() {
     while true; do
         local choice
@@ -581,6 +751,7 @@ main_menu() {
             --cancel-label "Exit" \
             --menu "Select an option:" \
             $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            0 "Flash OS to NVMe and Switch Boot (From SD)" \
             1 "Initial System Setup" \
             2 "Backup/Restore" \
             3 "Maintenance" \
@@ -594,6 +765,7 @@ main_menu() {
         fi
 
         case "$choice" in
+            0) flash_to_nvme ;;
             1) run_initial_setup ;;
             2) backup_restore_menu ;;
             3) maintenance_menu ;;
@@ -636,7 +808,8 @@ maintenance_menu() {
             --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
             0 "Back to Main Menu" \
             1 "Toggle Maintenance Mode" \
-            2 "Scan User Files (files:scan)")
+            2 "Scan User Files (files:scan)" \
+            3 "Storage Extension with LVM (Advanced)")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
             return 0  # Explicit back or cancel -> return to main
@@ -645,6 +818,7 @@ maintenance_menu() {
         case "$choice" in
             1) toggle_maintenance_mode ;;
             2) run_files_scan ;;
+            3) lvm_storage_extension ;;
         esac
         reset_terminal  # Clean after actions
     done
@@ -661,7 +835,9 @@ logs_menu() {
             2 "Backup Log" \
             3 "Restore Log" \
             4 "Docker Compose Logs" \
-            5 "Health Check Log")
+            5 "Health Check Log" \
+            6 "LVM Migration Log" \
+            7 "Flash to NVMe Log")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
             return 0  # Explicit back or cancel -> return to main
@@ -682,6 +858,8 @@ logs_menu() {
                 rm -f "$temp_log"
                 ;;
             5) dialog --title "Health Check Log" --tailbox "$HEALTH_LOG_FILE" 25 80 ;;
+            6) dialog --title "LVM Log" --tailbox "$LVM_LOG_FILE" 25 80 ;;
+            7) dialog --title "Flash Log" --tailbox "$FLASH_LOG_FILE" 25 80 ;;
         esac
         reset_terminal  # Clean after viewing
     done
