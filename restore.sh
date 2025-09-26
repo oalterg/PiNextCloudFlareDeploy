@@ -140,7 +140,6 @@ docker run --rm \
   mysql:8 \
   sh -c "mysql -h db -u root $MYSQL_DATABASE < /restore.sql"
 
-
 echo "[5/6] Starting Nextcloud service..."
 docker compose -f "$REPO_DIR/docker-compose.yml" up -d nextcloud
 

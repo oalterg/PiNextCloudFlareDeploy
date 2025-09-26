@@ -76,7 +76,7 @@ auto_detect_backup_drive() {
 update_env() {
     local key="$1" value="$2"
     if grep -q "^$key=" "$ENV_FILE" 2>/dev/null; then
-        sed -i "s/^$key=.*/$key=$value/" "$ENV_FILE"
+        sed -i "s|^$key=.*|$key=$value|" "$ENV_FILE"
     else
         echo "$key=$value" >> "$ENV_FILE"
     fi
@@ -254,159 +254,10 @@ system_health_check() {
     dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
 }
 
-
-run_initial_setup() {
-    # Check if stack is already running (idempotent: warn on re-run)
-    if is_stack_running; then
-        dialog --title "Warning" --yesno "Stack is already running. Re-run setup? (May reset config)" 8 50
-        [[ $? -ne 0 ]] && return
-    fi
-
-    # Auto-scan backup drive
-    local backup_label detected_dev
-    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
-    if [[ -n "$detected_dev" ]]; then
-        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
-        dialog --msgbox "Detected external drive: $detected_dev\nSuggested label: $backup_label\nFormat if needed?" 8 60
-        export AUTO_FORMAT_BACKUP=true  # Enable if confirmed
-    else
-        backup_label="LocalFallback"
-        export AUTO_FORMAT_BACKUP=false
-    fi
-
-    local values
-    values=$(dialog --backtitle "Nextcloud Initial Setup" \
-        --stdout \
-        --title "Configuration" \
-        --form "Enter your configuration details below." \
-        25 60 16 \
-        "Admin Password:"   1 1 ""            1 25 40 0 \
-        "DB Root Password:" 2 1 ""            2 25 40 0 \
-        "DB User Password:" 3 1 ""            3 25 40 0 \
-        "Base Domain:"      4 1 "example.com" 4 25 40 0 \
-        "Subdomain:"        5 1 "nextcloud"   5 25 40 0 \
-        "Backup Label:"     6 1 "$backup_label" 6 25 40 0)
-    local retval=$?
-    if [ $retval -ne 0 ] || [ -z "$values" ]; then
-        echo "[INFO] User canceled or dialog failed at $(date)" >> "$MAIN_LOG_FILE"
-        return 1
-    fi
-
-    mapfile -t values_array <<< "$values"
-    if [ "${#values_array[@]}" -lt 5 ]; then
-        dialog --title "Input Error" --msgbox "All fields are required. Please try again." 8 50
-        return 1
-    fi
-
-    local ADMIN_PASS="${values_array[0]}"
-    local DB_ROOT_PASS="${values_array[1]}"
-    local DB_USER_PASS="${values_array[2]}"
-    local BASE_DOMAIN="${values_array[3]}"
-    local SUBDOMAIN="${values_array[4]}"
-    local BACKUP_LABEL="${values_array[5]}"  # Index 5 for new field
-    export BACKUP_LABEL="${BACKUP_LABEL:-$backup_label}"  # Fallback to auto
-    export AUTO_FORMAT_BACKUP=true  # Or from confirmation
-
-    # Safeguard empty vars
-    if [[ -z "$ADMIN_PASS" || -z "$DB_ROOT_PASS" || -z "$DB_USER_PASS" || -z "$BASE_DOMAIN" ]]; then
-        dialog --title "Input Error" --msgbox "One or more fields are empty. Please try again." 8 50
-        return 1
-    fi
-
-    # Ensure log file exists and is writable
-    touch "$MAIN_LOG_FILE"
-    chmod 644 "$MAIN_LOG_FILE"
-
-    (
-        set -x
-        echo "--- TUI: Subshell for setup started at $(date) ---"
-        export NEXTCLOUD_ADMIN_PASSWORD="$ADMIN_PASS"
-        export MYSQL_ROOT_PASSWORD="$DB_ROOT_PASS"
-        export MYSQL_PASSWORD="$DB_USER_PASS"
-        export BASE_DOMAIN="$BASE_DOMAIN"
-        export SUBDOMAIN="${SUBDOMAIN:-nextcloud}"
-        "$REPO_DIR/setup.sh" --non-interactive
-    ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
-    local pid=$!
-
-    dialog --title "Initial Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
-    local tail_pid=$!
-
-    wait_for_completion "$pid" "Setup in Progress" "Running initial setup... (Check log for details)"
-    local exit_code=$?
-    
-    # Clean up tailbox
-    sleep 1
-    kill "$tail_pid" 2>/dev/null || true
-    reset_terminal
-    
-    if [ $exit_code -eq 0 ]; then
-        dialog --title "Success" --msgbox "Setup completed successfully!" 8 40
-    else
-        dialog --title "Error" --msgbox "Setup failed. Detailed log saved to:\n\n$MAIN_LOG_FILE" 10 70
-    fi
-}
-
-configure_backup_settings() {
-    source "$ENV_FILE" 2>/dev/null || true
-    local current_mount="${BACKUP_MOUNTDIR:-/mnt/backup}"
-    local current_label="${BACKUP_LABEL:-BackupDrive}"
-    local current_format="${AUTO_FORMAT_BACKUP:-N}"
-    local current_retention="${BACKUP_RETENTION:-8}"
-    local current_minute="0" current_hour="3" current_dom="*" current_month="*" current_dow="0"  # Default weekly Sunday 03:00
-
-    # Parse current cron if exists
-    if [[ -f "$CRON_FILE" ]]; then
-        local cron_line=$(grep -v '^#' "$CRON_FILE" | head -1)
-        current_minute=$(echo "$cron_line" | awk '{print $1}')
-        current_hour=$(echo "$cron_line" | awk '{print $2}')
-        current_dom=$(echo "$cron_line" | awk '{print $3}')
-        current_month=$(echo "$cron_line" | awk '{print $4}')
-        current_dow=$(echo "$cron_line" | awk '{print $5}')
-    fi
-
-    local values
-    values=$(dialog --backtitle "Backup Configuration" \
-        --stdout \
-        --title "Configure Backup Settings" \
-        --form "Enter backup settings:" \
-        18 60 10 \
-        "Mount Point:" 1 1 "$current_mount" 1 20 40 0 \
-        "Label:" 2 1 "$current_label" 2 20 40 0 \
-        "Auto-Format? (Y/N):" 3 1 "$current_format" 3 20 10 0 \
-        "Retention (days):" 4 1 "$current_retention" 4 20 10 0 \
-        "Cron Minute (0-59):" 5 1 "$current_minute" 5 20 10 0 \
-        "Cron Hour (0-23):" 6 1 "$current_hour" 6 20 10 0 \
-        "Cron Day of Month (1-31):" 7 1 "$current_dom" 7 20 10 0 \
-        "Cron Month (1-12):" 8 1 "$current_month" 8 20 10 0 \
-        "Cron Day of Week (0-6):" 9 1 "$current_dow" 9 20 10 0)
-    local retval=$?
-    if [ $retval -ne 0 ] || [ -z "$values" ]; then
-        return 0
-    fi
-
-    mapfile -t values_array <<< "$values"
-    local new_mount="${values_array[0]}"
-    local new_label="${values_array[1]}"
-    local new_format="${values_array[2]}"
-    local new_retention="${values_array[3]}"
-    local new_minute="${values_array[4]}"
-    local new_hour="${values_array[5]}"
-    local new_dom="${values_array[6]}"
-    local new_month="${values_array[7]}"
-    local new_dow="${values_array[8]}"
-
-    update_env "BACKUP_MOUNTDIR" "$new_mount"
-    update_env "BACKUP_LABEL" "$new_label"
-    update_env "AUTO_FORMAT_BACKUP" "$new_format"
-    update_env "BACKUP_RETENTION" "$new_retention"
-
-    configure_backup_drive "$new_label" "$new_mount" "$new_format"
-    install_backup_cron "$new_minute" "$new_hour" "$new_dom" "$new_month" "$new_dow"
-}
-
 trigger_backup() {
-    if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+    source "$ENV_FILE" 2>/dev/null || true
+    local backup_dir="${BACKUP_MOUNTDIR:-/mnt/backup}"
+    if ! mountpoint -q "$backup_dir"; then
         dialog --title "Error" --msgbox "Backup directory not mounted." 8 50
         return 1
     fi
@@ -620,8 +471,9 @@ lvm_storage_extension() {
     root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)  # e.g., /dev/nvme0n1p2, /dev/mmcblk0p2, /dev/mapper/rpi-vg-root-lv
 
     local original_root_partuuid
-    original_root_partuuid=$(blkid -o value -s PARTUUID /dev/nvme0n1p2 2>/dev/null || echo "357561ff-02")  # Auto-detect or fallback to your value
-
+    original_root_partuuid=$(blkid -o value -s PARTUUID /dev/nvme0n1p2 2>/dev/null)
+    [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of /dev/nvme0n1p2. Cannot proceed."
+ 
     (
         echo "=== LVM Migration Started at $(date) on root: $root_dev ===" >> "$LVM_LOG_FILE"
 
@@ -693,7 +545,7 @@ EOF
             rsync -aAXv --delete /mnt/old/ /mnt/new/ >> "$LVM_LOG_FILE" 2>&1 || die "Rsync failed."
             mount /dev/nvme0n1p1 /mnt/new$BOOT_PARTITION >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount boot."
             sed -i "s|PARTUUID=$original_root_partuuid|/dev/mapper/rpi-vg-root-lv|" /mnt/new/etc/fstab || die "fstab update failed."
-            sed -i 's/root=PARTUUID=.* /root=\/dev\/mapper\/rpi-vg-root-lv rootfstype=ext4 rootdelay=30 /' /mnt/new$BOOT_PARTITION/cmdline.txt || die "cmdline update failed."
+            sed -i 's|root=PARTUUID=[^ ]*|root=/dev/mapper/rpi-vg-root-lv rootfstype=ext4 rootdelay=30|' /mnt/new$BOOT_PARTITION/cmdline.txt || die "cmdline update failed."
             cp -r /etc/initramfs-tools/scripts/local-top/force_lvm /mnt/new/etc/initramfs-tools/scripts/local-top/ 2>/dev/null || true
             chmod +x /mnt/new/etc/initramfs-tools/scripts/local-top/force_lvm
             chroot /mnt/new update-initramfs -u -k $(uname -r) >> "$LVM_LOG_FILE" 2>&1 || die "Initramfs update on new root failed."
@@ -863,6 +715,156 @@ logs_menu() {
         esac
         reset_terminal  # Clean after viewing
     done
+}
+
+configure_backup_settings() {
+    source "$ENV_FILE" 2>/dev/null || true
+    local current_mount="${BACKUP_MOUNTDIR:-/mnt/backup}"
+    local current_label="${BACKUP_LABEL:-BackupDrive}"
+    local current_format="${AUTO_FORMAT_BACKUP:-N}"
+    local current_retention="${BACKUP_RETENTION:-8}"
+    local current_minute="0" current_hour="3" current_dom="*" current_month="*" current_dow="0"  # Default weekly Sunday 03:00
+
+    # Parse current cron if exists
+    if [[ -f "$CRON_FILE" ]]; then
+        local cron_line=$(grep -v '^#' "$CRON_FILE" | head -1)
+        current_minute=$(echo "$cron_line" | awk '{print $1}')
+        current_hour=$(echo "$cron_line" | awk '{print $2}')
+        current_dom=$(echo "$cron_line" | awk '{print $3}')
+        current_month=$(echo "$cron_line" | awk '{print $4}')
+        current_dow=$(echo "$cron_line" | awk '{print $5}')
+    fi
+
+    local values
+    values=$(dialog --backtitle "Backup Configuration" \
+        --stdout \
+        --title "Configure Backup Settings" \
+        --form "Enter backup settings:" \
+        18 60 10 \
+        "Mount Point:" 1 1 "$current_mount" 1 20 40 0 \
+        "Label:" 2 1 "$current_label" 2 20 40 0 \
+        "Auto-Format? (Y/N):" 3 1 "$current_format" 3 20 10 0 \
+        "Retention (days):" 4 1 "$current_retention" 4 20 10 0 \
+        "Cron Minute (0-59):" 5 1 "$current_minute" 5 20 10 0 \
+        "Cron Hour (0-23):" 6 1 "$current_hour" 6 20 10 0 \
+        "Cron Day of Month (1-31):" 7 1 "$current_dom" 7 20 10 0 \
+        "Cron Month (1-12):" 8 1 "$current_month" 8 20 10 0 \
+        "Cron Day of Week (0-6):" 9 1 "$current_dow" 9 20 10 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
+        return 0
+    fi
+
+    mapfile -t values_array <<< "$values"
+    local new_mount="${values_array[0]}"
+    local new_label="${values_array[1]}"
+    local new_format="${values_array[2]}"
+    local new_retention="${values_array[3]}"
+    local new_minute="${values_array[4]}"
+    local new_hour="${values_array[5]}"
+    local new_dom="${values_array[6]}"
+    local new_month="${values_array[7]}"
+    local new_dow="${values_array[8]}"
+
+    update_env "BACKUP_MOUNTDIR" "$new_mount"
+    update_env "BACKUP_LABEL" "$new_label"
+    update_env "AUTO_FORMAT_BACKUP" "$new_format"
+    update_env "BACKUP_RETENTION" "$new_retention"
+
+    configure_backup_drive "$new_label" "$new_mount" "$new_format"
+    install_backup_cron "$new_minute" "$new_hour" "$new_dom" "$new_month" "$new_dow"
+}
+
+run_initial_setup() {
+    # Check if stack is already running (idempotent: warn on re-run)
+    if is_stack_running; then
+        dialog --title "Warning" --yesno "Stack is already running. Re-run setup? (May reset config)" 8 50
+        [[ $? -ne 0 ]] && return
+    fi
+
+    # Auto-scan backup drive
+    local backup_label detected_dev
+    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
+    if [[ -n "$detected_dev" ]]; then
+        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
+        dialog --msgbox "Detected external drive: $detected_dev\nSuggested label: $backup_label\nFormat if needed?" 8 60
+        export AUTO_FORMAT_BACKUP=true  # Enable if confirmed
+    else
+        backup_label="LocalFallback"
+        export AUTO_FORMAT_BACKUP=false
+    fi
+
+    local values
+    values=$(dialog --backtitle "Nextcloud Initial Setup" \
+        --stdout \
+        --title "Configuration" \
+        --form "Enter your configuration details below." \
+        25 60 16 \
+        "Admin Password:"   1 1 ""            1 25 40 0 \
+        "DB Root Password:" 2 1 ""            2 25 40 0 \
+        "DB User Password:" 3 1 ""            3 25 40 0 \
+        "Base Domain:"      4 1 "example.com" 4 25 40 0 \
+        "Subdomain:"        5 1 "nextcloud"   5 25 40 0 \
+        "Backup Label:"     6 1 "$backup_label" 6 25 40 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
+        echo "[INFO] User canceled or dialog failed at $(date)" >> "$MAIN_LOG_FILE"
+        return 1
+    fi
+
+    mapfile -t values_array <<< "$values"
+    if [ "${#values_array[@]}" -lt 5 ]; then
+        dialog --title "Input Error" --msgbox "All fields are required. Please try again." 8 50
+        return 1
+    fi
+
+    local ADMIN_PASS="${values_array[0]}"
+    local DB_ROOT_PASS="${values_array[1]}"
+    local DB_USER_PASS="${values_array[2]}"
+    local BASE_DOMAIN="${values_array[3]}"
+    local SUBDOMAIN="${values_array[4]}"
+    local BACKUP_LABEL="${values_array[5]}"  # Index 5 for new field
+    export BACKUP_LABEL="${BACKUP_LABEL:-$backup_label}"  # Fallback to auto
+    export AUTO_FORMAT_BACKUP=true  # Or from confirmation
+
+    # Safeguard empty vars
+    if [[ -z "$ADMIN_PASS" || -z "$DB_ROOT_PASS" || -z "$DB_USER_PASS" || -z "$BASE_DOMAIN" ]]; then
+        dialog --title "Input Error" --msgbox "One or more fields are empty. Please try again." 8 50
+        return 1
+    fi
+
+    # Ensure log file exists and is writable
+    touch "$MAIN_LOG_FILE"
+    chmod 644 "$MAIN_LOG_FILE"
+
+    (
+        set -x
+        echo "--- TUI: Subshell for setup started at $(date) ---"
+        export NEXTCLOUD_ADMIN_PASSWORD="$ADMIN_PASS"
+        export MYSQL_ROOT_PASSWORD="$DB_ROOT_PASS"
+        export MYSQL_PASSWORD="$DB_USER_PASS"
+        export BASE_DOMAIN="$BASE_DOMAIN"
+        export SUBDOMAIN="${SUBDOMAIN:-nextcloud}"
+        "$REPO_DIR/setup.sh" --non-interactive
+    ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
+    local pid=$!
+
+    dialog --title "Initial Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Setup in Progress" "Running initial setup... (Check log for details)"
+    local exit_code=$?
+    
+    # Clean up tailbox
+    sleep 1
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+    
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Setup completed successfully!" 8 40
+    else
+        dialog --title "Error" --msgbox "Setup failed. Detailed log saved to:\n\n$MAIN_LOG_FILE" 10 70
+    fi
 }
 
 # --- Script Entrypoint ---

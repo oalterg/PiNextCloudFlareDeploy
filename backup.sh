@@ -34,9 +34,18 @@ auto_mount_backup() {
     usb_dev=$(lsblk -o NAME,TYPE,RM,MOUNTPOINT | grep 'disk\|part' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $4=="" {print "/dev/"$1; exit}')  # Removable, unmounted
     if [[ -n "$usb_dev" ]]; then
         echo "[*] Auto-detected backup drive: $usb_dev"
-        BACKUP_LABEL="BackupDrive_$(date +%Y%m%d)"
-        mkfs.ext4 -F -L "$BACKUP_LABEL" "$usb_dev"  # Auto-format if empty (add --confirm flag for prod)
-        mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || exit 1
+        local fs_type=$(blkid -o value -s TYPE "$usb_dev" 2>/dev/null)
+        if [[ -z "$fs_type" ]]; then
+            BACKUP_LABEL="BackupDrive_$(date +%Y%m%d)"
+            mkfs.ext4 -F -L "$BACKUP_LABEL" "$usb_dev"  # Only format if no filesystem
+            mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || exit 1
+        else
+            BACKUP_LABEL=$(blkid -o value -s LABEL "$usb_dev" 2>/dev/null || "BackupDrive_$(date +%Y%m%d)")
+            if [[ -z $(blkid -o value -s LABEL "$usb_dev") ]]; then
+                e2label "$usb_dev" "$BACKUP_LABEL"
+            fi
+            mount "$usb_dev" "$BACKUP_MOUNTDIR" || exit 1
+        fi
         echo "BACKUP_LABEL=$BACKUP_LABEL" >> "$ENV_FILE"  # Update .env idempotently
     else
         echo "[!] No external drive found. Using local fallback: $BACKUP_MOUNTDIR (limited space!)"

@@ -11,7 +11,7 @@ readonly ENV_FILE="$REPO_DIR/.env"
 readonly ENV_TEMPLATE="$REPO_DIR/.env.template"
 readonly COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
 readonly LOCK_FILE="/var/run/raspi-nextcloud-setup.lock"
-readonly REQUIRED_CMDS=("curl" "git" "jq" "parted" "lsblk" "blkid" "docker" "cloudflared")
+readonly REQUIRED_CMDS=("curl" "git" "jq" "parted" "lsblk" "blkid" "docker" "cloudflared" "gpg")
 
 # --- Helper Functions ---
 die() { echo "[ERROR] $1" >&2; exit 1; }
@@ -69,8 +69,8 @@ preflight_checks() {
 install_dependencies() {
     echo "[1/10] Installing system dependencies..."
     apt-get update -y
-    apt-get install -y ca-certificates curl gnupg lsb-release cron jq moreutils parted
-
+    apt-get install -y ca-certificates curl gnupg lsb-release cron jq moreutils parted gpg
+ 
     # Docker setup (idempotent)
     if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
         mkdir -p /etc/apt/keyrings
@@ -234,24 +234,24 @@ setup_backup_drive() {
 
     local dev="$usb_dev"  # From auto_detect
     local fs_type
-    fs_type=$(blkid -o value -s TYPE "$dev" 2>/dev/null || echo "ext4")
+    fs_type=$(blkid -o value -s TYPE "$dev" 2>/dev/null)
 
     if [[ "$AUTO_FORMAT_BACKUP" == "true" && -z "$fs_type" ]]; then
         echo "[*] Formatting detected drive (destructive—proceed with caution)..."
-        mkfs."$fs_type" -F -L "$BACKUP_LABEL" "$dev"
+        mkfs.ext4 -F -L "$BACKUP_LABEL" "$dev"
     elif [[ -z "$fs_type" ]]; then
         die "Drive detected but unformatted. Set AUTO_FORMAT_BACKUP=true in env or format manually."
     fi
 
     # Mount idempotently
     umount "$BACKUP_MOUNTDIR" 2>/dev/null || true
-    mount -t "$fs_type" -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || die "Failed to mount backup drive."
+    mount -t "${fs_type:-ext4}" -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || die "Failed to mount backup drive."
     
     # fstab update
     local UUID
     UUID=$(blkid -o value -s UUID "$dev")
     if ! grep -q "$UUID" /etc/fstab; then
-        echo "UUID=$UUID $BACKUP_MOUNTDIR $fs_type defaults,nofail 0 2" >> /etc/fstab
+        echo "UUID=$UUID $BACKUP_MOUNTDIR ${fs_type:-ext4} defaults,nofail 0 2" >> /etc/fstab
         echo "Added backup drive to /etc/fstab."
     fi
 }
@@ -268,7 +268,7 @@ install_backup_cronjob() {
     fi
 
     chmod +x "$REPO_DIR/backup.sh"
-    local cron_content="# Run weekly Nextcloud backup on Sunday at 03:00\n0 3 * * 0 root $REPO_DIR/backup.sh >> /var/log/nextcloud-backup.log 2>&1\n"
+    local cron_content="# Run weekly Nextcloud backup on Sunday at 03:00\n0 3 * * 0 root $REPO_DIR/backup.sh >> /var/log/raspi-nextcloud/backup.log 2>&1\n"
 
     if [[ -f /etc/cron.d/nextcloud-backup && $(cat /etc/cron.d/nextcloud-backup) == "$cron_content" ]]; then
         echo "Cron job already installed and up-to-date."
