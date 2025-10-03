@@ -86,8 +86,8 @@ install_dependencies() {
     fi
     if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
         mkdir -p --mode=0755 /usr/share/keyrings
-        curl -fsSL https://pkg.cloudflare.com/cloudflared.gpg | tee /usr/share/keyrings/cloudflared.gpg >/dev/null
-        echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
+        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
         apt-get update -y
     fi
     apt-get install -y cloudflared
@@ -118,6 +118,15 @@ gather_config_from_env() {
 setup_cloudflare() {
     echo "[3/10] Setting up Cloudflare Tunnel..."
     echo "You may need to authenticate with Cloudflare in your browser."
+    if [ ! -f /root/.cloudflared/cert.pem ]; then
+        echo "Certificate not found. Running 'cloudflared tunnel login'..."
+        cloudflared tunnel login
+        if [ ! -f /root/.cloudflared/cert.pem ]; then
+            echo "Certificate still not found after login. If running over SSH, the cert.pem was likely downloaded to your local machine."
+            echo "Please copy cert.pem to /root/.cloudflared/cert.pem on this device and rerun the script."
+            die "Missing Cloudflare certificate."
+        fi
+    fi
     local TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
     CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
     if [[ -z "$CF_TUNNEL_ID" || "$CF_TUNNEL_ID" == "null" ]]; then
