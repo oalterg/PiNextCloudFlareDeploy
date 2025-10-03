@@ -20,6 +20,14 @@ WIDTH=70
 CHOICE_HEIGHT=8
 BOOT_PARTITION="/boot/firmware"  # Standard for Pi 5 Bookworm
 
+# Detect boot device
+root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)
+if [[ $root_dev == /dev/mmcblk* ]]; then
+    is_sd_boot=true
+else
+    is_sd_boot=false
+fi
+
 # --- Ensure dependencies and scripts are ready (idempotent) ---
 if ! command -v dialog >/dev/null 2>&1; then
     echo "Error: 'dialog' is required but not installed." >&2
@@ -596,34 +604,55 @@ EOF
 
 main_menu() {
     while true; do
-        local choice
-        choice=$(dialog --backtitle "Nextcloud Pi Manager" \
-            --stdout \
-            --title "Main Menu" \
-            --cancel-label "Exit" \
-            --menu "Select an option:" \
-            $HEIGHT $WIDTH $CHOICE_HEIGHT \
-            0 "Flash OS to NVMe and Switch Boot (From SD)" \
-            1 "Initial System Setup" \
-            2 "Backup/Restore" \
-            3 "Maintenance" \
-            4 "View Logs" \
-            5 "System Health Check")
-        local retval=$?
-        if [ $retval -ne 0 ]; then
-            clear
-            echo "Exiting."
-            exit 0
-        fi
+        if $is_sd_boot; then
+            local choice
+            choice=$(dialog --backtitle "Nextcloud Pi Manager (SD Boot)" \
+                --stdout \
+                --title "Main Menu" \
+                --cancel-label "Exit" \
+                --menu "Select an option:" \
+                $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                1 "Flash OS to NVMe / SSD" \
+                2 "Expand Filesystem with LVM")
+            local retval=$?
+            if [ $retval -ne 0 ]; then
+                clear
+                echo "Exiting."
+                exit 0
+            fi
 
-        case "$choice" in
-            0) flash_to_nvme ;;
-            1) run_initial_setup ;;
-            2) backup_restore_menu ;;
-            3) maintenance_menu ;;
-            4) logs_menu ;;
-            5) system_health_check ;;
-        esac
+            case "$choice" in
+                1) flash_to_nvme ;;
+                2) lvm_storage_extension ;;
+            esac
+        else
+            local choice
+            choice=$(dialog --backtitle "Nextcloud Pi Manager" \
+                --stdout \
+                --title "Main Menu" \
+                --cancel-label "Exit" \
+                --menu "Select an option:" \
+                $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                1 "Initial System Setup" \
+                2 "Backup/Restore" \
+                3 "Maintenance" \
+                4 "View Logs" \
+                5 "System Health Check")
+            local retval=$?
+            if [ $retval -ne 0 ]; then
+                clear
+                echo "Exiting."
+                exit 0
+            fi
+
+            case "$choice" in
+                1) run_initial_setup ;;
+                2) backup_restore_menu ;;
+                3) maintenance_menu ;;
+                4) logs_menu ;;
+                5) system_health_check ;;
+            esac
+        fi
         reset_terminal  # Ensure clean state after actions
     done
 }
@@ -661,7 +690,7 @@ maintenance_menu() {
             0 "Back to Main Menu" \
             1 "Toggle Maintenance Mode" \
             2 "Scan User Files (files:scan)" \
-            3 "Storage Extension with LVM (Advanced)")
+            3 "Expand Filesystem with LVM")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
             return 0  # Explicit back or cancel -> return to main
