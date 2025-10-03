@@ -68,9 +68,8 @@ preflight_checks() {
 
 install_dependencies() {
     echo "[1/10] Installing system dependencies..."
-    apt-get update -y
     apt-get install -y ca-certificates curl gnupg lsb-release cron jq moreutils parted gpg
- 
+
     # Docker setup (idempotent)
     if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
         mkdir -p /etc/apt/keyrings
@@ -85,12 +84,10 @@ install_dependencies() {
     if ! systemctl is-active --quiet docker; then
         die "Docker failed to start. Check systemctl status docker."
     fi
-
-    # Cloudflared setup (idempotent)
-    if ! [ -f /usr/share/keyrings/cloudflare-main.gpg ]; then
+    if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
         mkdir -p --mode=0755 /usr/share/keyrings
-        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-        echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' > /etc/apt/sources.list.d/cloudflared.list
+        curl -fsSL https://pkg.cloudflare.com/cloudflared.gpg | tee /usr/share/keyrings/cloudflared.gpg >/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
         apt-get update -y
     fi
     apt-get install -y cloudflared
