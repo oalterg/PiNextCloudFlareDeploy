@@ -10,7 +10,7 @@ MAIN_LOG_FILE="$LOG_DIR/main_setup.log"
 BACKUP_LOG_FILE="$LOG_DIR/backup.log"
 RESTORE_LOG_FILE="$LOG_DIR/restore.log"
 LVM_LOG_FILE="$LOG_DIR/lvm_migration.log"
-FLASH_LOG_FILE="$LOG_DIR/flash_to_nvme.log"
+FLASH_LOG_FILE="$LOG_DIR/flash_to_drive.log"
 ENV_FILE="$REPO_DIR/.env"
 COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
 CRON_FILE="/etc/cron.d/nextcloud-backup"
@@ -423,6 +423,18 @@ run_files_scan() {
     fi
 }
 
+get_ssd_drives() {
+    lsblk -d -o NAME -n | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z])$' | sort
+}
+
+fix_cloudflare_repo() {
+    echo "[INFO] Fixing Cloudflare repository configuration" >> "$1"
+    sudo rm -f /etc/apt/sources.list.d/cloudflare*.list >> "$1" 2>&1
+    sudo mkdir -p --mode=0755 /usr/share/keyrings >> "$1" 2>&1
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null 2>> "$1"
+    echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main' | sudo tee /etc/apt/sources.list.d/cloudflared.list >> "$1" 2>&1
+}
+
 # New: Flash OS to NVMe and Switch Boot (For Fresh SD to NVMe)
 flash_to_nvme() {
     local root_dev
@@ -431,40 +443,76 @@ flash_to_nvme() {
         die "This option is only available when booted from SD card."
     fi
 
-    dialog --title "Warning" --yesno "This will clone the current OS from SD to NVMe (/dev/nvme0n1), set boot priority to NVMe, and reboot. NVMe will be overwritten. Proceed?" 10 60
+    local drives
+    drives=$(get_ssd_drives)
+    mapfile -t drive_array <<< "$drives"
+    if [ ${#drive_array[@]} -eq 0 ]; then
+        die "No target SSD/NVMe drive detected."
+    fi
+
+    local target_name
+    if [ ${#drive_array[@]} -eq 1 ]; then
+        target_name=${drive_array[0]}
+    else
+        local options=()
+        for i in "${!drive_array[@]}"; do
+            local size
+            size=$(lsblk -d -o SIZE -n /dev/"${drive_array[$i]}")
+            options+=("$((i+1))" "${drive_array[$i]} ($size)")
+        done
+        local choice
+        choice=$(dialog --stdout --title "Select Target Drive" --menu "Choose the drive to flash to:" 15 50 5 "${options[@]}")
+        if [ $? -ne 0 ]; then return 0; fi
+        target_name=${drive_array[$((choice-1))]}
+    fi
+
+    local part_suffix
+    if [[ $target_name =~ ^nvme ]]; then
+        part_suffix="p"
+    else
+        part_suffix=""
+    fi
+    local target_root_part="/dev/${target_name}${part_suffix}2"
+
+    dialog --title "Warning" --yesno "This will clone the current OS from SD to /dev/$target_name, set boot priority, and reboot. The drive will be overwritten. Proceed?" 10 60
     if [ $? -ne 0 ]; then return 0; fi
 
     (
-        echo "=== Flash to NVMe Started at $(date) ===" >> "$FLASH_LOG_FILE"
+        echo "=== Flash to $target_name Started at $(date) ===" >> "$FLASH_LOG_FILE"
 
-        apt update && apt install -y git rsync >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install dependencies."
-        git clone https://github.com/billw2/rpi-clone.git /tmp/rpi-clone >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to clone rpi-clone."
+        fix_cloudflare_repo "$FLASH_LOG_FILE"
+        apt update >> "$FLASH_LOG_FILE" 2>&1 || die "apt update failed."
+        apt install -y git rsync >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+        git clone https://github.com/geerlingguy/rpi-clone.git /tmp/rpi-clone >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to clone rpi-clone."
         cd /tmp/rpi-clone
-        make install >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install rpi-clone."
-        rpi-clone nvme0 -f -v >> "$FLASH_LOG_FILE" 2>&1 || die "Clone failed."
+        sudo cp rpi-clone rpi-clone-setup /usr/local/bin >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to copy rpi-clone scripts."
+        sudo chmod +x /usr/local/bin/rpi-clone /usr/local/bin/rpi-clone-setup >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to make rpi-clone executable."
+        rpi-clone "$target_name" -f -U -v >> "$FLASH_LOG_FILE" 2>&1 || die "Clone failed."
         
-        # Add auto-start TUI on first NVMe boot
-        mkdir -p /mnt/nvme
-        mount /dev/nvme0n1p2 /mnt/nvme >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to mount new root."
-        echo "if [ -f /first_boot_tui ]; then sudo $REPO_DIR/tui.sh; rm /first_boot_tui; fi" >> /mnt/nvme/etc/rc.local
-        touch /mnt/nvme/first_boot_tui
-        umount /mnt/nvme
+        # Add auto-start TUI on first boot
+        mkdir -p /mnt/target
+        mount "$target_root_part" /mnt/target >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to mount new root."
+        echo "if [ -f /first_boot_tui ]; then sudo $REPO_DIR/tui.sh; rm /first_boot_tui; fi" >> /mnt/target/etc/rc.local
+        touch /mnt/target/first_boot_tui
+        umount /mnt/target
 
-        # Set boot order to NVMe (B4 for USB/NVMe)
-        raspi-config nonint do_boot_order B4 >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to set boot order."
+        # Set boot order
+        local boot_code
+        if [[ $target_name =~ ^nvme ]]; then boot_code=B3; else boot_code=B2; fi
+        raspi-config nonint do_boot_order "$boot_code" >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to set boot order."
 
-        echo "=== Flash to NVMe Completed at $(date) ===" >> "$FLASH_LOG_FILE"
+        echo "=== Flash to $target_name Completed at $(date) ===" >> "$FLASH_LOG_FILE"
     ) & 
     local pid=$!
 
     dialog --title "Flash Log" --tailbox "$FLASH_LOG_FILE" 25 80 &
     local tail_pid=$!
 
-    wait_for_completion "$pid" "Flash to NVMe in Progress" "Cloning and configuring... (Check log)"
+    wait_for_completion "$pid" "Flash to Drive in Progress" "Cloning and configuring... (Check log)"
     kill "$tail_pid" 2>/dev/null || true
     reset_terminal
 
-    dialog --title "Complete" --yesno "Flash done. Reboot to NVMe now? (Remove SD card after shutdown)" 8 60
+    dialog --title "Complete" --yesno "Flash done. Reboot to $target_name now? (Remove SD card after shutdown)" 8 60
     if [ $? -eq 0 ]; then sudo reboot; fi
 
     dialog --title "Flash Log" --textbox "$FLASH_LOG_FILE" 25 80
@@ -472,23 +520,38 @@ flash_to_nvme() {
 
 # New: LVM Storage Extension Function (Phase-Aware, Automated)
 lvm_storage_extension() {
-    dialog --title "Warning" --yesno "This extends storage with LVM across dual NVMe (~1.8TB root). Requires SD card with Raspberry Pi OS Bookworm Lite. Backup data first. Proceed?" 12 60
-    if [ $? -ne 0 ]; then return 0; fi
+    local drives
+    drives=$(get_ssd_drives)
+    mapfile -t drive_array <<< "$drives"
+    if [ ${#drive_array[@]} -ne 2 ]; then
+        die "Exactly two SSD/NVMe drives required for LVM extension."
+    fi
+    local primary=${drive_array[0]}
+    local secondary=${drive_array[1]}
+    local primary_suffix
+    if [[ $primary =~ ^nvme ]]; then primary_suffix="p"; else primary_suffix=""; fi
+    local secondary_suffix
+    if [[ $secondary =~ ^nvme ]]; then secondary_suffix="p"; else secondary_suffix=""; fi
 
     local root_dev
     root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)  # e.g., /dev/nvme0n1p2, /dev/mmcblk0p2, /dev/mapper/rpi-vg-root-lv
 
     local original_root_partuuid
-    original_root_partuuid=$(blkid -o value -s PARTUUID /dev/nvme0n1p2 2>/dev/null)
-    [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of /dev/nvme0n1p2. Cannot proceed."
+    original_root_partuuid=$(blkid -o value -s PARTUUID "/dev/${primary}${primary_suffix}2" 2>/dev/null)
+    [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of /dev/${primary}${primary_suffix}2. Cannot proceed."
  
+    dialog --title "Warning" --yesno "This extends storage with LVM across dual drives (~1.8TB root). Requires SD card with Raspberry Pi OS Bookworm Lite. Backup data first. Proceed?" 12 60
+    if [ $? -ne 0 ]; then return 0; fi
+
     (
         echo "=== LVM Migration Started at $(date) on root: $root_dev ===" >> "$LVM_LOG_FILE"
 
-        if [[ $root_dev == /dev/nvme0n1p* ]]; then
-            # Phase 1: Preparation on original NVMe
-            echo "[Phase 1] Preparing on original NVMe..." >> "$LVM_LOG_FILE"
-            apt update && apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+        if [[ $root_dev == /dev/"${primary}${primary_suffix}"* ]]; then
+            # Phase 1: Preparation on original drive
+            echo "[Phase 1] Preparing on original drive..." >> "$LVM_LOG_FILE"
+            fix_cloudflare_repo "$LVM_LOG_FILE"
+            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
+            apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
             sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
             cat <<EOF >> /etc/initramfs-tools/modules
 nvme_core
@@ -513,10 +576,10 @@ case "\$1" in prereqs) prereqs; exit 0;; esac
 modprobe -q nvme_core >/dev/null 2>&1
 modprobe -q nvme >/dev/null 2>&1
 modprobe -q dm-mod >/dev/null 2>&1
-log_begin_msg "Waiting for NVMe (up to 30s)"
+log_begin_msg "Waiting for secondary drive (up to 30s)"
 for i in \$(seq 1 30); do
-    if [ -b /dev/nvme1n1 ]; then
-        log_success_msg "NVMe found after \$i seconds"
+    if [ -b /dev/$secondary ]; then
+        log_success_msg "Secondary drive found after \$i seconds"
         break
     fi
     sleep 1
@@ -537,21 +600,23 @@ EOF
         elif [[ $root_dev == /dev/mmcblk* ]]; then
             # Phase 2: Migration on SD
             echo "[Phase 2] Migrating on SD..." >> "$LVM_LOG_FILE"
-            apt update && apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            fix_cloudflare_repo "$LVM_LOG_FILE"
+            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
+            apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
             vgremove -f rpi-vg 2>/dev/null || true
-            pvremove -f /dev/nvme1n1 2>/dev/null || true
-            wipefs -a /dev/nvme1n1 2>/dev/null || true
-            parted /dev/nvme1n1 mklabel gpt 2>/dev/null || true
-            pvcreate -f /dev/nvme1n1 >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create PV."
-            vgcreate rpi-vg /dev/nvme1n1 >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create VG."
+            pvremove -f /dev/$secondary 2>/dev/null || true
+            wipefs -a /dev/$secondary 2>/dev/null || true
+            parted /dev/$secondary mklabel gpt 2>/dev/null || true
+            pvcreate -f /dev/$secondary >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create PV."
+            vgcreate rpi-vg /dev/$secondary >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create VG."
             lvcreate -n root-lv -l 100%FREE rpi-vg >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create LV."
             mkfs.ext4 -L root /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Failed to format LV."
             e2fsck -f -y /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || true
             mkdir -p /mnt/old /mnt/new
-            mount /dev/nvme0n1p2 /mnt/old >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount old root."
+            mount /dev/"${primary}${primary_suffix}2" /mnt/old >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount old root."
             mount /dev/rpi-vg/root-lv /mnt/new >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount new root."
             rsync -aAXv --delete /mnt/old/ /mnt/new/ >> "$LVM_LOG_FILE" 2>&1 || die "Rsync failed."
-            mount /dev/nvme0n1p1 /mnt/new$BOOT_PARTITION >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount boot."
+            mount /dev/"${primary}${primary_suffix}1" /mnt/new$BOOT_PARTITION >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount boot."
             sed -i "s|PARTUUID=$original_root_partuuid|/dev/mapper/rpi-vg-root-lv|" /mnt/new/etc/fstab || die "fstab update failed."
             sed -i 's|root=PARTUUID=[^ ]*|root=/dev/mapper/rpi-vg-root-lv rootfstype=ext4 rootdelay=30|' /mnt/new$BOOT_PARTITION/cmdline.txt || die "cmdline update failed."
             cp -r /etc/initramfs-tools/scripts/local-top/force_lvm /mnt/new/etc/initramfs-tools/scripts/local-top/ 2>/dev/null || true
@@ -561,14 +626,17 @@ EOF
             umount /mnt/new$BOOT_PARTITION
             umount /mnt/new
             umount /mnt/old
-            echo "[Phase 2 Complete] Set boot to NVMe via raspi-config, remove SD, reboot." >> "$LVM_LOG_FILE"
+            echo "[Phase 2 Complete] Set boot to primary drive via raspi-config, remove SD, reboot." >> "$LVM_LOG_FILE"
 
         elif [[ $root_dev == /dev/mapper/rpi-vg-root-lv ]]; then
             # Phase 3: Finalization on new LVM
             echo "[Phase 3] Finalizing on new LVM..." >> "$LVM_LOG_FILE"
-            wipefs -a /dev/nvme0n1p2 >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed."
-            pvcreate -f /dev/nvme0n1p2 >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed."
-            vgextend rpi-vg /dev/nvme0n1p2 >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
+            fix_cloudflare_repo "$LVM_LOG_FILE"
+            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
+            apt install -y lvm2 >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install lvm2."
+            wipefs -a /dev/"${primary}${primary_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed."
+            pvcreate -f /dev/"${primary}${primary_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed."
+            vgextend rpi-vg /dev/"${primary}${primary_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
             lvextend -l +100%FREE /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "LV extend failed."
             resize2fs /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Resize failed."
             e2fsck -f -y /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || true
@@ -590,10 +658,12 @@ EOF
     reset_terminal
 
     # Phase-specific prompts
-    if [[ $root_dev == /dev/nvme0n1p* ]]; then
+    if [[ $root_dev == /dev/"${primary}${primary_suffix}"* ]]; then
         dialog --title "SD Card Prompt" --msgbox "Insert SD card with Raspberry Pi OS Bookworm Lite now. Then, boot to SD (raspi-config > Advanced > Boot Order > SD Card Boot). On SD, run:\ncurl -O https://github.com/oalterg/pinextcloudflaredeploy/raw/main/install.txt && sudo bash install.txt\nto install TUI repo. Then run sudo $REPO_DIR/tui.sh > Maintenance > Storage Extension for Phase 2." 15 70
     elif [[ $root_dev == /dev/mmcblk* ]]; then
-        dialog --title "Next Steps" --msgbox "Phase 2 done. Run raspi-config > Advanced > Boot Order > NVMe/USB Boot, remove SD, reboot. If shell drops, manually activate: modprobe nvme_core nvme dm-mod; lvm pvscan --cache; vgscan --mknodes; vgchange -ay rpi-vg; exit." 12 60
+        local boot_type
+        if [[ $primary =~ ^nvme ]]; then boot_type="NVMe/PCIe Boot (B3)"; else boot_type="USB Boot (B2)"; fi
+        dialog --title "Next Steps" --msgbox "Phase 2 done. Run raspi-config > Advanced > Boot Order > $boot_type, remove SD, reboot. If shell drops, manually activate: modprobe nvme_core nvme dm-mod; lvm pvscan --cache; vgscan --mknodes; vgchange -ay rpi-vg; exit." 12 60
     elif [[ $root_dev == /dev/mapper/rpi-vg-root-lv ]]; then
         dialog --title "Complete" --yesno "Phase 3 done. Reboot to confirm?" 8 50
         if [ $? -eq 0 ]; then sudo reboot; fi
@@ -612,7 +682,7 @@ main_menu() {
                 --cancel-label "Exit" \
                 --menu "Select an option:" \
                 $HEIGHT $WIDTH $CHOICE_HEIGHT \
-                1 "Flash OS to NVMe / SSD" \
+                1 "Flash OS to Drive (NVMe/USB SSD)" \
                 2 "Expand Filesystem with LVM")
             local retval=$?
             if [ $retval -ne 0 ]; then
@@ -718,7 +788,7 @@ logs_menu() {
             4 "Docker Compose Logs" \
             5 "Health Check Log" \
             6 "LVM Migration Log" \
-            7 "Flash to NVMe Log")
+            7 "Flash to Drive Log")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
             return 0  # Explicit back or cancel -> return to main
