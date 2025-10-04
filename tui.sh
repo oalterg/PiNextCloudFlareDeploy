@@ -526,47 +526,48 @@ lvm_storage_extension() {
     if [ ${#drive_array[@]} -ne 2 ]; then
         die "Exactly two SSD/NVMe drives required for LVM extension."
     fi
-    local primary=${drive_array[0]}
-    local secondary=${drive_array[1]}
-    local primary_suffix
-    if [[ $primary =~ ^nvme ]]; then primary_suffix="p"; else primary_suffix=""; fi
-    local secondary_suffix
-    if [[ $secondary =~ ^nvme ]]; then secondary_suffix="p"; else secondary_suffix=""; fi
 
-    local root_dev
-    root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)  # e.g., /dev/nvme0n1p2, /dev/mmcblk0p2, /dev/mapper/rpi-vg-root-lv
+    local root_dev_full
+    root_dev_full=$(findmnt -no SOURCE /)
+    local root_dev_short=${root_dev_full#/dev/mapper/} # Get clean name like rpi--vg-root--lv
 
-    local original_root_partuuid
-    original_root_partuuid=$(blkid -o value -s PARTUUID "/dev/${primary}${primary_suffix}2" 2>/dev/null)
-    [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of /dev/${primary}${primary_suffix}2. Cannot proceed."
- 
-    dialog --title "Warning" --yesno "This extends storage with LVM across dual drives (~1.8TB root). Requires SD card with Raspberry Pi OS Bookworm Lite. Backup data first. Proceed?" 12 60
+    dialog --title "Warning" --yesno "This will extend storage with LVM across two drives, creating a single large filesystem. This process is complex and involves multiple reboots. Ensure you have a fresh Raspberry Pi OS Bookworm Lite SD card available for the intermediate step. It is highly recommended to back up all data first. Proceed?" 15 70
     if [ $? -ne 0 ]; then return 0; fi
 
     (
-        echo "=== LVM Migration Started at $(date) on root: $root_dev ===" >> "$LVM_LOG_FILE"
+        echo "=== LVM Migration Started at $(date) on root: $root_dev_full ===" >> "$LVM_LOG_FILE"
 
-        if [[ $root_dev == /dev/"${primary}${primary_suffix}"* ]]; then
-            # Phase 1: Preparation on original drive
-            echo "[Phase 1] Preparing on original drive..." >> "$LVM_LOG_FILE"
+        # --- Phase 1: Preparation on the initial (non-LVM) SSD/NVMe drive ---
+        if [[ "$root_dev_full" =~ ^/dev/(nvme|sd) ]]; then
+            echo "[Phase 1] Preparing the initial drive for migration..." >> "$LVM_LOG_FILE"
+            local current_root_drive
+            current_root_drive=$(lsblk -no pkname "$root_dev_full")
+            local other_drive=""
+            for drive in "${drive_array[@]}"; do
+                if [[ "$drive" != "$current_root_drive" ]]; then
+                    other_drive=$drive
+                    break
+                fi
+            done
+            [[ -z "$other_drive" ]] && die "Could not determine the other drive for initramfs preparation."
+
+            echo "Current root drive: $current_root_drive. The other drive is: $other_drive." >> "$LVM_LOG_FILE"
+
             fix_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
             apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
             sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
+            # Add required modules for LVM on NVMe/USB
             cat <<EOF >> /etc/initramfs-tools/modules
 nvme_core
 nvme
 dm-mod
-dm-crypt
-dm-snapshot
-dm-thin-pool
-dm-mirror
-dm-log
-dm-cache
-dm-raid
+usb_storage
+sd_mod
 EOF
             sort -u /etc/initramfs-tools/modules -o /etc/initramfs-tools/modules
             mkdir -p /etc/initramfs-tools/scripts/local-top
+            # Dynamically create the initramfs script to wait for the correct secondary drive
             cat <<EOF > /etc/initramfs-tools/scripts/local-top/force_lvm
 #!/bin/sh
 PREREQ=""
@@ -576,9 +577,9 @@ case "\$1" in prereqs) prereqs; exit 0;; esac
 modprobe -q nvme_core >/dev/null 2>&1
 modprobe -q nvme >/dev/null 2>&1
 modprobe -q dm-mod >/dev/null 2>&1
-log_begin_msg "Waiting for secondary drive (up to 30s)"
+log_begin_msg "Waiting for secondary drive ($other_drive) up to 30s"
 for i in \$(seq 1 30); do
-    if [ -b /dev/$secondary ]; then
+    if [ -b /dev/$other_drive ]; then
         log_success_msg "Secondary drive found after \$i seconds"
         break
     fi
@@ -589,83 +590,132 @@ lvm vgscan --mknodes
 lvm vgchange -ay rpi-vg || true
 EOF
             chmod +x /etc/initramfs-tools/scripts/local-top/force_lvm
-            update-initramfs -u -k $(uname -r) >> "$LVM_LOG_FILE" 2>&1 || die "Failed to update initramfs."
-            cp /boot/initrd.img-$(uname -r) $BOOT_PARTITION/ || die "Failed to copy initrd."
-            if ! grep -q "initramfs initrd.img-$(uname -r) followkernel" $BOOT_PARTITION/config.txt; then
-                echo "[all]" >> $BOOT_PARTITION/config.txt
-                echo "initramfs initrd.img-$(uname -r) followkernel" >> $BOOT_PARTITION/config.txt
+            update-initramfs -u -k "$(uname -r)" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to update initramfs."
+            cp "/boot/initrd.img-$(uname -r)" "$BOOT_PARTITION/" || die "Failed to copy initrd."
+            if ! grep -q "initramfs initrd.img-$(uname -r) followkernel" "$BOOT_PARTITION/config.txt"; then
+                echo -e "\n[all]" >> "$BOOT_PARTITION/config.txt"
+                echo "initramfs initrd.img-$(uname -r) followkernel" >> "$BOOT_PARTITION/config.txt"
             fi
-            echo "[Phase 1 Complete] System prepared." >> "$LVM_LOG_FILE"
+            echo "[Phase 1 Complete] System prepared for migration from SD card." >> "$LVM_LOG_FILE"
 
-        elif [[ $root_dev == /dev/mmcblk* ]]; then
-            # Phase 2: Migration on SD
-            echo "[Phase 2] Migrating on SD..." >> "$LVM_LOG_FILE"
+        # --- Phase 2: Migration performed from a temporary SD card OS ---
+        elif [[ "$root_dev_full" == /dev/mmcblk* ]]; then
+            echo "[Phase 2] Migrating from original drive to new LVM volume..." >> "$LVM_LOG_FILE"
+            
+            # Robustly identify source and target drives by checking for a filesystem
+            local source_drive="" target_drive=""
+            if blkid "/dev/${drive_array[0]}2" &>/dev/null; then
+                source_drive=${drive_array[0]}
+                target_drive=${drive_array[1]}
+            elif blkid "/dev/${drive_array[1]}2" &>/dev/null; then
+                source_drive=${drive_array[1]}
+                target_drive=${drive_array[0]}
+            else
+                die "Could not identify source drive. Neither drive appears to have a valid filesystem on partition 2."
+            fi
+            echo "Source drive: $source_drive, Target drive: $target_drive" >> "$LVM_LOG_FILE"
+
+            local source_suffix="p" target_suffix="p"
+            [[ "$source_drive" =~ ^sd ]] && source_suffix=""
+            [[ "$target_drive" =~ ^sd ]] && target_suffix=""
+            
+            local original_root_partuuid
+            original_root_partuuid=$(blkid -o value -s PARTUUID "/dev/${source_drive}${source_suffix}2")
+            [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of source drive /dev/${source_drive}${source_suffix}2."
+
             fix_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
-            apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            apt install -y lvm2 rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            
+            echo "Setting up LVM on target drive $target_drive..." >> "$LVM_LOG_FILE"
+            # Clean up and create LVM on the target drive
             vgremove -f rpi-vg 2>/dev/null || true
-            pvremove -f /dev/$secondary 2>/dev/null || true
-            wipefs -a /dev/$secondary 2>/dev/null || true
-            parted /dev/$secondary mklabel gpt 2>/dev/null || true
-            pvcreate -f /dev/$secondary >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create PV."
-            vgcreate rpi-vg /dev/$secondary >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create VG."
-            lvcreate -n root-lv -l 100%FREE rpi-vg >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create LV."
-            mkfs.ext4 -L root /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Failed to format LV."
-            e2fsck -f -y /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || true
-            mkdir -p /mnt/old /mnt/new
-            mount /dev/"${primary}${primary_suffix}2" /mnt/old >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount old root."
-            mount /dev/rpi-vg/root-lv /mnt/new >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount new root."
-            rsync -aAXv --delete /mnt/old/ /mnt/new/ >> "$LVM_LOG_FILE" 2>&1 || die "Rsync failed."
-            mount /dev/"${primary}${primary_suffix}1" /mnt/new$BOOT_PARTITION >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount boot."
-            sed -i "s|PARTUUID=$original_root_partuuid|/dev/mapper/rpi-vg-root-lv|" /mnt/new/etc/fstab || die "fstab update failed."
-            sed -i 's|root=PARTUUID=[^ ]*|root=/dev/mapper/rpi-vg-root-lv rootfstype=ext4 rootdelay=30|' /mnt/new$BOOT_PARTITION/cmdline.txt || die "cmdline update failed."
-            cp -r /etc/initramfs-tools/scripts/local-top/force_lvm /mnt/new/etc/initramfs-tools/scripts/local-top/ 2>/dev/null || true
-            chmod +x /mnt/new/etc/initramfs-tools/scripts/local-top/force_lvm
-            chroot /mnt/new update-initramfs -u -k $(uname -r) >> "$LVM_LOG_FILE" 2>&1 || die "Initramfs update on new root failed."
-            cp /mnt/new/boot/initrd.img-$(uname -r) /mnt/new$BOOT_PARTITION/ || die "Initrd copy failed."
-            umount /mnt/new$BOOT_PARTITION
-            umount /mnt/new
-            umount /mnt/old
-            echo "[Phase 2 Complete] Set boot to primary drive via raspi-config, remove SD, reboot." >> "$LVM_LOG_FILE"
+            pvremove -f "/dev/$target_drive" 2>/dev/null || true
+            wipefs -a "/dev/$target_drive" >> "$LVM_LOG_FILE" 2>&1
+            parted --script "/dev/$target_drive" mklabel gpt >> "$LVM_LOG_FILE" 2>&1
+            pvcreate -f "/dev/$target_drive" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create PV on $target_drive."
+            vgcreate rpi-vg "/dev/$target_drive" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create VG 'rpi-vg'."
+            lvcreate -n root-lv -l 100%FREE rpi-vg >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create LV 'root-lv'."
+            mkfs.ext4 -L rootfs /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Failed to format LV."
+            
+            echo "Copying data from $source_drive to LVM..." >> "$LVM_LOG_FILE"
+            mkdir -p /mnt/old_root /mnt/new_root
+            mount "/dev/${source_drive}${source_suffix}2" /mnt/old_root >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount old root."
+            mount /dev/rpi-vg/root-lv /mnt/new_root >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount new LVM root."
+            rsync -aAXv --delete /mnt/old_root/ /mnt/new_root/ >> "$LVM_LOG_FILE" 2>&1 || die "Rsync failed."
+            
+            echo "Configuring boot files for LVM..." >> "$LVM_LOG_FILE"
+            mount "/dev/${source_drive}${source_suffix}1" "/mnt/new_root$BOOT_PARTITION" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount boot partition."
+            # Update fstab and cmdline.txt to point to the new LVM root device
+            sed -i "s|PARTUUID=$original_root_partuuid|/dev/mapper/rpi--vg-root--lv|" /mnt/new_root/etc/fstab || die "fstab update failed."
+            sed -i "s|root=PARTUUID=[^ ]*|root=/dev/mapper/rpi--vg-root--lv rootfstype=ext4 rootwait|" "/mnt/new_root$BOOT_PARTITION/cmdline.txt" || die "cmdline update failed."
+            
+            umount "/mnt/new_root$BOOT_PARTITION"
+            umount /mnt/new_root
+            umount /mnt/old_root
+            echo "[Phase 2 Complete] Set boot to the original source drive ($source_drive) via raspi-config, remove SD, and reboot." >> "$LVM_LOG_FILE"
 
-        elif [[ $root_dev == /dev/mapper/rpi-vg-root-lv ]]; then
-            # Phase 3: Finalization on new LVM
-            echo "[Phase 3] Finalizing on new LVM..." >> "$LVM_LOG_FILE"
+        # --- Phase 3: Finalization on the new LVM root filesystem ---
+        elif [[ "$root_dev_short" == "rpi--vg-root--lv" ]]; then
+            echo "[Phase 3] Finalizing LVM setup by incorporating the original drive..." >> "$LVM_LOG_FILE"
+            
+            # Robustly identify the drive to add (the one NOT in the current VG)
+            local current_pv_dev
+            current_pv_dev=$(pvs --noheadings -o pv_name | sed 's|/dev/||')
+            local drive_to_add=""
+            for drive in "${drive_array[@]}"; do
+                if [[ "$drive" != "$current_pv_dev" ]]; then
+                    drive_to_add=$drive
+                    break
+                fi
+            done
+            [[ -z "$drive_to_add" ]] && die "Could not determine which drive to add to the VG."
+            echo "Drive to add to LVM: $drive_to_add" >> "$LVM_LOG_FILE"
+            
+            local add_suffix="p"
+            [[ "$drive_to_add" =~ ^sd ]] && add_suffix=""
+
             fix_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
-            apt install -y lvm2 >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install lvm2."
-            wipefs -a /dev/"${primary}${primary_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed."
-            pvcreate -f /dev/"${primary}${primary_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed."
-            vgextend rpi-vg /dev/"${primary}${primary_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
+            apt install -y lvm2 parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install lvm2."
+            
+            echo "Wiping and adding /dev/${drive_to_add}${add_suffix}2 to volume group..." >> "$LVM_LOG_FILE"
+            wipefs -a "/dev/${drive_to_add}${add_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed on old root partition."
+            pvcreate -f "/dev/${drive_to_add}${add_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed on old root partition."
+            vgextend rpi-vg "/dev/${drive_to_add}${add_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
+            
+            echo "Extending logical volume and resizing filesystem..." >> "$LVM_LOG_FILE"
             lvextend -l +100%FREE /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "LV extend failed."
             resize2fs /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Resize failed."
             e2fsck -f -y /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || true
-            echo "[Phase 3 Complete] Storage extended." >> "$LVM_LOG_FILE"
+            echo "[Phase 3 Complete] Storage has been successfully extended across both drives." >> "$LVM_LOG_FILE"
 
         else
-            die "Unknown root device: $root_dev. Aborting."
+            die "Unknown root device: $root_dev_full. Cannot determine LVM migration phase. Aborting."
         fi
 
-        echo "=== LVM Migration Completed at $(date) ===" >> "$LVM_LOG_FILE"
-    ) & 
+        echo "=== LVM Migration Phase Completed at $(date) ===" >> "$LVM_LOG_FILE"
+    ) &
     local pid=$!
 
     dialog --title "LVM Log" --tailbox "$LVM_LOG_FILE" 25 80 &
     local tail_pid=$!
 
-    wait_for_completion "$pid" "LVM Extension in Progress" "Processing phase... (Check log)"
+    wait_for_completion "$pid" "LVM Extension in Progress" "Processing phase... (Check log for details)"
     kill "$tail_pid" 2>/dev/null || true
     reset_terminal
 
-    # Phase-specific prompts
-    if [[ $root_dev == /dev/"${primary}${primary_suffix}"* ]]; then
-        dialog --title "SD Card Prompt" --msgbox "Insert SD card with Raspberry Pi OS Bookworm Lite now. Then, boot to SD (raspi-config > Advanced > Boot Order > SD Card Boot). On SD, run:\ncurl -O https://github.com/oalterg/pinextcloudflaredeploy/raw/main/install.txt && sudo bash install.txt\nto install TUI repo. Then run sudo $REPO_DIR/tui.sh > Maintenance > Storage Extension for Phase 2." 15 70
-    elif [[ $root_dev == /dev/mmcblk* ]]; then
-        local boot_type
-        if [[ $primary =~ ^nvme ]]; then boot_type="NVMe/PCIe Boot (B3)"; else boot_type="USB Boot (B2)"; fi
-        dialog --title "Next Steps" --msgbox "Phase 2 done. Run raspi-config > Advanced > Boot Order > $boot_type, remove SD, reboot. If shell drops, manually activate: modprobe nvme_core nvme dm-mod; lvm pvscan --cache; vgscan --mknodes; vgchange -ay rpi-vg; exit." 12 60
-    elif [[ $root_dev == /dev/mapper/rpi-vg-root-lv ]]; then
-        dialog --title "Complete" --yesno "Phase 3 done. Reboot to confirm?" 8 50
+    # --- Phase-specific prompts for next steps ---
+    if [[ "$root_dev_full" =~ ^/dev/(nvme|sd) ]]; then
+        dialog --title "Next Steps: Reboot to SD Card" --msgbox "Phase 1 is complete. Please perform the following steps:\n\n1. Shut down the Raspberry Pi.\n2. Insert an SD card flashed with a fresh Raspberry Pi OS Lite (Bookworm).\n3. Boot from the SD card (you may need to set this in raspi-config or the bootloader).\n4. On the SD card OS, run the installer again (curl... | sudo bash install.txt).\n5. Run this TUI again and select 'Maintenance' > 'Expand Filesystem with LVM' to begin Phase 2." 18 75
+    elif [[ "$root_dev_full" == /dev/mmcblk* ]]; then
+        local boot_drive
+        boot_drive=$(echo "$LVM_LOG_FILE" | grep "Source drive:" | tail -1 | awk '{print $3}')
+        local boot_type="USB Boot (B2)"
+        [[ "$boot_drive" =~ ^nvme ]] && boot_type="NVMe/PCIe Boot (B3)"
+        dialog --title "Next Steps: Reboot to LVM" --msgbox "Phase 2 is complete. Please perform the following steps:\n\n1. Shut down the Raspberry Pi.\n2. REMOVE the SD card.\n3. Ensure the boot order is set to '$boot_type' (via raspi-config or bootloader).\n4. Power on the device. It will boot from the new LVM volume.\n5. Once booted, run this TUI again and select 'Maintenance' > 'Expand Filesystem with LVM' to begin the final phase." 18 75
+    elif [[ "$root_dev_short" == "rpi--vg-root--lv" ]]; then
+        dialog --title "Complete" --yesno "LVM extension is complete! The root filesystem is now extended across both drives. It's recommended to reboot to ensure everything is working correctly. Reboot now?" 10 60
         if [ $? -eq 0 ]; then sudo reboot; fi
     fi
 

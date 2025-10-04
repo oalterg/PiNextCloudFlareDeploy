@@ -129,6 +129,47 @@ setup_cloudflare() {
     fi
     local TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
     CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+    if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+        echo "Warning: Tunnel with name $TUNNEL_NAME already exists (ID: $CF_TUNNEL_ID)."
+        local choice
+        if [ -t 0 ]; then
+            read -p "Do you want to (d)elete and recreate, or (c)hoose a different subdomain? [d/c]: " choice
+        else
+            echo "Non-interactive mode detected."
+            if [[ "${FORCE_RECREATE_TUNNEL:-false}" == "true" ]]; then
+                choice="d"
+            else
+                choice="r"
+            fi
+        fi
+        case "$choice" in
+            d|D)
+                echo "Deleting existing tunnel..."
+                cloudflared tunnel delete "$CF_TUNNEL_ID" || die "Failed to delete existing tunnel."
+                CF_TUNNEL_ID=""
+                ;;
+            c|C)
+                if [ -t 0 ]; then
+                    read -p "Enter a new subdomain: " SUBDOMAIN
+                else
+                    die "Cannot choose new subdomain in non-interactive mode."
+                fi
+                CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+                NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+                TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+                CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+                if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+                    die "Tunnel with new name $TUNNEL_NAME also exists. Please choose another or delete manually."
+                fi
+                ;;
+            r|R)
+                # Reuse
+                ;;
+            *)
+                die "Invalid choice. Aborting."
+                ;;
+        esac
+    fi
     if [[ -z "$CF_TUNNEL_ID" || "$CF_TUNNEL_ID" == "null" ]]; then
         echo "Creating new tunnel: $TUNNEL_NAME"
         CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $NF}')
@@ -136,8 +177,20 @@ setup_cloudflare() {
         echo "Reusing existing tunnel ID: $CF_TUNNEL_ID"
     fi
     echo "Routing DNS for $CF_HOSTNAME..."
-    cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_HOSTNAME" || echo "DNS route may already exist. Continuing..."
+    # Use the unambiguous tunnel ID instead of the name for routing.
+    # This ensures the DNS record points to the exact tunnel we just created or selected.
+    cloudflared tunnel route dns --overwrite-dns "$CF_TUNNEL_ID" "$CF_HOSTNAME" || die "Failed to create or update DNS route for $CF_HOSTNAME."
     local CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
+    if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+        echo "Credentials file missing. Generating by running tunnel temporarily..."
+        cloudflared tunnel --credentials-file "$CREDENTIALS_FILE" run "$TUNNEL_NAME" & 
+        local temp_pid=$!
+        sleep 5
+        kill "$temp_pid" 2>/dev/null || true
+        if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+            die "Failed to generate credentials file."
+        fi
+    fi
     mkdir -p /etc/cloudflared
     cat > /etc/cloudflared/config.yml <<EOF
 tunnel: $TUNNEL_NAME
@@ -218,7 +271,7 @@ configure_nextcloud_https() {
     docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || die "Failed to set overwriteprotocol."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || die "Failed to set trusted_proxies 0."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
-
+    docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
     echo "Restarting Nextcloud service..."
     docker compose -f "$COMPOSE_FILE" restart nextcloud
     wait_for_healthy "nextcloud" 120
