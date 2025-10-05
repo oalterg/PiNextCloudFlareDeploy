@@ -602,23 +602,22 @@ EOF
         elif [[ "$root_dev_full" == /dev/mmcblk* ]]; then
             echo "[Phase 2] Migrating from original drive to new LVM volume..." >> "$LVM_LOG_FILE"
             
-            # Robustly identify source and target drives by checking for a filesystem
+            # Robustly identify source and target drives by checking for a filesystem on partition 2
             local source_drive="" target_drive=""
-            if blkid "/dev/${drive_array[0]}${ (drive_array[0] =~ ^sd) ? '' : 'p' }2" &>/dev/null; then
-                source_drive=${drive_array[0]}
-                target_drive=${drive_array[1]}
-            elif blkid "/dev/${drive_array[1]}${ (drive_array[1] =~ ^sd) ? '' : 'p' }2" &>/dev/null; then
-                source_drive=${drive_array[1]}
-                target_drive=${drive_array[0]}
-            else
-                die "Could not identify source drive. Neither drive appears to have a valid filesystem on partition 2."
-            fi
+            local source_suffix target_suffix
+            for drive in "${drive_array[@]}"; do
+                suffix=$( [[ $drive =~ ^nvme ]] && echo "p" || echo "" )
+                if blkid "/dev/${drive}${suffix}2" &>/dev/null; then
+                    source_drive=$drive
+                    source_suffix=$suffix
+                else
+                    target_drive=$drive
+                    target_suffix=$suffix
+                fi
+            done
+            [[ -z "$source_drive" || -z "$target_drive" ]] && die "Could not identify source or target drive."
             echo "Source drive: $source_drive, Target drive: $target_drive" >> "$LVM_LOG_FILE"
 
-            local source_suffix="p" target_suffix="p"
-            [[ "$source_drive" =~ ^sd ]] && source_suffix=""
-            [[ "$target_drive" =~ ^sd ]] && target_suffix=""
-            
             local original_root_partuuid
             original_root_partuuid=$(blkid -o value -s PARTUUID "/dev/${source_drive}${source_suffix}2")
             [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of source drive /dev/${source_drive}${source_suffix}2."
@@ -659,29 +658,27 @@ EOF
         elif [[ "$root_dev_short" == "rpi--vg-root--lv" ]]; then
             echo "[Phase 3] Finalizing LVM setup by incorporating the original drive..." >> "$LVM_LOG_FILE"
             
-            # Robustly identify the drive to add (the one NOT in the current VG)
-            local used_bases=()
-            while IFS= read -r pv; do
-                pv=$(echo "$pv" | sed 's|/dev/||' | sed 's/[p]?[0-9]*$//')
-                used_bases+=("$pv")
-            done < <(pvs --noheadings -o pv_name)
-            local drive_to_add=""
+            # Get current PVs
+            mapfile -t pvs_list < <(pvs --noheadings -o pv_name | awk '{print $1}')
+            
+            # Find the partition or whole disk to add (not in current PVs)
+            local add_dev=""
             for drive in "${drive_array[@]}"; do
-                if ! printf '%s\n' "${used_bases[@]}" | grep -q "^$drive$"; then
-                    drive_to_add=$drive
+                local suffix=$( [[ $drive =~ ^nvme ]] && echo "p" || echo "" )
+                local candidate_dev="/dev/${drive}${suffix}2"
+                if [ -b "$candidate_dev" ] && ! printf '%s\n' "${pvs_list[@]}" | grep -q "^$candidate_dev$"; then
+                    add_dev="$candidate_dev"
+                    break
+                fi
+                # Check whole disk if partition not present
+                candidate_dev="/dev/$drive"
+                if [ -b "$candidate_dev" ] && ! printf '%s\n' "${pvs_list[@]}" | grep -q "^$candidate_dev$"; then
+                    add_dev="$candidate_dev"
                     break
                 fi
             done
-            [[ -z "$drive_to_add" ]] && { echo "All drives already in VG. Skipping Phase 3." >> "$LVM_LOG_FILE"; return 0; }
-            echo "Drive to add to LVM: $drive_to_add" >> "$LVM_LOG_FILE"
-            
-            local add_suffix="p"
-            [[ "$drive_to_add" =~ ^sd ]] && add_suffix=""
-
-            local add_dev="/dev/${drive_to_add}${add_suffix}2"
-            if [ ! -b "$add_dev" ]; then
-                die "Partition $add_dev not found. Aborting."
-            fi
+            [[ -z "$add_dev" ]] && { echo "No suitable device found to add to VG. Skipping Phase 3." >> "$LVM_LOG_FILE"; return 0; }
+            echo "Device to add to LVM: $add_dev" >> "$LVM_LOG_FILE"
 
             fix_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
