@@ -604,10 +604,10 @@ EOF
             
             # Robustly identify source and target drives by checking for a filesystem
             local source_drive="" target_drive=""
-            if blkid "/dev/${drive_array[0]}2" &>/dev/null; then
+            if blkid "/dev/${drive_array[0]}${ (drive_array[0] =~ ^sd) ? '' : 'p' }2" &>/dev/null; then
                 source_drive=${drive_array[0]}
                 target_drive=${drive_array[1]}
-            elif blkid "/dev/${drive_array[1]}2" &>/dev/null; then
+            elif blkid "/dev/${drive_array[1]}${ (drive_array[1] =~ ^sd) ? '' : 'p' }2" &>/dev/null; then
                 source_drive=${drive_array[1]}
                 target_drive=${drive_array[0]}
             else
@@ -660,29 +660,38 @@ EOF
             echo "[Phase 3] Finalizing LVM setup by incorporating the original drive..." >> "$LVM_LOG_FILE"
             
             # Robustly identify the drive to add (the one NOT in the current VG)
-            local current_pv_dev
-            current_pv_dev=$(pvs --noheadings -o pv_name | sed 's|/dev/||')
+            local used_bases=()
+            while IFS= read -r pv; do
+                pv=$(echo "$pv" | sed 's|/dev/||' | sed 's/[p]?[0-9]*$//')
+                used_bases+=("$pv")
+            done < <(pvs --noheadings -o pv_name)
             local drive_to_add=""
             for drive in "${drive_array[@]}"; do
-                if [[ "$drive" != "$current_pv_dev" ]]; then
+                if ! printf '%s\n' "${used_bases[@]}" | grep -q "^$drive$"; then
                     drive_to_add=$drive
                     break
                 fi
             done
-            [[ -z "$drive_to_add" ]] && die "Could not determine which drive to add to the VG."
+            [[ -z "$drive_to_add" ]] && { echo "All drives already in VG. Skipping Phase 3." >> "$LVM_LOG_FILE"; return 0; }
             echo "Drive to add to LVM: $drive_to_add" >> "$LVM_LOG_FILE"
             
             local add_suffix="p"
             [[ "$drive_to_add" =~ ^sd ]] && add_suffix=""
 
+            local add_dev="/dev/${drive_to_add}${add_suffix}2"
+            if [ ! -b "$add_dev" ]; then
+                die "Partition $add_dev not found. Aborting."
+            fi
+
             fix_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
             apt install -y lvm2 parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install lvm2."
             
-            echo "Wiping and adding /dev/${drive_to_add}${add_suffix}2 to volume group..." >> "$LVM_LOG_FILE"
-            wipefs -a "/dev/${drive_to_add}${add_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed on old root partition."
-            pvcreate -f "/dev/${drive_to_add}${add_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed on old root partition."
-            vgextend rpi-vg "/dev/${drive_to_add}${add_suffix}2" >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
+            echo "Wiping and adding $add_dev to volume group..." >> "$LVM_LOG_FILE"
+            umount "$add_dev" 2>/dev/null || true
+            wipefs -a -f "$add_dev" >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed on $add_dev."
+            pvcreate -f "$add_dev" >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed on $add_dev."
+            vgextend rpi-vg "$add_dev" >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
             
             echo "Extending logical volume and resizing filesystem..." >> "$LVM_LOG_FILE"
             lvextend -l +100%FREE /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "LV extend failed."
