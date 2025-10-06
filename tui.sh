@@ -1618,6 +1618,146 @@ run_restore() {
     fi
 }
 
+# --- Setup FTP Server ---
+setup_ftp_server() {
+    if [[ $EUID -ne 0 ]]; then
+        dialog --title "Error" --msgbox "This option must be run as root." 8 50
+        return
+    fi
+
+    source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found." 8 50; return; }
+
+    local nc_cid=$(get_nc_cid)
+    if [[ -z "$nc_cid" ]]; then
+        dialog --title "Error" --msgbox "Nextcloud container not running." 8 50
+        return
+    fi
+
+    local nc_user
+    nc_user=$(dialog --stdout --title "Nextcloud User" --inputbox "Enter the Nextcloud username for FTP access:" 8 50)
+    if [ $? -ne 0 ] || [ -z "$nc_user" ]; then return; fi
+
+    # Verify user exists
+    if ! docker exec -u www-data "$nc_cid" php occ user:info "$nc_user" >/dev/null 2>&1; then
+        dialog --title "Error" --msgbox "Nextcloud user '$nc_user' does not exist." 8 50
+        return
+    fi
+
+    local ftp_user
+    ftp_user=$(dialog --stdout --title "FTP Username" --inputbox "Enter FTP username (default: camera):" 8 50 "camera")
+    if [ $? -ne 0 ]; then return; fi
+    ftp_user="${ftp_user:-camera}"
+
+    local ftp_pass
+    ftp_pass=$(dialog --stdout --title "FTP Password" --passwordbox "Enter FTP password:" 8 50)
+    if [ $? -ne 0 ] || [ -z "$ftp_pass" ]; then return; fi
+
+    local confirm_pass
+    confirm_pass=$(dialog --stdout --title "Confirm Password" --passwordbox "Confirm FTP password:" 8 50)
+    if [ $? -ne 0 ] || [ "$ftp_pass" != "$confirm_pass" ]; then
+        dialog --title "Error" --msgbox "Passwords do not match." 8 50
+        return
+    fi
+
+    dialog --title "Confirm" --yesno "Setup FTP server for user '$nc_user' with FTP user '$ftp_user'? This will install vsftpd and configure it." 10 60
+    if [ $? -ne 0 ]; then return; fi
+
+    # Install packages
+    apt-get update -y
+    apt-get install -y vsftpd libpam-pwdfile apache2-utils inotify-tools
+
+    # Only backup the original conf file if a backup doesn't already exist
+    if [ ! -f /etc/vsftpd.conf.bak ]; then
+        cp /etc/vsftpd.conf /etc/vsftpd.conf.bak
+    fi
+
+    # Set www-data home directory to NEXTCLOUD_DATA_DIR to avoid fallback issues
+    if [ "$(getent passwd www-data | cut -d: -f6)" != "$NEXTCLOUD_DATA_DIR" ]; then
+        usermod -d "$NEXTCLOUD_DATA_DIR" www-data
+    fi
+
+    # Configure vsftpd.conf
+    cat > /etc/vsftpd.conf <<EOF
+listen=YES
+listen_ipv6=NO
+local_enable=YES
+write_enable=YES
+local_umask=022
+chroot_local_user=YES
+allow_writeable_chroot=YES
+guest_enable=YES
+guest_username=www-data
+virtual_use_local_privs=YES
+user_sub_token=\$USER
+local_root=${NEXTCLOUD_DATA_DIR}/\$USER/files/uploads
+user_config_dir=/etc/vsftpd/user_conf
+pam_service_name=vsftpd.virtual
+EOF
+
+    # PAM config
+    cat > /etc/pam.d/vsftpd.virtual <<EOF
+auth    required pam_pwdfile.so pwdfile /etc/vsftpd/ftppasswd
+account required pam_permit.so
+EOF
+
+    # Create uploads dir
+    local upload_dir="${NEXTCLOUD_DATA_DIR}/${nc_user}/files/uploads"
+    mkdir -p "$upload_dir"
+    chown -R www-data:www-data "${NEXTCLOUD_DATA_DIR}/${nc_user}"
+
+    # Ensure config directory exists before writing to it
+    mkdir -p /etc/vsftpd/user_conf
+
+    # Add virtual user (create password file or append to existing)
+    if [ ! -f /etc/vsftpd/ftppasswd ]; then
+        htpasswd -b -c -d /etc/vsftpd/ftppasswd "$ftp_user" "$ftp_pass"
+    else
+        htpasswd -b -d /etc/vsftpd/ftppasswd "$ftp_user" "$ftp_pass"
+    fi
+
+    # User config for chroot
+    echo "local_root=${NEXTCLOUD_DATA_DIR}/${nc_user}/files/uploads" > /etc/vsftpd/user_conf/"$ftp_user"
+
+    # Restart vsftpd
+    systemctl restart vsftpd
+
+    # Setup inotify watcher script
+    cat > /usr/local/bin/nextcloud-ftp-sync.sh <<EOF
+#!/bin/bash
+
+NC_USER="\$1"
+WATCH_DIR="${NEXTCLOUD_DATA_DIR}/\$NC_USER/files/uploads"
+REPO_DIR="/opt/raspi-nextcloud-setup"
+COMPOSE_FILE="\$REPO_DIR/docker-compose.yml"
+NC_CID=\$(docker compose -f "\$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true)
+if [[ -z "\$NC_CID" ]]; then exit 1; fi
+
+while true; do
+  inotifywait -e create,modify,move,delete -r "\$WATCH_DIR" && \
+  docker exec -u www-data "\$NC_CID" php occ files:scan "\$NC_USER"
+done
+EOF
+    chmod +x /usr/local/bin/nextcloud-ftp-sync.sh
+
+    # Systemd service
+    cat > /etc/systemd/system/nextcloud-ftp-sync@.service <<EOF
+[Unit]
+Description=Nextcloud FTP Sync Watcher for %i
+
+[Service]
+ExecStart=/usr/local/bin/nextcloud-ftp-sync.sh %i
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now nextcloud-ftp-sync@"$nc_user"
+
+    dialog --title "Success" --msgbox "FTP server setup complete. Connect with user '$ftp_user' and password provided. Uploads to '$upload_dir' will trigger Nextcloud scan." 10 70
+}
+
 # --- Main Menu ---
 main_menu() {
     while true; do
@@ -1655,6 +1795,7 @@ main_menu() {
                 5 "System Health Check" \
                 6 "Maintenance Menu" \
                 7 "View Logs" \
+                8 "Setup FTP Server" \
                 0 "Exit")
             local retval=$?
             if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
@@ -1673,6 +1814,7 @@ main_menu() {
                     ;;
                 6) maintenance_menu ;;
                 7) logs_menu ;;
+                8) setup_ftp_server ;;
             esac
         fi
         reset_terminal  # Ensure clean state after actions
