@@ -1,0 +1,1751 @@
+#!/bin/bash
+# tui — A TUI for managing the Nextcloud environment (now central script with integrated setup, backup, and restore)
+
+set -euo pipefail
+
+# --- Configuration and Initialization ---
+REPO_DIR="/opt/raspi-nextcloud-setup"
+LOG_DIR="/var/log/raspi-nextcloud"
+MAIN_LOG_FILE="$LOG_DIR/main_setup.log"
+BACKUP_LOG_FILE="$LOG_DIR/backup.log"
+RESTORE_LOG_FILE="$LOG_DIR/restore.log"
+LVM_LOG_FILE="$LOG_DIR/lvm_migration.log"
+FLASH_LOG_FILE="$LOG_DIR/flash_to_drive.log"
+ENV_FILE="$REPO_DIR/.env"
+COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+CRON_FILE="/etc/cron.d/nextcloud-backup"
+HEALTH_LOG_FILE="$LOG_DIR/health_check.log"
+HEIGHT=20
+WIDTH=70
+CHOICE_HEIGHT=8
+BOOT_PARTITION="/boot/firmware"  # Standard for Pi 5 Bookworm
+
+# Detect boot device
+root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)
+if [[ $root_dev == /dev/mmcblk* ]]; then
+    is_sd_boot=true
+else
+    is_sd_boot=false
+fi
+
+# --- Ensure dependencies and scripts are ready (idempotent) ---
+if ! command -v dialog >/dev/null 2>&1; then
+    echo "Error: 'dialog' is required but not installed." >&2
+    exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Error: 'docker' is required but not installed." >&2
+    exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
+# --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
+if [ $# -gt 0 ]; then
+    case "$1" in
+        --backup)
+            backup
+            exit $?
+            ;;
+        --restore)
+            shift
+            restore "$@"
+            exit $?
+            ;;
+    esac
+fi
+
+# --- Integrated Setup Function (from setup script) ---
+setup() {
+    echo "--- setup script started ---"
+
+    set -euo pipefail
+
+    # --- Constants ---
+    readonly REPO_DIR="/opt/raspi-nextcloud-setup"
+    readonly ENV_FILE="$REPO_DIR/.env"
+    readonly ENV_TEMPLATE="$REPO_DIR/.env.template"
+    readonly COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+    readonly LOCK_FILE="/var/run/raspi-nextcloud-setup.lock"
+    readonly REQUIRED_CMDS=("curl" "git" "jq" "parted" "lsblk" "blkid" "docker" "cloudflared" "gpg")
+
+    # --- Helper Functions ---
+    die() { echo "[ERROR] $1" >&2; exit 1; }
+
+    wait_for_healthy() {
+        local service_name="$1"
+        local timeout_seconds="$2"
+        local container_id
+        echo "Waiting for $service_name to become healthy..."
+        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+        [[ -z "$container_id" ]] && die "Could not find container for service '$service_name'."
+        local end_time=$((SECONDS + timeout_seconds))
+        while [ $SECONDS -lt $end_time ]; do
+            local status
+            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
+            [ "$status" == "healthy" ] && { echo "✅ $service_name is healthy."; return 0; }
+            sleep 5
+        done
+        die "$service_name did not become healthy. Check logs: 'docker logs $container_id'."
+    }
+
+    auto_detect_backup_drive() {
+        # Auto-scan: Largest removable/unmounted disk (non-root)
+        local usb_dev
+        usb_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')  # Removable, unmounted
+        if [[ -n "$usb_dev" ]]; then
+            echo "[*] Auto-detected external drive: $usb_dev ($(lsblk -o SIZE -n -d "$usb_dev"))"
+            return 0
+        else
+            echo "[!] No external drive detected. Using local fallback."
+            BACKUP_MOUNTDIR="/home/$SUDO_USER/backup"  # Safe default
+            return 1
+        fi
+    }
+
+    # --- Main Logic ---
+    preflight_checks() {
+        echo "[*] Running pre-flight checks..."
+        [[ $EUID -ne 0 ]] && die "This script must be run as root."
+
+        if [[ -z "${SUDO_USER-}" ]]; then
+            die "Could not determine the original user. Please run with 'sudo' (e.g., 'sudo /opt/raspi-nextcloud-setup/tui'), not via 'sudo su' or a root shell."
+        fi
+
+        for cmd in "${REQUIRED_CMDS[@]}"; do
+            if ! command -v "$cmd" &>/dev/null; then
+                [[ "$cmd" == "curl" || "$cmd" == "git" ]] && die "Required command '$cmd' is not installed."
+            fi
+        done
+        cd "$REPO_DIR"
+        USER_HOME=$(eval echo "~$SUDO_USER")
+        [[ -d "$USER_HOME" ]] || die "Could not determine home directory for user '$SUDO_USER'."
+    }
+
+    install_dependencies() {
+        echo "[1/10] Installing system dependencies..."
+        apt-get install -y ca-certificates curl gnupg lsb-release cron jq moreutils parted gpg
+
+        # Docker setup (idempotent)
+        if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+            apt-get update -y
+        fi
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+        # Ensure Docker is running
+        systemctl enable --now docker
+        if ! systemctl is-active --quiet docker; then
+            die "Docker failed to start. Check systemctl status docker."
+        fi
+        if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
+            mkdir -p --mode=0755 /usr/share/keyrings
+            curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
+            apt-get update -y
+        fi
+        apt-get install -y cloudflared
+    }
+
+    gather_config_from_env() {
+        echo "[2/10] Gathering configuration from environment..."
+        : "${NEXTCLOUD_ADMIN_PASSWORD:?}" "${MYSQL_ROOT_PASSWORD:?}" "${MYSQL_PASSWORD:?}" "${BASE_DOMAIN:?}"
+        SUBDOMAIN=${SUBDOMAIN:-nextcloud}
+        CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+        NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+        NEXTCLOUD_ADMIN_USER="admin"
+        MYSQL_USER="nextcloud_user"
+        MYSQL_DATABASE="nextcloud"
+        USER_HOME=$(eval echo "~$SUDO_USER")
+        NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
+        NEXTCLOUD_PORT="8080"
+        BACKUP_LABEL="BackupDrive"
+        BACKUP_MOUNTDIR="/mnt/backup"
+        BACKUP_RETENTION=8
+        # New: Auto-confirm format from env (TUI sets)
+        AUTO_FORMAT_BACKUP="${AUTO_FORMAT_BACKUP:-false}"
+        # New: Trusted proxies from env or default
+        TRUSTED_PROXIES_0="${TRUSTED_PROXIES_0:-172.18.0.1}"
+        TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-127.0.0.1}"
+    }
+
+    setup_cloudflare() {
+        echo "[3/10] Setting up Cloudflare Tunnel..."
+        echo "You may need to authenticate with Cloudflare in your browser."
+        if [ ! -f /root/.cloudflared/cert.pem ]; then
+            echo "Certificate still not found after login. If running over SSH, the cert.pem was likely downloaded to your local machine."
+            echo "Please copy cert.pem to /root/.cloudflared/cert.pem on this device and rerun the script."
+            die "Missing Cloudflare certificate."
+        fi
+        local TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+        CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+        if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+            echo "Warning: Tunnel with name $TUNNEL_NAME already exists (ID: $CF_TUNNEL_ID)."
+            local choice
+            if [ -t 0 ]; then
+                read -p "Do you want to (d)elete and recreate, or (c)hoose a different subdomain? [d/c]: " choice
+            else
+                echo "Non-interactive mode detected."
+                if [[ "${FORCE_RECREATE_TUNNEL:-false}" == "true" ]]; then
+                    choice="d"
+                else
+                    choice="r"
+                fi
+            fi
+            case "$choice" in
+                d|D)
+                    echo "Deleting existing tunnel..."
+                    cloudflared tunnel delete "$CF_TUNNEL_ID" || die "Failed to delete existing tunnel."
+                    CF_TUNNEL_ID=""
+                    ;;
+                c|C)
+                    if [ -t 0 ]; then
+                        read -p "Enter a new subdomain: " SUBDOMAIN
+                    else
+                        die "Cannot choose new subdomain in non-interactive mode."
+                    fi
+                    CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+                    NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+                    TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+                    CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+                    if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+                        die "Tunnel with new name $TUNNEL_NAME also exists. Please choose another or delete manually."
+                    fi
+                    ;;
+                r|R)
+                    # Reuse
+                    ;;
+                *)
+                    die "Invalid choice. Aborting."
+                    ;;
+            esac
+        fi
+        if [[ -z "$CF_TUNNEL_ID" || "$CF_TUNNEL_ID" == "null" ]]; then
+            echo "Creating new tunnel: $TUNNEL_NAME"
+            CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $NF}')
+        else
+            echo "Reusing existing tunnel ID: $CF_TUNNEL_ID"
+        fi
+        echo "Routing DNS for $CF_HOSTNAME..."
+        cloudflared tunnel route dns --overwrite-dns "$CF_TUNNEL_ID" "$CF_HOSTNAME" || die "Failed to create or update DNS route for $CF_HOSTNAME."
+        local CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
+        if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+            echo "Credentials file missing. Generating by running tunnel temporarily..."
+            cloudflared tunnel --credentials-file "$CREDENTIALS_FILE" run "$TUNNEL_NAME" & 
+            local temp_pid=$!
+            sleep 5
+            kill "$temp_pid" 2>/dev/null || true
+            if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+                die "Failed to generate credentials file."
+            fi
+        fi
+        mkdir -p /etc/cloudflared
+        cat > /etc/cloudflared/config.yml <<EOF
+tunnel: $TUNNEL_NAME
+credentials-file: $CREDENTIALS_FILE
+ingress:
+  - hostname: $CF_HOSTNAME
+    service: http://localhost:$NEXTCLOUD_PORT
+  - service: http_status:404
+EOF
+        cat >/etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Nextcloud
+After=network-online.target
+[Service]
+Type=notify
+ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run
+Restart=on-failure
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        if systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+            echo "[*] Service already enabled, restarting..."
+            systemctl restart cloudflared
+        else
+            echo "[*] Enabling and starting service..."
+            systemctl enable --now cloudflared
+        fi
+    }
+
+    generate_env_file() {
+        echo "[4/10] Generating .env configuration file..."
+        [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
+
+        mkdir -p "$NEXTCLOUD_DATA_DIR"
+        chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
+        cp "$ENV_TEMPLATE" "$ENV_FILE"
+
+        # Apply sed with validation
+        sed -i -e "s|^NEXTCLOUD_ADMIN_PASSWORD=.*|NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD|" \
+          -e "s|^NEXTCLOUD_TRUSTED_DOMAINS=.*|NEXTCLOUD_TRUSTED_DOMAINS=$NEXTCLOUD_TRUSTED_DOMAINS|" \
+          -e "s|^NEXTCLOUD_PORT=.*|NEXTCLOUD_PORT=$NEXTCLOUD_PORT|" \
+          -e "s|^MYSQL_ROOT_PASSWORD=.*|MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD|" \
+          -e "s|^MYSQL_PASSWORD=.*|MYSQL_PASSWORD=$MYSQL_PASSWORD|" \
+          -e "s|^NEXTCLOUD_DATA_DIR=.*|NEXTCLOUD_DATA_DIR=$NEXTCLOUD_DATA_DIR|" \
+          -e "s|^BACKUP_MOUNTDIR=.*|BACKUP_MOUNTDIR=$BACKUP_MOUNTDIR|" \
+          -e "s|^BACKUP_LABEL=.*|BACKUP_LABEL=$BACKUP_LABEL|" \
+          -e "s|^BACKUP_RETENTION=.*|BACKUP_RETENTION=$BACKUP_RETENTION|" \
+          -e "s|^CF_TUNNEL_ID=.*|CF_TUNNEL_ID=$CF_TUNNEL_ID|" \
+          -e "s|^TRUSTED_PROXIES_0=.*|TRUSTED_PROXIES_0=$TRUSTED_PROXIES_0|" \
+          -e "s|^TRUSTED_PROXIES_1=.*|TRUSTED_PROXIES_1=$TRUSTED_PROXIES_1|" \
+          -e "s|^AUTO_FORMAT_BACKUP=.*|AUTO_FORMAT_BACKUP=$AUTO_FORMAT_BACKUP|" \
+          "$ENV_FILE"
+
+        # Validate key vars
+        grep -q "NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD" "$ENV_FILE" || die "Failed to update .env (admin password)."
+        grep -q "CF_TUNNEL_ID=$CF_TUNNEL_ID" "$ENV_FILE" || die "Failed to update .env (tunnel ID)."
+
+        chmod 600 "$ENV_FILE"
+    }
+
+    deploy_docker_stack() {
+        echo "[5/10] Deploying Docker stack, may take a while..."
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
+        wait_for_healthy "db" 120
+        wait_for_healthy "nextcloud" 600
+    }
+
+    configure_nextcloud_https() {
+        echo "[6/10] Applying reverse proxy HTTPS configuration..."
+        local NC_CID
+        NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
+        [[ -z "$NC_CID" ]] && die "Nextcloud container not ready."
+
+        docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || die "Failed to set overwriteprotocol."
+        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || die "Failed to set trusted_proxies 0."
+        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
+        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
+        echo "Restarting Nextcloud service..."
+        docker compose -f "$COMPOSE_FILE" restart nextcloud
+        wait_for_healthy "nextcloud" 120
+    }
+
+    validate_setup() {
+        echo "[10/10] Validating setup..."
+        sleep 10
+        if curl -f -k "https://$CF_HOSTNAME/status.php" >/dev/null 2>&1; then
+            echo "✅ Nextcloud is accessible at: https://$CF_HOSTNAME"
+        else
+            echo "⚠️ Setup complete, but accessibility check failed. Check Cloudflare tunnel and firewall."
+        fi
+    }
+
+    # --- Function Entry (replaces original main) ---
+    exec 200>"$LOCK_FILE"
+    flock -n 200 || die "Setup script is already running."
+    trap 'rm -f "$LOCK_FILE"; echo "Lock cleaned up." >&2' EXIT
+    
+    preflight_checks
+    install_dependencies
+    gather_config_from_env
+    setup_cloudflare
+    generate_env_file
+    deploy_docker_stack
+    configure_nextcloud_https
+    validate_setup
+
+    echo "✅ Installation complete!"
+}
+
+# --- Integrated Backup Function (from backup script) ---
+backup() {
+    set -euo pipefail
+
+    # --- Configuration and Initialization ---
+    REPO_DIR="/opt/raspi-nextcloud-setup"
+    ENV_FILE="$REPO_DIR/.env"
+    LOCK_FILE="/var/run/nextcloud-backup.lock"
+    [[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE"; exit 1; }
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+
+    # Validate required variables
+    : "${BACKUP_MOUNTDIR:?BACKUP_MOUNTDIR not set in .env}"
+    : "${BACKUP_LABEL:?BACKUP_LABEL not set in .env}"
+    : "${BACKUP_RETENTION:?BACKUP_RETENTION not set in .env}"
+    : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
+    : "${MYSQL_USER:?}"
+    : "${MYSQL_PASSWORD:?}"
+    : "${MYSQL_DATABASE:?}"
+
+    auto_mount_backup() {
+        if mountpoint -q "$BACKUP_MOUNTDIR"; then return 0; fi
+        if [[ -n "$BACKUP_LABEL" ]] && blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
+            mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || {
+                echo "[!] Failed to mount $BACKUP_LABEL."
+                exit 1
+            }
+            return 0
+        fi
+        # Auto-scan fallback
+        local usb_dev
+        usb_dev=$(lsblk -o NAME,TYPE,RM,MOUNTPOINT | grep 'disk\|part' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $4=="" {print "/dev/"$1; exit}')  # Removable, unmounted
+        if [[ -n "$usb_dev" ]]; then
+            echo "[*] Auto-detected backup drive: $usb_dev"
+            local fs_type=$(blkid -o value -s TYPE "$usb_dev" 2>/dev/null)
+            if [[ -z "$fs_type" ]]; then
+                BACKUP_LABEL="BackupDrive_$(date +%Y%m%d)"
+                mkfs.ext4 -F -L "$BACKUP_LABEL" "$usb_dev"  # Only format if no filesystem
+                mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || exit 1
+            else
+                BACKUP_LABEL=$(blkid -o value -s LABEL "$usb_dev" 2>/dev/null || "BackupDrive_$(date +%Y%m%d)")
+                if [[ -z $(blkid -o value -s LABEL "$usb_dev") ]]; then
+                    e2label "$usb_dev" "$BACKUP_LABEL"
+                fi
+                mount "$usb_dev" "$BACKUP_MOUNTDIR" || exit 1
+            fi
+            echo "BACKUP_LABEL=$BACKUP_LABEL" >> "$ENV_FILE"  # Update .env idempotently
+        else
+            echo "[!] No external drive found. Using local fallback: $BACKUP_MOUNTDIR (limited space!)"
+            mkdir -p "$BACKUP_MOUNTDIR"
+        fi
+    }
+
+    # --- Locking ---
+    exec 200>"$LOCK_FILE"
+    flock -n 200 || { echo "Backup is already running."; exit 1; }
+
+    # --- Staging and Cleanup ---
+    DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
+    STAGING_DIR=$(mktemp -d -p "$BACKUP_MOUNTDIR" staging_XXXXXX)  # Secure temp
+    ARCHIVE_PATH="$BACKUP_MOUNTDIR/nextcloud_backup_${DATE}.tar.gz"
+
+    # TRAP to ensure cleanup and maintenance mode is turned off on exit/error
+    cleanup() {
+        echo "[*] Cleaning up..."
+        # Turn maintenance mode OFF, suppress errors if already off
+        if [[ -n "${NC_CID:-}" ]] && docker ps -q --no-trunc | grep -q "$NC_CID"; then
+            echo "[*] Ensuring maintenance mode is disabled..."
+            docker exec -u www-data "$NC_CID" php occ maintenance:mode --off || true
+        fi
+        # Remove staging directory
+        if [[ -d "$STAGING_DIR" ]]; then
+            rm -rf "$STAGING_DIR"
+            echo "[*] Staging directory removed."
+        fi
+        rm -f "$LOCK_FILE"  # Ensure lock release
+    }
+    trap cleanup EXIT INT TERM
+
+    # --- Mount Backup Drive ---
+    auto_mount_backup
+
+    # --- Main Backup Logic ---
+    echo "=== Starting Nextcloud Backup: $DATE ==="
+
+    mkdir -p "$STAGING_DIR/data" "$STAGING_DIR/db" "$STAGING_DIR/config"
+    NC_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q nextcloud)"
+
+    echo "[1/6] Checking for sufficient disk space..."
+    ESTIMATED_DATA_KB=$(du -sk "$NEXTCLOUD_DATA_DIR" | awk '{print $1}')
+    ESTIMATED_TOTAL_KB=$((ESTIMATED_DATA_KB + 102400)) # Add 100MB for DB/config
+    AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
+    if [ "$AVAILABLE_KB" -lt "$ESTIMATED_TOTAL_KB" ]; then
+        echo "[!] Not enough free space. Available: $((AVAILABLE_KB / 1024)) MB, Needed: $((ESTIMATED_TOTAL_KB / 1024)) MB. Aborting."
+        exit 1
+    fi
+
+    echo "[2/6] Enabling maintenance mode..."
+    docker exec -u www-data "$NC_CID" php occ maintenance:mode --on
+
+    echo "[3/6] Dumping database..."
+    DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
+    docker run --rm \
+      --network container:"$DB_CID" \
+      -e MYSQL_PWD="$MYSQL_PASSWORD" \
+      mysql:8 \
+      mysqldump --column-statistics=0 -h 127.0.0.1 -u "$MYSQL_USER" "$MYSQL_DATABASE" \
+      > "$STAGING_DIR/db/nextcloud.sql"
+
+    echo "[4/6] Copying data and config..."
+    rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/data/"
+    NC_HTML_VOLUME=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+    docker run --rm -v "${NC_HTML_VOLUME}:/volume:ro" -v "$STAGING_DIR/config":/backup alpine \
+        sh -c "cp -a /volume/config/. /backup/"
+
+    echo "[5/6] Creating compressed archive..."
+    tar -C "$STAGING_DIR" -czf "$ARCHIVE_PATH" data db config
+    sync
+
+    # Maintenance mode is disabled by the 'trap cleanup' function
+
+    echo "[6/6] Applying backup retention policy (keep last $BACKUP_RETENTION)..."
+    ls -tp "$BACKUP_MOUNTDIR"/nextcloud_backup_*.tar.gz 2>/dev/null | tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm --
+    echo "--- Backup Complete: $ARCHIVE_PATH ---"
+}
+
+restore() {
+    set -euo pipefail
+
+    # --- Configuration and Initialization ---
+    REPO_DIR="/opt/raspi-nextcloud-setup"
+    ENV_FILE="$REPO_DIR/.env"
+    BACKUP_LABEL="${BACKUP_LABEL:-BackupDrive}"
+    COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+    [[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE"; exit 1; }
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+
+    # --- Helper Functions ---
+
+    # Print a formatted error message and exit.
+    die() {
+        echo "[ERROR] $1" >&2
+        exit 1
+    }
+
+    # Helper function to wait for a container to be healthy using `docker inspect`.
+    wait_for_healthy() {
+        local service_name="$1"
+        local timeout_seconds="$2"
+        local container_id
+
+        echo "Waiting for $service_name to become healthy..."
+        
+        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+        if [[ -z "$container_id" ]]; then
+            die "Could not find container for service '$service_name'. Please check Docker logs."
+        fi
+
+        local end_time=$((SECONDS + timeout_seconds))
+        while [ $SECONDS -lt $end_time ]; do
+            local status
+            # Directly inspect the health status from Docker's metadata.
+            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
+            if [ "$status" == "healthy" ]; then
+                echo "✅ $service_name is healthy."
+                return 0
+            fi
+            sleep 5
+        done
+
+        die "$service_name container did not become healthy in time. Check logs with 'docker logs $container_id'."
+    }
+
+    # Validate required variables
+    : "${BACKUP_MOUNTDIR:?BACKUP_MOUNTDIR not set in .env}"
+    : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
+    : "${MYSQL_USER:?}"
+    : "${MYSQL_PASSWORD:?}"
+    : "${MYSQL_DATABASE:?}"
+    : "${MYSQL_ROOT_PASSWORD:?}"
+
+    # --- Temporary Directory and Cleanup ---
+    TMP_DIR=$(mktemp -d -t nextcloud-restore-XXXXXX)
+    trap 'echo "[*] Cleaning up temporary directory..."; rm -rf "$TMP_DIR"' EXIT INT TERM
+
+    # --- Mount Backup Drive ---
+    mkdir -p "$BACKUP_MOUNTDIR"
+    if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+      if blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
+        echo "[*] Mounting backup drive '$BACKUP_LABEL' to $BACKUP_MOUNTDIR..."
+        mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR"
+      else
+        echo "[!] Backup drive with label '$BACKUP_LABEL' not found. Aborting."
+        exit 1
+      fi
+    fi
+
+    # --- Handle --no-prompt flag ---
+    no_prompt=false
+    for arg in "$@"; do
+        if [[ "$arg" == "--no-prompt" ]]; then
+            no_prompt=true
+        fi
+    done
+
+    # --- Select Backup File ---
+    if [[ $# -ge 1 && "$1" != "--no-prompt" ]]; then
+      BACKUP_FILE="$1"
+    else
+      echo "[*] No backup file specified. Finding the latest..."
+      BACKUP_FILE="$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -name 'nextcloud_backup_*.tar.gz' -print0 | xargs -0 ls -t | head -n1)"
+      [[ -n "$BACKUP_FILE" ]] || { echo "No backups found in $BACKUP_MOUNTDIR"; exit 1; }
+    fi
+    [[ -f "$BACKUP_FILE" ]] || { echo "Backup not found: $BACKUP_FILE"; exit 1; }
+    echo "[*] Selected backup for restore: $BACKUP_FILE"
+
+    # --- User Confirmation ---
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "This will COMPLETELY OVERWRITE the following:"
+    echo "  - Nextcloud data: $NEXTCLOUD_DATA_DIR"
+    echo "  - Nextcloud config"
+    echo "  - MariaDB database: $MYSQL_DATABASE"
+    echo "This operation is irreversible."
+    if $no_prompt; then
+        CONFIRM="OVERWRITE"
+    else
+        read -rp "Type 'OVERWRITE' to proceed: " CONFIRM
+    fi
+    [[ "${CONFIRM^^}" == "OVERWRITE" ]] || { echo "Restore aborted by user."; exit 0; }
+
+    # --- Main Restore Logic ---
+    echo "[1/6] Stopping and removing Nextcloud container..."
+    docker compose -f "$REPO_DIR/docker-compose.yml" rm -sf nextcloud
+
+    echo "[2/6] Extracting backup to temporary location..."
+    tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
+    [[ -d "$TMP_DIR/data" && -f "$TMP_DIR/db/nextcloud.sql" && -d "$TMP_DIR/config" ]] || \
+      { echo "Backup archive is malformed (missing data/, db/, or config/ dirs)."; exit 1; }
+
+    echo "[3/6] Restoring data and config directories..."
+    mkdir -p "$NEXTCLOUD_DATA_DIR"
+    rsync -a --delete "$TMP_DIR/data/" "$NEXTCLOUD_DATA_DIR/"
+    # Get volume name idempotently (even if container is stopped)
+    NC_HTML_VOLUME=$(docker volume ls -q -f name=raspi-nextcloud-setup_nextcloud_html)
+    docker run --rm -v "${NC_HTML_VOLUME}:/volume" -v "$TMP_DIR/config:/backup:ro" alpine \
+        sh -c "rm -rf /volume/config/* && cp -a /backup/. /volume/config/"
+
+    echo "[4/6] Resetting and restoring database..."
+    docker compose -f "$REPO_DIR/docker-compose.yml" up -d db
+    echo "[*] Waiting for DB container to be healthy..."
+    wait_for_healthy "db" 120
+    DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
+    NETWORK_NAME=$(docker inspect "$DB_CID" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+
+    # Drop and recreate database to ensure idempotent restore
+    docker run --rm \
+      --network "$NETWORK_NAME" \
+      -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+      mysql:8 \
+      sh -c "mysql -h db -u root -e \"DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;\""
+
+    # Import dump using mysql:8 client container
+    docker run --rm \
+      --network "$NETWORK_NAME" \
+      -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+      -v "$TMP_DIR/db/nextcloud.sql:/restore.sql" \
+      mysql:8 \
+      sh -c "mysql -h db -u root $MYSQL_DATABASE < /restore.sql"
+
+    echo "[5/6] Starting Nextcloud service..."
+    docker compose -f "$REPO_DIR/docker-compose.yml" up -d nextcloud
+
+    echo "[6/6] Verifying services and exiting maintenance mode..."
+    echo "[*] Waiting for Nextcloud container to be healthy..."
+    wait_for_healthy "nextcloud" 180
+    NC_CID_NEW="$(docker compose -f "/opt/raspi-nextcloud-setup/docker-compose.yml" ps -q nextcloud)"
+    docker exec -u www-data "$NC_CID_NEW" php occ maintenance:mode --off || true
+
+    # Temp dir is cleaned up by the trap
+    echo "=== Restore Complete From: $BACKUP_FILE ==="
+}
+
+# --- Helper Functions ---
+die() {
+    dialog --title "Error" --msgbox "$1" 8 60
+    exit 1
+}
+
+get_nc_cid() {
+    docker compose -f "$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true
+}
+
+is_stack_running() {
+    [[ -n "$(get_nc_cid)" ]]
+}
+
+wait_for_completion() {
+    local pid=$1
+    local title=$2
+    local text=$3
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+    done
+    wait "$pid"
+    return $?
+}
+
+reset_terminal() {
+    sleep 0.5
+    stty sane 2>/dev/null || true
+}
+
+auto_detect_backup_drive() {
+    local detected_dev backup_label
+    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
+    if [[ -n "$detected_dev" ]]; then
+        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
+        echo "$detected_dev|$backup_label"
+    else
+        echo "|LocalFallback"
+    fi
+}
+
+update_env() {
+    local key="$1" value="$2"
+    if grep -q "^$key=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^$key=.*|$key=$value|" "$ENV_FILE"
+    else
+        echo "$key=$value" >> "$ENV_FILE"
+    fi
+}
+
+install_backup_cron() {
+    local minute="$1" hour="$2" day_of_month="$3" month="$4" day_of_week="$5"
+    local cron_expr="$minute $hour $day_of_month $month $day_of_week"
+
+    local cron_content="# Run Nextcloud backup at $cron_expr\n$cron_expr root /usr/local/sbin/raspi-nextcloud-tui --backup >> $BACKUP_LOG_FILE 2>&1\n"
+    if [[ -f "$CRON_FILE" && $(cat "$CRON_FILE") == *"$cron_expr"* ]]; then
+        echo "Cron job already up-to-date for schedule $cron_expr."
+    else
+        echo -e "$cron_content" > "$CRON_FILE"
+        chmod 644 "$CRON_FILE"
+        echo "Cron job updated for schedule $cron_expr."
+    fi
+}
+
+configure_backup_drive() {
+    local backup_label="$1" mount_dir="$2" auto_format="$3"
+    local detected_info auto_dev suggested_label
+
+    # Auto-detect suggestion
+    detected_info=$(auto_detect_backup_drive)
+    auto_dev=$(echo "$detected_info" | cut -d'|' -f1)
+    suggested_label=$(echo "$detected_info" | cut -d'|' -f2)
+
+    if [[ "$auto_dev" != "" && "$suggested_label" != "LocalFallback" ]]; then
+        dialog --msgbox "Detected external drive: $auto_dev\nSuggested label: $suggested_label\n(You can override below)" 10 60
+    fi
+
+    local values
+    values=$(dialog --backtitle "Backup Drive Configuration" \
+        --stdout \
+        --title "Configure Backup Drive" \
+        --form "Enter backup drive details:" \
+        15 60 8 \
+        "Mount Point:" 1 1 "$mount_dir" 1 20 40 0 \
+        "Label:"       2 1 "${backup_label:-$suggested_label}" 2 20 40 0 \
+        "Auto-Format? (Y/N):" 3 1 "${auto_format:-N}" 3 20 10 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
+        return 1
+    fi
+
+    mapfile -t values_array <<< "$values"
+    local new_mount="${values_array[0]}"
+    local new_label="${values_array[1]}"
+    local new_format="${values_array[2]}"
+
+    # Update .env
+    update_env "BACKUP_MOUNTDIR" "$new_mount"
+    update_env "BACKUP_LABEL" "$new_label"
+    update_env "AUTO_FORMAT_BACKUP" "$new_format"
+
+    mkdir -p "$new_mount"
+
+    # Format if requested and needed
+    if [[ "$new_format" == "Y" || "$new_format" == "y" ]]; then
+        dialog --title "WARNING" --yesno "Formatting will ERASE all data on the drive with label '$new_label'. Proceed?" 8 60
+        if [ $? -eq 0 ]; then
+            local dev
+            dev=$(blkid -L "$new_label" 2>/dev/null || echo "$auto_dev")
+            if [[ -n "$dev" ]]; then
+                mkfs.ext4 -F -L "$new_label" "$dev" >> "$BACKUP_LOG_FILE" 2>&1
+                echo "[INFO] Formatted drive $dev with label $new_label" >> "$BACKUP_LOG_FILE"
+            else
+                dialog --title "Error" --msgbox "Drive not found for formatting." 8 50
+                return 1
+            fi
+        else
+            return 0
+        fi
+    fi
+
+    # Mount
+    if ! mountpoint -q "$new_mount"; then
+        if blkid -L "$new_label" >/dev/null 2>&1; then
+            mount -L "$new_label" "$new_mount" || {
+                dialog --title "Error" --msgbox "Failed to mount drive." 8 50
+                return 1
+            }
+            # Add to fstab if not present
+            local uuid
+            uuid=$(blkid -o value -s UUID -L "$new_label")
+            if ! grep -q "$uuid" /etc/fstab; then
+                echo "UUID=$uuid $new_mount ext4 defaults,nofail 0 2" >> /etc/fstab
+            fi
+        else
+            dialog --title "Error" --msgbox "Drive with label '$new_label' not found." 8 50
+            return 1
+        fi
+    fi
+
+    dialog --title "Success" --msgbox "Backup drive configured and mounted at $new_mount." 8 50
+}
+
+system_health_check() {
+    touch "$HEALTH_LOG_FILE"
+    chmod 644 "$HEALTH_LOG_FILE"
+
+    (
+        echo "=== System Health Check Started at $(date) ==="
+
+        # Docker status
+        echo "[CHECK] Docker service:"
+        if systemctl is-active --quiet docker; then
+            echo "  ✅ Docker is running"
+        else
+            echo "  ❌ Docker is not running"
+        fi
+
+        # Stack status
+        echo "[CHECK] Nextcloud stack:"
+        if is_stack_running; then
+            echo "  ✅ Stack is running"
+            local nc_cid db_cid
+            nc_cid=$(get_nc_cid)
+            db_cid=$(docker compose -f "$COMPOSE_FILE" ps -q db 2>/dev/null)
+            if [[ -n "$nc_cid" && -n "$db_cid" ]]; then
+                local nc_health db_health
+                nc_health=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$nc_cid" 2>/dev/null || echo "unknown")
+                db_health=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$db_cid" 2>/dev/null || echo "unknown")
+                echo "  Nextcloud health: $nc_health"
+                echo "  DB health: $db_health"
+            fi
+        else
+            echo "  ❌ Stack is not running"
+        fi
+
+        # Disk space
+        echo "[CHECK] Disk usage:"
+        df -h / | tail -1 | awk '{print "  Root: " $5 " used (" $4 " available)"}'
+        source "$ENV_FILE" 2>/dev/null || true
+        local backup_dir="${BACKUP_MOUNTDIR:-/mnt/backup}"
+        if mountpoint -q "$backup_dir"; then
+            df -h "$backup_dir" | tail -1 | awk '{print "  Backup: " $5 " used (" $4 " available)"}'
+        else
+            echo "  Backup dir not mounted"
+        fi
+
+        # Backup drive mount
+        echo "[CHECK] Backup drive:"
+        if mountpoint -q "$backup_dir"; then
+            echo "  ✅ Mounted at $backup_dir"
+        else
+            echo "  ❌ Not mounted"
+        fi
+
+        # Cron job
+        echo "[CHECK] Backup cron:"
+        if [[ -f "$CRON_FILE" ]]; then
+            echo "  ✅ Installed: $(head -1 "$CRON_FILE")"
+        else
+            echo "  ❌ Not installed"
+        fi
+
+        # Log errors (last 50 lines)
+        echo "[CHECK] Recent errors in logs:"
+        grep -i "error\|fail\|warn" "$MAIN_LOG_FILE" "$BACKUP_LOG_FILE" "$RESTORE_LOG_FILE" 2>/dev/null | tail -20 || echo "  No recent errors"
+
+        # Nextcloud occ status (if running)
+        if [[ -n "$nc_cid" ]]; then
+            echo "[CHECK] Nextcloud status:"
+            docker exec -u www-data "$nc_cid" php occ status 2>/dev/null || echo "  Could not get status."
+        fi
+
+        echo "=== Health Check Completed at $(date) ==="
+    ) >> "$HEALTH_LOG_FILE" 2>&1
+
+    dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
+}
+
+# --- Maintenance Menu ---
+maintenance_menu() {
+    while true; do
+        local choice
+        choice=$(dialog --stdout \
+            --title "Maintenance Menu" \
+            --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            0 "Back to Main Menu" \
+            1 "Toggle Maintenance Mode" \
+            2 "Scan User Files (files:scan)" \
+            3 "Expand Filesystem with LVM")
+        local retval=$?
+        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+            return 0  # Explicit back or cancel -> return to main
+        fi
+
+        case "$choice" in
+            1) toggle_maintenance_mode ;;
+            2) run_files_scan ;;
+            3) lvm_storage_extension ;;
+        esac
+        reset_terminal  # Clean after actions
+    done
+}
+
+toggle_maintenance_mode() {
+    if ! is_stack_running; then
+        dialog --title "Error" --msgbox "Nextcloud stack is not running." 8 50
+        return 1
+    fi
+
+    local nc_cid
+    nc_cid=$(get_nc_cid)
+    if [[ -z "$nc_cid" ]]; then
+        dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
+        return 1
+    fi
+
+    local current_status
+    if ! current_status=$(docker exec -u www-data "$nc_cid" php occ maintenance:mode 2>&1); then
+        dialog --title "Error" --msgbox "Failed to query maintenance mode: $current_status" 8 50
+        return 1
+    fi
+
+    local status new_mode new_status
+    if echo "$current_status" | grep -q "enabled"; then
+        status="enabled"
+        new_mode="--off"
+        new_status="disabled"
+    else
+        status="disabled"
+        new_mode="--on"
+        new_status="enabled"
+    fi
+
+    dialog --title "Confirm" --yesno "Maintenance mode is currently $status. Do you want to turn it $new_status?" 10 60
+    if [ $? -eq 0 ]; then
+        if docker exec -u www-data "$nc_cid" php occ maintenance:mode "$new_mode" >/dev/null 2>&1; then
+            dialog --title "Success" --msgbox "Maintenance mode is now $new_status." 8 40
+        else
+            dialog --title "Error" --msgbox "Failed to toggle maintenance mode." 8 50
+        fi
+    fi
+    reset_terminal
+}
+
+run_files_scan() {
+    if ! is_stack_running; then
+        dialog --title "Error" --msgbox "Nextcloud stack is not running." 8 50
+        return 1
+    fi
+    
+    local user
+    user=$(dialog --stdout \
+        --inputbox "Enter username to scan (or '--all' for all users):" 8 60 "")
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$user" ]; then
+        return 0
+    fi
+
+    dialog --title "Confirm Scan" --yesno "Scan files for user: '$user'?" 8 50
+    if [ $? -eq 0 ]; then
+        local nc_cid
+        nc_cid=$(get_nc_cid)
+        if [[ -z "$nc_cid" ]]; then
+            dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
+            return 1
+        fi
+        (
+            echo "=== File Scan Started at $(date) ===" 
+            docker exec -u www-data "$nc_cid" php occ files:scan "$user"
+            echo "=== File Scan Completed at $(date) ===" 
+        ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
+        local pid=$!
+        
+        dialog --title "File Scan Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
+        local tail_pid=$!
+        
+        wait_for_completion "$pid" "Scan in Progress" "Scanning user files... (Check log for details)"
+        kill "$tail_pid" 2>/dev/null || true
+        reset_terminal
+        
+        dialog --title "Complete" --msgbox "File scan for '$user' finished. Check log for details." 8 60
+    fi
+}
+
+get_ssd_drives() {
+    lsblk -d -o NAME -n | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z])$' | sort
+}
+
+fix_cloudflare_repo() {
+    echo "[INFO] Fixing Cloudflare repository configuration" >> "$1"
+    sudo rm -f /etc/apt/sources.list.d/cloudflare*.list >> "$1" 2>&1
+    sudo mkdir -p --mode=0755 /usr/share/keyrings >> "$1" 2>&1
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null 2>> "$1"
+    echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main' | sudo tee /etc/apt/sources.list.d/cloudflared.list >> "$1" 2>&1
+}
+
+# New: Flash OS to NVMe and Switch Boot (For Fresh SD to NVMe)
+flash_to_nvme() {
+    local root_dev
+    root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)
+    if [[ $root_dev != /dev/mmcblk* ]]; then
+        die "This option is only available when booted from SD card."
+    fi
+
+    local drives
+    drives=$(get_ssd_drives)
+    mapfile -t drive_array <<< "$drives"
+    if [ ${#drive_array[@]} -eq 0 ]; then
+        die "No target SSD/NVMe drive detected."
+    fi
+
+    local target_name
+    if [ ${#drive_array[@]} -eq 1 ]; then
+        target_name=${drive_array[0]}
+    else
+        local options=()
+        for i in "${!drive_array[@]}"; do
+            local size
+            size=$(lsblk -d -o SIZE -n /dev/"${drive_array[$i]}")
+            options+=("$((i+1))" "${drive_array[$i]} ($size)")
+        done
+        local choice
+        choice=$(dialog --stdout --title "Select Target Drive" --menu "Choose the drive to flash to:" 15 50 5 "${options[@]}")
+        if [ $? -ne 0 ]; then return 0; fi
+        target_name=${drive_array[$((choice-1))]}
+    fi
+
+    local part_suffix
+    if [[ $target_name =~ ^nvme ]]; then
+        part_suffix="p"
+    else
+        part_suffix=""
+    fi
+    local target_root_part="/dev/${target_name}${part_suffix}2"
+
+    dialog --title "Warning" --yesno "This will clone the current OS from SD to /dev/$target_name, set boot priority, and reboot. The drive will be overwritten. Proceed?" 10 60
+    if [ $? -ne 0 ]; then return 0; fi
+
+    (
+        echo "=== Flash to $target_name Started at $(date) ===" >> "$FLASH_LOG_FILE"
+
+        fix_cloudflare_repo "$FLASH_LOG_FILE"
+        apt update >> "$FLASH_LOG_FILE" 2>&1 || die "apt update failed."
+        apt install -y git rsync >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+        git clone https://github.com/geerlingguy/rpi-clone.git /tmp/rpi-clone >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to clone rpi-clone."
+        cd /tmp/rpi-clone
+        sudo cp rpi-clone rpi-clone-setup /usr/local/bin >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to copy rpi-clone scripts."
+        sudo chmod +x /usr/local/bin/rpi-clone /usr/local/bin/rpi-clone-setup >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to make rpi-clone executable."
+        rpi-clone "$target_name" -f -U -v >> "$FLASH_LOG_FILE" 2>&1 || die "Clone failed."
+        
+        # Add auto-start TUI on first boot
+        mkdir -p /mnt/target
+        mount "$target_root_part" /mnt/target >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to mount new root."
+        echo "if [ -f /first_boot_tui ]; then sudo $REPO_DIR/tui.sh; rm /first_boot_tui; fi" >> /mnt/target/etc/rc.local
+        touch /mnt/target/first_boot_tui
+        umount /mnt/target
+
+        # Set boot order
+        local boot_code
+        if [[ $target_name =~ ^nvme ]]; then boot_code=B3; else boot_code=B2; fi
+        raspi-config nonint do_boot_order "$boot_code" >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to set boot order."
+
+        echo "=== Flash to $target_name Completed at $(date) ===" >> "$FLASH_LOG_FILE"
+    ) & 
+    local pid=$!
+
+    dialog --title "Flash Log" --tailbox "$FLASH_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Flash to Drive in Progress" "Cloning and configuring... (Check log)"
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    dialog --title "Complete" --yesno "Flash done. Reboot to $target_name now? (Remove SD card after shutdown)" 8 60
+    if [ $? -eq 0 ]; then sudo reboot; fi
+
+    dialog --title "Flash Log" --textbox "$FLASH_LOG_FILE" 25 80
+}
+
+# New: LVM Storage Extension Function (Phase-Aware, Automated)
+lvm_storage_extension() {
+    local drives
+    drives=$(get_ssd_drives)
+    mapfile -t drive_array <<< "$drives"
+    if [ ${#drive_array[@]} -ne 2 ]; then
+        die "Exactly two SSD/NVMe drives required for LVM extension."
+    fi
+
+    local root_dev_full
+    root_dev_full=$(findmnt -no SOURCE /)
+    local root_dev_short=${root_dev_full#/dev/mapper/} # Get clean name like rpi--vg-root--lv
+
+    dialog --title "Warning" --yesno "This will extend storage with LVM across two drives, creating a single large filesystem. This process is complex and involves multiple reboots. Ensure you have a fresh Raspberry Pi OS Bookworm Lite SD card available for the intermediate step. It is highly recommended to back up all data first. Proceed?" 15 70
+    if [ $? -ne 0 ]; then return 0; fi
+
+    (
+        echo "=== LVM Migration Started at $(date) on root: $root_dev_full ===" >> "$LVM_LOG_FILE"
+
+        # --- Phase 1: Preparation on the initial (non-LVM) SSD/NVMe drive ---
+        if [[ "$root_dev_full" =~ ^/dev/(nvme|sd) ]]; then
+            echo "[Phase 1] Preparing the initial drive for migration..." >> "$LVM_LOG_FILE"
+            local current_root_drive
+            current_root_drive=$(lsblk -no pkname "$root_dev_full")
+            local other_drive=""
+            for drive in "${drive_array[@]}"; do
+                if [[ "$drive" != "$current_root_drive" ]]; then
+                    other_drive=$drive
+                    break
+                fi
+            done
+            [[ -z "$other_drive" ]] && die "Could not determine the other drive for initramfs preparation."
+
+            echo "Current root drive: $current_root_drive. The other drive is: $other_drive." >> "$LVM_LOG_FILE"
+
+            fix_cloudflare_repo "$LVM_LOG_FILE"
+            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
+            apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
+            # Add required modules for LVM on NVMe/USB
+            cat <<EOF >> /etc/initramfs-tools/modules
+nvme_core
+nvme
+dm-mod
+usb_storage
+sd_mod
+EOF
+            sort -u /etc/initramfs-tools/modules -o /etc/initramfs-tools/modules
+            mkdir -p /etc/initramfs-tools/scripts/local-top
+            # Dynamically create the initramfs script to wait for the correct secondary drive
+            cat <<EOF > /etc/initramfs-tools/scripts/local-top/force_lvm
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "\$PREREQ"; }
+case "\$1" in prereqs) prereqs; exit 0;; esac
+. /scripts/functions
+modprobe -q nvme_core >/dev/null 2>&1
+modprobe -q nvme >/dev/null 2>&1
+modprobe -q dm-mod >/dev/null 2>&1
+log_begin_msg "Waiting for secondary drive ($other_drive) up to 30s"
+for i in \$(seq 1 30); do
+    if [ -b /dev/$other_drive ]; then
+        log_success_msg "Secondary drive found after \$i seconds"
+        break
+    fi
+    sleep 1
+done
+lvm pvscan --cache
+lvm vgscan --mknodes
+lvm vgchange -ay rpi-vg || true
+EOF
+            chmod +x /etc/initramfs-tools/scripts/local-top/force_lvm
+            update-initramfs -u -k "$(uname -r)" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to update initramfs."
+            cp "/boot/initrd.img-$(uname -r)" "$BOOT_PARTITION/" || die "Failed to copy initrd."
+            if ! grep -q "initramfs initrd.img-$(uname -r) followkernel" "$BOOT_PARTITION/config.txt"; then
+                echo -e "\n[all]" >> "$BOOT_PARTITION/config.txt"
+                echo "initramfs initrd.img-$(uname -r) followkernel" >> "$BOOT_PARTITION/config.txt"
+            fi
+            echo "[Phase 1 Complete] System prepared for migration from SD card." >> "$LVM_LOG_FILE"
+
+        # --- Phase 2: Migration performed from a temporary SD card OS ---
+        elif [[ "$root_dev_full" == /dev/mmcblk* ]]; then
+            echo "[Phase 2] Migrating from original drive to new LVM volume..." >> "$LVM_LOG_FILE"
+            
+            # Robustly identify source and target drives by checking for a filesystem on partition 2
+            local source_drive="" target_drive=""
+            local source_suffix target_suffix
+            for drive in "${drive_array[@]}"; do
+                suffix=$( [[ $drive =~ ^nvme ]] && echo "p" || echo "" )
+                if blkid "/dev/${drive}${suffix}2" &>/dev/null; then
+                    source_drive=$drive
+                    source_suffix=$suffix
+                else
+                    target_drive=$drive
+                    target_suffix=$suffix
+                fi
+            done
+            [[ -z "$source_drive" || -z "$target_drive" ]] && die "Could not identify source or target drive."
+            echo "Source drive: $source_drive, Target drive: $target_drive" >> "$LVM_LOG_FILE"
+
+            local original_root_partuuid
+            original_root_partuuid=$(blkid -o value -s PARTUUID "/dev/${source_drive}${source_suffix}2")
+            [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of source drive /dev/${source_drive}${source_suffix}2."
+
+            fix_cloudflare_repo "$LVM_LOG_FILE"
+            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
+            apt install -y lvm2 rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            
+            echo "Setting up LVM on target drive $target_drive..." >> "$LVM_LOG_FILE"
+            # Clean up and create LVM on the target drive
+            vgremove -f rpi-vg 2>/dev/null || true
+            pvremove -f "/dev/$target_drive" 2>/dev/null || true
+            wipefs -a "/dev/$target_drive" >> "$LVM_LOG_FILE" 2>&1
+            parted --script "/dev/$target_drive" mklabel gpt >> "$LVM_LOG_FILE" 2>&1
+            pvcreate -f "/dev/$target_drive" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create PV on $target_drive."
+            vgcreate rpi-vg "/dev/$target_drive" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create VG 'rpi-vg'."
+            lvcreate -n root-lv -l 100%FREE rpi-vg >> "$LVM_LOG_FILE" 2>&1 || die "Failed to create LV 'root-lv'."
+            mkfs.ext4 -L rootfs /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Failed to format LV."
+            
+            echo "Copying data from $source_drive to LVM..." >> "$LVM_LOG_FILE"
+            mkdir -p /mnt/old_root /mnt/new_root
+            mount "/dev/${source_drive}${source_suffix}2" /mnt/old_root >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount old root."
+            mount /dev/rpi-vg/root-lv /mnt/new_root >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount new LVM root."
+            rsync -aAXv --delete /mnt/old_root/ /mnt/new_root/ >> "$LVM_LOG_FILE" 2>&1 || die "Rsync failed."
+            
+            echo "Configuring boot files for LVM..." >> "$LVM_LOG_FILE"
+            mount "/dev/${source_drive}${source_suffix}1" "/mnt/new_root$BOOT_PARTITION" >> "$LVM_LOG_FILE" 2>&1 || die "Failed to mount boot partition."
+            # Update fstab and cmdline.txt to point to the new LVM root device
+            sed -i "s|PARTUUID=$original_root_partuuid|/dev/mapper/rpi--vg-root--lv|" /mnt/new_root/etc/fstab || die "fstab update failed."
+            sed -i "s|root=PARTUUID=[^ ]*|root=/dev/mapper/rpi--vg-root--lv rootfstype=ext4 rootwait|" "/mnt/new_root$BOOT_PARTITION/cmdline.txt" || die "cmdline update failed."
+            
+            umount "/mnt/new_root$BOOT_PARTITION"
+            umount /mnt/new_root
+            umount /mnt/old_root
+            echo "[Phase 2 Complete] Set boot to the original source drive ($source_drive) via raspi-config, remove SD, and reboot." >> "$LVM_LOG_FILE"
+
+        # --- Phase 3: Finalization on the new LVM root filesystem ---
+        elif [[ "$root_dev_short" == "rpi--vg-root--lv" ]]; then
+            echo "[Phase 3] Finalizing LVM setup by incorporating the original drive..." >> "$LVM_LOG_FILE"
+            
+            # Get current PVs
+            mapfile -t pvs_list < <(pvs --noheadings -o pv_name | awk '{print $1}')
+            
+            # Find the partition or whole disk to add (not in current PVs)
+            local add_dev=""
+            for drive in "${drive_array[@]}"; do
+                local suffix=$( [[ $drive =~ ^nvme ]] && echo "p" || echo "" )
+                local candidate_dev="/dev/${drive}${suffix}2"
+                if [ -b "$candidate_dev" ] && ! printf '%s\n' "${pvs_list[@]}" | grep -q "^$candidate_dev$"; then
+                    add_dev="$candidate_dev"
+                    break
+                fi
+                # Check whole disk if partition not present
+                candidate_dev="/dev/$drive"
+                if [ -b "$candidate_dev" ] && ! printf '%s\n' "${pvs_list[@]}" | grep -q "^$candidate_dev$"; then
+                    add_dev="$candidate_dev"
+                    break
+                fi
+            done
+            [[ -z "$add_dev" ]] && { echo "No suitable device found to add to VG. Skipping Phase 3." >> "$LVM_LOG_FILE"; return 0; }
+            echo "Device to add to LVM: $add_dev" >> "$LVM_LOG_FILE"
+
+            fix_cloudflare_repo "$LVM_LOG_FILE"
+            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
+            apt install -y lvm2 parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install lvm2."
+            
+            echo "Wiping and adding $add_dev to volume group..." >> "$LVM_LOG_FILE"
+            umount "$add_dev" 2>/dev/null || true
+            wipefs -a -f "$add_dev" >> "$LVM_LOG_FILE" 2>&1 || die "Wipefs failed on $add_dev."
+            pvcreate -f "$add_dev" >> "$LVM_LOG_FILE" 2>&1 || die "PV create failed on $add_dev."
+            vgextend rpi-vg "$add_dev" >> "$LVM_LOG_FILE" 2>&1 || die "VG extend failed."
+            
+            echo "Extending logical volume and resizing filesystem..." >> "$LVM_LOG_FILE"
+            lvextend -l +100%FREE /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "LV extend failed."
+            resize2fs /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || die "Resize failed."
+            e2fsck -f -y /dev/rpi-vg/root-lv >> "$LVM_LOG_FILE" 2>&1 || true
+            echo "[Phase 3 Complete] Storage has been successfully extended across both drives." >> "$LVM_LOG_FILE"
+
+        else
+            die "Unknown root device: $root_dev_full. Cannot determine LVM migration phase. Aborting."
+        fi
+
+        echo "=== LVM Migration Phase Completed at $(date) ===" >> "$LVM_LOG_FILE"
+    ) &
+    local pid=$!
+
+    dialog --title "LVM Log" --tailbox "$LVM_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "LVM Extension in Progress" "Processing phase... (Check log for details)"
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    # --- Phase-specific prompts for next steps ---
+    if [[ "$root_dev_full" =~ ^/dev/(nvme|sd) ]]; then
+        dialog --title "Next Steps: Reboot to SD Card" --msgbox "Phase 1 is complete. Please perform the following steps:\n\n1. Shut down the Raspberry Pi.\n2. Insert an SD card flashed with a fresh Raspberry Pi OS Lite (Bookworm).\n3. Boot from the SD card (you may need to set this in raspi-config or the bootloader).\n4. On the SD card OS, run the installer again (curl... | sudo bash install.txt).\n5. Run this TUI again and select 'Maintenance' > 'Expand Filesystem with LVM' to begin Phase 2." 18 75
+    elif [[ "$root_dev_full" == /dev/mmcblk* ]]; then
+        local boot_drive
+        boot_drive=$(echo "$LVM_LOG_FILE" | grep "Source drive:" | tail -1 | awk '{print $3}')
+        local boot_type="USB Boot (B2)"
+        [[ "$boot_drive" =~ ^nvme ]] && boot_type="NVMe/PCIe Boot (B3)"
+        dialog --title "Next Steps: Reboot to LVM" --msgbox "Phase 2 is complete. Please perform the following steps:\n\n1. Shut down the Raspberry Pi.\n2. REMOVE the SD card.\n3. Ensure the boot order is set to '$boot_type' (via raspi-config or bootloader).\n4. Power on the device. It will boot from the new LVM volume.\n5. Once booted, run this TUI again and select 'Maintenance' > 'Expand Filesystem with LVM' to begin the final phase." 18 75
+    elif [[ "$root_dev_short" == "rpi--vg-root--lv" ]]; then
+        dialog --title "Complete" --yesno "LVM extension is complete! The root filesystem is now extended across both drives. It's recommended to reboot to ensure everything is working correctly. Reboot now?" 10 60
+        if [ $? -eq 0 ]; then sudo reboot; fi
+    fi
+
+    dialog --title "LVM Extension Log" --textbox "$LVM_LOG_FILE" 25 80
+}
+
+# --- Logs Menu ---
+logs_menu() {
+    while true; do
+        local choice
+        choice=$(dialog --stdout \
+            --title "View Logs" \
+            --menu "Select a log to view (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            0 "Back to Main Menu" \
+            1 "Main Setup Log" \
+            2 "Backup Log" \
+            3 "Restore Log" \
+            4 "Docker Compose Logs" \
+            5 "Health Check Log" \
+            6 "LVM Migration Log" \
+            7 "Flash to Drive Log")
+        local retval=$?
+        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+            return 0
+        fi
+        
+        case "$choice" in
+            1) dialog --title "Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 ;;
+            2) dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 ;;
+            3) dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 ;;
+            4) 
+                local temp_log
+                temp_log=$(mktemp /tmp/dockerlogs.XXXXXX)
+                if docker compose -f "$COMPOSE_FILE" logs --tail=100 > "$temp_log" 2>&1; then
+                    dialog --title "Docker Logs" --tailbox "$temp_log" 25 80
+                else
+                    dialog --title "Error" --msgbox "Failed to fetch Docker logs." 8 50
+                fi
+                rm -f "$temp_log"
+                ;;
+            5) dialog --title "Health Check Log" --tailbox "$HEALTH_LOG_FILE" 25 80 ;;
+            6) dialog --title "LVM Log" --tailbox "$LVM_LOG_FILE" 25 80 ;;
+            7) dialog --title "Flash Log" --tailbox "$FLASH_LOG_FILE" 25 80 ;;
+        esac
+        reset_terminal
+    done
+}
+
+# --- Configure Backup Settings ---
+configure_backup_settings() {
+    source "$ENV_FILE" 2>/dev/null || true
+    local current_mount="${BACKUP_MOUNTDIR:-/mnt/backup}"
+    local current_label="${BACKUP_LABEL:-BackupDrive}"
+    local current_format="${AUTO_FORMAT_BACKUP:-N}"
+    local current_retention="${BACKUP_RETENTION:-8}"
+    local current_minute="0" current_hour="3" current_dom="*" current_month="*" current_dow="0"  # Default weekly Sunday 03:00
+
+    # Parse current cron if exists
+    if [[ -f "$CRON_FILE" ]]; then
+        local cron_line=$(grep -v '^#' "$CRON_FILE" | head -1)
+        current_minute=$(echo "$cron_line" | awk '{print $1}')
+        current_hour=$(echo "$cron_line" | awk '{print $2}')
+        current_dom=$(echo "$cron_line" | awk '{print $3}')
+        current_month=$(echo "$cron_line" | awk '{print $4}')
+        current_dow=$(echo "$cron_line" | awk '{print $5}')
+    fi
+
+    local values
+    values=$(dialog --backtitle "Backup Configuration" \
+        --stdout \
+        --title "Configure Backup Settings" \
+        --form "Enter backup settings:" \
+        18 60 10 \
+        "Mount Point:" 1 1 "$current_mount" 1 20 40 0 \
+        "Label:" 2 1 "$current_label" 2 20 40 0 \
+        "Auto-Format? (Y/N):" 3 1 "$current_format" 3 20 10 0 \
+        "Retention (days):" 4 1 "$current_retention" 4 20 10 0 \
+        "Cron Minute (0-59):" 5 1 "$current_minute" 5 20 10 0 \
+        "Cron Hour (0-23):" 6 1 "$current_hour" 6 20 10 0 \
+        "Cron Day of Month (1-31):" 7 1 "$current_dom" 7 20 10 0 \
+        "Cron Month (1-12):" 8 1 "$current_month" 8 20 10 0 \
+        "Cron Day of Week (0-6):" 9 1 "$current_dow" 9 20 10 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
+        return 0
+    fi
+
+    mapfile -t values_array <<< "$values"
+    local new_mount="${values_array[0]}"
+    local new_label="${values_array[1]}"
+    local new_format="${values_array[2]}"
+    local new_retention="${values_array[3]}"
+    local new_minute="${values_array[4]}"
+    local new_hour="${values_array[5]}"
+    local new_dom="${values_array[6]}"
+    local new_month="${values_array[7]}"
+    local new_dow="${values_array[8]}"
+
+    update_env "BACKUP_MOUNTDIR" "$new_mount"
+    update_env "BACKUP_LABEL" "$new_label"
+    update_env "AUTO_FORMAT_BACKUP" "$new_format"
+    update_env "BACKUP_RETENTION" "$new_retention"
+
+    configure_backup_drive "$new_label" "$new_mount" "$new_format"
+    install_backup_cron "$new_minute" "$new_hour" "$new_dom" "$new_month" "$new_dow"
+}
+
+# --- Run Initial Setup ---
+run_initial_setup() {
+    # Check if stack is already running (idempotent: warn on re-run)
+    if is_stack_running; then
+        dialog --title "Warning" --yesno "Stack is already running. Re-run setup? (May reset config)" 8 50
+        [[ $? -ne 0 ]] && return
+    fi
+
+    local values
+    values=$(dialog --backtitle "Nextcloud Initial Setup" \
+        --stdout \
+        --title "Configuration" \
+        --form "Enter your configuration details below." \
+        25 60 16 \
+        "Admin Password:"   1 1 ""            1 25 40 0 \
+        "DB Root Password:" 2 1 ""            2 25 40 0 \
+        "DB User Password:" 3 1 ""            3 25 40 0 \
+        "Base Domain:"      4 1 "example.com" 4 25 40 0 \
+        "Subdomain:"        5 1 "nextcloud"   5 25 40 0)
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then
+        echo "[INFO] User canceled or dialog failed at $(date)" >> "$MAIN_LOG_FILE"
+        return 1
+    fi
+
+    mapfile -t values_array <<< "$values"
+    if [ "${#values_array[@]}" -lt 5 ]; then
+        dialog --title "Input Error" --msgbox "All fields are required. Please try again." 8 50
+        return 1
+    fi
+
+    local ADMIN_PASS="${values_array[0]}"
+    local DB_ROOT_PASS="${values_array[1]}"
+    local DB_USER_PASS="${values_array[2]}"
+    local BASE_DOMAIN="${values_array[3]}"
+    local SUBDOMAIN="${values_array[4]}"
+
+    # Safeguard empty vars
+    if [[ -z "$ADMIN_PASS" || -z "$DB_ROOT_PASS" || -z "$DB_USER_PASS" || -z "$BASE_DOMAIN" ]]; then
+        dialog --title "Input Error" --msgbox "One or more fields are empty. Please try again." 8 50
+        return 1
+    fi
+
+    # Centralized Cloudflare login
+    if [ ! -f /root/.cloudflared/cert.pem ]; then
+        dialog --msgbox "Cloudflare authentication required. The authentication process will start now, and instructions will be shown in a dialog box." 8 60
+        cloudflared tunnel login | dialog --programbox "Cloudflare Authentication - Open the URL in your browser" 20 80
+        if [ ! -f /root/.cloudflared/cert.pem ]; then
+            dialog --title "Error" --msgbox "Authentication failed or certificate not created. Please try again or manually place cert.pem." 8 60
+            return 1
+        fi
+    fi
+
+    # Ensure log file exists and is writable
+    touch "$MAIN_LOG_FILE"
+    chmod 644 "$MAIN_LOG_FILE"
+
+    (
+        set -x
+        echo "--- TUI: Subshell for setup started at $(date) ---"
+        export NEXTCLOUD_ADMIN_PASSWORD="$ADMIN_PASS"
+        export MYSQL_ROOT_PASSWORD="$DB_ROOT_PASS"
+        export MYSQL_PASSWORD="$DB_USER_PASS"
+        export BASE_DOMAIN="$BASE_DOMAIN"
+        export SUBDOMAIN="${SUBDOMAIN:-nextcloud}"
+        setup
+    ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
+    local pid=$!
+
+    dialog --title "Initial Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Setup in Progress" "Running initial setup... (Check log for details)"
+    local exit_code=$?
+    
+    # Clean up tailbox
+    sleep 1
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+    
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Setup completed successfully!" 8 40
+    else
+        dialog --title "Error" --msgbox "Setup failed. Detailed log saved to:\n\n$MAIN_LOG_FILE" 10 70
+    fi
+}
+
+# --- Run Backup ---
+run_backup() {
+    if ! is_stack_running; then
+        dialog --title "Error" --msgbox "Nextcloud stack not running." 8 50
+        return
+    fi
+
+    source "$ENV_FILE" 2>/dev/null || true
+    dialog --title "Confirm" --yesno "Run backup now? Ensure backup drive is mounted." 8 60
+    if [ $? -ne 0 ]; then return; fi
+
+    (
+        backup
+    ) >> "$BACKUP_LOG_FILE" 2>&1 &
+    local pid=$!
+
+    dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Backup in Progress" "Running backup..."
+    local exit_code=$?
+
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Backup completed successfully!" 8 40
+    else
+        dialog --title "Error" --msgbox "Backup failed. Check log at $BACKUP_LOG_FILE." 8 60
+    fi
+}
+
+# --- Run Restore ---
+run_restore() {
+    if ! is_stack_running; then
+        dialog --title "Error" --msgbox "Nextcloud stack not running." 8 50
+        return
+    fi
+
+    source "$ENV_FILE" 2>/dev/null || true
+    if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+        dialog --title "Error" --msgbox "Backup drive not mounted. Configure in settings first." 8 60
+        return
+    fi
+
+    local backups
+    mapfile -t backups < <(find "$BACKUP_MOUNTDIR" -maxdepth 1 -name 'nextcloud_backup_*.tar.gz' -print0 | xargs -0 ls -t)
+    if [ ${#backups[@]} -eq 0 ]; then
+        dialog --title "Error" --msgbox "No backups found in $BACKUP_MOUNTDIR." 8 60
+        return
+    fi
+
+    local options=()
+    for i in "${!backups[@]}"; do
+        options+=("$((i+1))" "$(basename "${backups[$i]}")")
+    done
+
+    local choice
+    choice=$(dialog --stdout --title "Select Backup" --menu "Choose a backup to restore:" $HEIGHT $WIDTH $CHOICE_HEIGHT "${options[@]}")
+    if [ $? -ne 0 ]; then return; fi
+
+    local selected="${backups[$((choice-1))]}"
+
+    dialog --title "WARNING" --yesno "This will OVERWRITE your current data, config, and database with the contents from $selected.\n\nThis operation is irreversible. Proceed?" 10 70
+    if [ $? -ne 0 ]; then return; fi
+
+    (
+        restore "$selected" --no-prompt
+    ) >> "$RESTORE_LOG_FILE" 2>&1 &
+    local pid=$!
+
+    dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Restore in Progress" "Running restore..."
+    local exit_code=$?
+
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Restore completed successfully!" 8 40
+    else
+        dialog --title "Error" --msgbox "Restore failed. Check log at $RESTORE_LOG_FILE." 8 60
+    fi
+}
+
+# --- Setup FTP Server ---
+setup_ftp_server() {
+    if [[ $EUID -ne 0 ]]; then
+        dialog --title "Error" --msgbox "This option must be run as root." 8 50
+        return
+    fi
+
+    source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found." 8 50; return; }
+
+    local nc_cid=$(get_nc_cid)
+    if [[ -z "$nc_cid" ]]; then
+        dialog --title "Error" --msgbox "Nextcloud container not running." 8 50
+        return
+    fi
+
+    local nc_user
+    nc_user=$(dialog --stdout --title "Nextcloud User" --inputbox "Enter the Nextcloud username for FTP access:" 8 50)
+    if [ $? -ne 0 ] || [ -z "$nc_user" ]; then return; fi
+
+    # Verify user exists
+    if ! docker exec -u www-data "$nc_cid" php occ user:info "$nc_user" >/dev/null 2>&1; then
+        dialog --title "Error" --msgbox "Nextcloud user '$nc_user' does not exist." 8 50
+        return
+    fi
+
+    local ftp_user
+    ftp_user=$(dialog --stdout --title "FTP Username" --inputbox "Enter FTP username (default: camera):" 8 50 "camera")
+    if [ $? -ne 0 ]; then return; fi
+    ftp_user="${ftp_user:-camera}"
+
+    local ftp_pass
+    ftp_pass=$(dialog --stdout --title "FTP Password" --passwordbox "Enter FTP password:" 8 50)
+    if [ $? -ne 0 ] || [ -z "$ftp_pass" ]; then return; fi
+
+    local confirm_pass
+    confirm_pass=$(dialog --stdout --title "Confirm Password" --passwordbox "Confirm FTP password:" 8 50)
+    if [ $? -ne 0 ] || [ "$ftp_pass" != "$confirm_pass" ]; then
+        dialog --title "Error" --msgbox "Passwords do not match." 8 50
+        return
+    fi
+
+    dialog --title "Confirm" --yesno "Setup FTP server for user '$nc_user' with FTP user '$ftp_user'? This will install vsftpd and configure it." 10 60
+    if [ $? -ne 0 ]; then return; fi
+
+    # Install packages
+    apt-get update -y
+    apt-get install -y vsftpd libpam-pwdfile apache2-utils inotify-tools
+
+    # Only backup the original conf file if a backup doesn't already exist
+    if [ ! -f /etc/vsftpd.conf.bak ]; then
+        cp /etc/vsftpd.conf /etc/vsftpd.conf.bak
+    fi
+
+    # Set www-data home directory to NEXTCLOUD_DATA_DIR to avoid fallback issues
+    if [ "$(getent passwd www-data | cut -d: -f6)" != "$NEXTCLOUD_DATA_DIR" ]; then
+        usermod -d "$NEXTCLOUD_DATA_DIR" www-data
+    fi
+
+    # Configure vsftpd.conf
+    cat > /etc/vsftpd.conf <<EOF
+listen=YES
+listen_ipv6=NO
+local_enable=YES
+write_enable=YES
+local_umask=022
+chroot_local_user=YES
+allow_writeable_chroot=YES
+guest_enable=YES
+guest_username=www-data
+virtual_use_local_privs=YES
+user_sub_token=\$USER
+local_root=${NEXTCLOUD_DATA_DIR}/\$USER/files/uploads
+user_config_dir=/etc/vsftpd/user_conf
+pam_service_name=vsftpd.virtual
+EOF
+
+    # PAM config
+    cat > /etc/pam.d/vsftpd.virtual <<EOF
+auth    required pam_pwdfile.so pwdfile /etc/vsftpd/ftppasswd
+account required pam_permit.so
+EOF
+
+    # Create uploads dir
+    local upload_dir="${NEXTCLOUD_DATA_DIR}/${nc_user}/files/uploads"
+    mkdir -p "$upload_dir"
+    chown -R www-data:www-data "${NEXTCLOUD_DATA_DIR}/${nc_user}"
+
+    # Ensure config directory exists before writing to it
+    mkdir -p /etc/vsftpd/user_conf
+
+    # Add virtual user (create password file or append to existing)
+    if [ ! -f /etc/vsftpd/ftppasswd ]; then
+        htpasswd -b -c -d /etc/vsftpd/ftppasswd "$ftp_user" "$ftp_pass"
+    else
+        htpasswd -b -d /etc/vsftpd/ftppasswd "$ftp_user" "$ftp_pass"
+    fi
+
+    # User config for chroot
+    echo "local_root=${NEXTCLOUD_DATA_DIR}/${nc_user}/files/uploads" > /etc/vsftpd/user_conf/"$ftp_user"
+
+    # Restart vsftpd
+    systemctl restart vsftpd
+
+    # Setup inotify watcher script
+    cat > /usr/local/bin/nextcloud-ftp-sync.sh <<EOF
+#!/bin/bash
+
+NC_USER="\$1"
+WATCH_DIR="${NEXTCLOUD_DATA_DIR}/\$NC_USER/files/uploads"
+REPO_DIR="/opt/raspi-nextcloud-setup"
+COMPOSE_FILE="\$REPO_DIR/docker-compose.yml"
+NC_CID=\$(docker compose -f "\$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true)
+if [[ -z "\$NC_CID" ]]; then exit 1; fi
+
+while true; do
+  inotifywait -e create,modify,move,delete -r "\$WATCH_DIR" && \
+  docker exec -u www-data "\$NC_CID" php occ files:scan "\$NC_USER"
+done
+EOF
+    chmod +x /usr/local/bin/nextcloud-ftp-sync.sh
+
+    # Systemd service
+    cat > /etc/systemd/system/nextcloud-ftp-sync@.service <<EOF
+[Unit]
+Description=Nextcloud FTP Sync Watcher for %i
+
+[Service]
+ExecStart=/usr/local/bin/nextcloud-ftp-sync.sh %i
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now nextcloud-ftp-sync@"$nc_user"
+
+    dialog --title "Success" --msgbox "FTP server setup complete. Connect with user '$ftp_user' and password provided. Uploads to '$upload_dir' will trigger Nextcloud scan." 10 70
+}
+
+# --- Main Menu ---
+main_menu() {
+    while true; do
+        if $is_sd_boot; then
+            local choice
+            choice=$(dialog --backtitle "Nextcloud Pi Manager (SD Boot)" \
+                --stdout \
+                --title "Main Menu" \
+                --cancel-label "Exit" \
+                --menu "Select an option:" \
+                $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                1 "Flash OS to Drive (NVMe/USB SSD)" \
+                2 "Expand Filesystem with LVM")
+            local retval=$?
+            if [ $retval -ne 0 ]; then
+                clear
+                echo "Exiting."
+                exit 0
+            fi
+
+            case "$choice" in
+                1) flash_to_nvme ;;
+                2) lvm_storage_extension ;;
+            esac
+        else
+            local choice
+            choice=$(dialog --stdout \
+                --backtitle "Raspi Nextcloud TUI" \
+                --title "Main Menu" \
+                --menu "Select an option:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                1 "Initial Setup" \
+                2 "Run Backup" \
+                3 "Run Restore" \
+                4 "Configure Backup Settings" \
+                5 "System Health Check" \
+                6 "Maintenance Menu" \
+                7 "View Logs" \
+                8 "Setup FTP Server" \
+                0 "Exit")
+            local retval=$?
+            if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+                clear
+                exit 0
+            fi
+
+            case "$choice" in
+                1) run_initial_setup ;;
+                2) run_backup ;;
+                3) run_restore ;;
+                4) configure_backup_settings ;;
+                5) 
+                    system_health_check
+                    dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
+                    ;;
+                6) maintenance_menu ;;
+                7) logs_menu ;;
+                8) setup_ftp_server ;;
+            esac
+        fi
+        reset_terminal  # Ensure clean state after actions
+    done
+}
+
+# --- Script Entrypoint ---
+cd "$REPO_DIR" || { echo "Error: Cannot access $REPO_DIR"; exit 1; }
+main_menu
