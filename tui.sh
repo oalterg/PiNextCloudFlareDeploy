@@ -1,9 +1,9 @@
 #!/bin/bash
-# tui.sh — A TUI for managing the Nextcloud environment
+# tui — A TUI for managing the Nextcloud environment (now central script with integrated setup, backup, and restore)
 
 set -euo pipefail
 
-# --- Configuration ---
+# --- Configuration and Initialization ---
 REPO_DIR="/opt/raspi-nextcloud-setup"
 LOG_DIR="/var/log/raspi-nextcloud"
 MAIN_LOG_FILE="$LOG_DIR/main_setup.log"
@@ -39,10 +39,673 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 mkdir -p "$LOG_DIR"
-chmod +x "$REPO_DIR/setup.sh" "$REPO_DIR/backup.sh" "$REPO_DIR/restore.sh" 2>/dev/null || true
+
+# --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
+if [ $# -gt 0 ]; then
+    case "$1" in
+        --backup)
+            backup
+            exit $?
+            ;;
+        --restore)
+            shift
+            restore "$@"
+            exit $?
+            ;;
+    esac
+fi
+
+# --- Integrated Setup Function (from setup script) ---
+setup() {
+    echo "--- setup script started ---"
+
+    set -euo pipefail
+
+    # --- Constants ---
+    readonly REPO_DIR="/opt/raspi-nextcloud-setup"
+    readonly ENV_FILE="$REPO_DIR/.env"
+    readonly ENV_TEMPLATE="$REPO_DIR/.env.template"
+    readonly COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+    readonly LOCK_FILE="/var/run/raspi-nextcloud-setup.lock"
+    readonly REQUIRED_CMDS=("curl" "git" "jq" "parted" "lsblk" "blkid" "docker" "cloudflared" "gpg")
+
+    # --- Helper Functions ---
+    die() { echo "[ERROR] $1" >&2; exit 1; }
+
+    wait_for_healthy() {
+        local service_name="$1"
+        local timeout_seconds="$2"
+        local container_id
+        echo "Waiting for $service_name to become healthy..."
+        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+        [[ -z "$container_id" ]] && die "Could not find container for service '$service_name'."
+        local end_time=$((SECONDS + timeout_seconds))
+        while [ $SECONDS -lt $end_time ]; do
+            local status
+            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
+            [ "$status" == "healthy" ] && { echo "✅ $service_name is healthy."; return 0; }
+            sleep 5
+        done
+        die "$service_name did not become healthy. Check logs: 'docker logs $container_id'."
+    }
+
+    auto_detect_backup_drive() {
+        # Auto-scan: Largest removable/unmounted disk (non-root)
+        local usb_dev
+        usb_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')  # Removable, unmounted
+        if [[ -n "$usb_dev" ]]; then
+            echo "[*] Auto-detected external drive: $usb_dev ($(lsblk -o SIZE -n -d "$usb_dev"))"
+            return 0
+        else
+            echo "[!] No external drive detected. Using local fallback."
+            BACKUP_MOUNTDIR="/home/$SUDO_USER/backup"  # Safe default
+            return 1
+        fi
+    }
+
+    # --- Main Logic ---
+    preflight_checks() {
+        echo "[*] Running pre-flight checks..."
+        [[ $EUID -ne 0 ]] && die "This script must be run as root."
+
+        if [[ -z "${SUDO_USER-}" ]]; then
+            die "Could not determine the original user. Please run with 'sudo' (e.g., 'sudo /opt/raspi-nextcloud-setup/tui'), not via 'sudo su' or a root shell."
+        fi
+
+        for cmd in "${REQUIRED_CMDS[@]}"; do
+            if ! command -v "$cmd" &>/dev/null; then
+                [[ "$cmd" == "curl" || "$cmd" == "git" ]] && die "Required command '$cmd' is not installed."
+            fi
+        done
+        cd "$REPO_DIR"
+        USER_HOME=$(eval echo "~$SUDO_USER")
+        [[ -d "$USER_HOME" ]] || die "Could not determine home directory for user '$SUDO_USER'."
+    }
+
+    install_dependencies() {
+        echo "[1/10] Installing system dependencies..."
+        apt-get install -y ca-certificates curl gnupg lsb-release cron jq moreutils parted gpg
+
+        # Docker setup (idempotent)
+        if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+            apt-get update -y
+        fi
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+        # Ensure Docker is running
+        systemctl enable --now docker
+        if ! systemctl is-active --quiet docker; then
+            die "Docker failed to start. Check systemctl status docker."
+        fi
+        if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
+            mkdir -p --mode=0755 /usr/share/keyrings
+            curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
+            apt-get update -y
+        fi
+        apt-get install -y cloudflared
+    }
+
+    gather_config_from_env() {
+        echo "[2/10] Gathering configuration from environment..."
+        : "${NEXTCLOUD_ADMIN_PASSWORD:?}" "${MYSQL_ROOT_PASSWORD:?}" "${MYSQL_PASSWORD:?}" "${BASE_DOMAIN:?}"
+        SUBDOMAIN=${SUBDOMAIN:-nextcloud}
+        CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+        NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+        NEXTCLOUD_ADMIN_USER="admin"
+        MYSQL_USER="nextcloud_user"
+        MYSQL_DATABASE="nextcloud"
+        USER_HOME=$(eval echo "~$SUDO_USER")
+        NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
+        NEXTCLOUD_PORT="8080"
+        BACKUP_LABEL="BackupDrive"
+        BACKUP_MOUNTDIR="/mnt/backup"
+        BACKUP_RETENTION=8
+        # New: Auto-confirm format from env (TUI sets)
+        AUTO_FORMAT_BACKUP="${AUTO_FORMAT_BACKUP:-false}"
+        # New: Trusted proxies from env or default
+        TRUSTED_PROXIES_0="${TRUSTED_PROXIES_0:-172.18.0.1}"
+        TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-127.0.0.1}"
+    }
+
+    setup_cloudflare() {
+        echo "[3/10] Setting up Cloudflare Tunnel..."
+        echo "You may need to authenticate with Cloudflare in your browser."
+        if [ ! -f /root/.cloudflared/cert.pem ]; then
+            echo "Certificate still not found after login. If running over SSH, the cert.pem was likely downloaded to your local machine."
+            echo "Please copy cert.pem to /root/.cloudflared/cert.pem on this device and rerun the script."
+            die "Missing Cloudflare certificate."
+        fi
+        local TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+        CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+        if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+            echo "Warning: Tunnel with name $TUNNEL_NAME already exists (ID: $CF_TUNNEL_ID)."
+            local choice
+            if [ -t 0 ]; then
+                read -p "Do you want to (d)elete and recreate, or (c)hoose a different subdomain? [d/c]: " choice
+            else
+                echo "Non-interactive mode detected."
+                if [[ "${FORCE_RECREATE_TUNNEL:-false}" == "true" ]]; then
+                    choice="d"
+                else
+                    choice="r"
+                fi
+            fi
+            case "$choice" in
+                d|D)
+                    echo "Deleting existing tunnel..."
+                    cloudflared tunnel delete "$CF_TUNNEL_ID" || die "Failed to delete existing tunnel."
+                    CF_TUNNEL_ID=""
+                    ;;
+                c|C)
+                    if [ -t 0 ]; then
+                        read -p "Enter a new subdomain: " SUBDOMAIN
+                    else
+                        die "Cannot choose new subdomain in non-interactive mode."
+                    fi
+                    CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+                    NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+                    TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+                    CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+                    if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+                        die "Tunnel with new name $TUNNEL_NAME also exists. Please choose another or delete manually."
+                    fi
+                    ;;
+                r|R)
+                    # Reuse
+                    ;;
+                *)
+                    die "Invalid choice. Aborting."
+                    ;;
+            esac
+        fi
+        if [[ -z "$CF_TUNNEL_ID" || "$CF_TUNNEL_ID" == "null" ]]; then
+            echo "Creating new tunnel: $TUNNEL_NAME"
+            CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $NF}')
+        else
+            echo "Reusing existing tunnel ID: $CF_TUNNEL_ID"
+        fi
+        echo "Routing DNS for $CF_HOSTNAME..."
+        cloudflared tunnel route dns --overwrite-dns "$CF_TUNNEL_ID" "$CF_HOSTNAME" || die "Failed to create or update DNS route for $CF_HOSTNAME."
+        local CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
+        if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+            echo "Credentials file missing. Generating by running tunnel temporarily..."
+            cloudflared tunnel --credentials-file "$CREDENTIALS_FILE" run "$TUNNEL_NAME" & 
+            local temp_pid=$!
+            sleep 5
+            kill "$temp_pid" 2>/dev/null || true
+            if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+                die "Failed to generate credentials file."
+            fi
+        fi
+        mkdir -p /etc/cloudflared
+        cat > /etc/cloudflared/config.yml <<EOF
+tunnel: $TUNNEL_NAME
+credentials-file: $CREDENTIALS_FILE
+ingress:
+  - hostname: $CF_HOSTNAME
+    service: http://localhost:$NEXTCLOUD_PORT
+  - service: http_status:404
+EOF
+        cat >/etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Nextcloud
+After=network-online.target
+[Service]
+Type=notify
+ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run
+Restart=on-failure
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        if systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+            echo "[*] Service already enabled, restarting..."
+            systemctl restart cloudflared
+        else
+            echo "[*] Enabling and starting service..."
+            systemctl enable --now cloudflared
+        fi
+    }
+
+    generate_env_file() {
+        echo "[4/10] Generating .env configuration file..."
+        [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
+
+        mkdir -p "$NEXTCLOUD_DATA_DIR"
+        chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
+        cp "$ENV_TEMPLATE" "$ENV_FILE"
+
+        # Apply sed with validation
+        sed -i -e "s|^NEXTCLOUD_ADMIN_PASSWORD=.*|NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD|" \
+          -e "s|^NEXTCLOUD_TRUSTED_DOMAINS=.*|NEXTCLOUD_TRUSTED_DOMAINS=$NEXTCLOUD_TRUSTED_DOMAINS|" \
+          -e "s|^NEXTCLOUD_PORT=.*|NEXTCLOUD_PORT=$NEXTCLOUD_PORT|" \
+          -e "s|^MYSQL_ROOT_PASSWORD=.*|MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD|" \
+          -e "s|^MYSQL_PASSWORD=.*|MYSQL_PASSWORD=$MYSQL_PASSWORD|" \
+          -e "s|^NEXTCLOUD_DATA_DIR=.*|NEXTCLOUD_DATA_DIR=$NEXTCLOUD_DATA_DIR|" \
+          -e "s|^BACKUP_MOUNTDIR=.*|BACKUP_MOUNTDIR=$BACKUP_MOUNTDIR|" \
+          -e "s|^BACKUP_LABEL=.*|BACKUP_LABEL=$BACKUP_LABEL|" \
+          -e "s|^BACKUP_RETENTION=.*|BACKUP_RETENTION=$BACKUP_RETENTION|" \
+          -e "s|^CF_TUNNEL_ID=.*|CF_TUNNEL_ID=$CF_TUNNEL_ID|" \
+          -e "s|^TRUSTED_PROXIES_0=.*|TRUSTED_PROXIES_0=$TRUSTED_PROXIES_0|" \
+          -e "s|^TRUSTED_PROXIES_1=.*|TRUSTED_PROXIES_1=$TRUSTED_PROXIES_1|" \
+          -e "s|^AUTO_FORMAT_BACKUP=.*|AUTO_FORMAT_BACKUP=$AUTO_FORMAT_BACKUP|" \
+          "$ENV_FILE"
+
+        # Validate key vars
+        grep -q "NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD" "$ENV_FILE" || die "Failed to update .env (admin password)."
+        grep -q "CF_TUNNEL_ID=$CF_TUNNEL_ID" "$ENV_FILE" || die "Failed to update .env (tunnel ID)."
+
+        chmod 600 "$ENV_FILE"
+    }
+
+    deploy_docker_stack() {
+        echo "[5/10] Deploying Docker stack, may take a while..."
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
+        wait_for_healthy "db" 120
+        wait_for_healthy "nextcloud" 600
+    }
+
+    configure_nextcloud_https() {
+        echo "[6/10] Applying reverse proxy HTTPS configuration..."
+        local NC_CID
+        NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
+        [[ -z "$NC_CID" ]] && die "Nextcloud container not ready."
+
+        docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || die "Failed to set overwriteprotocol."
+        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || die "Failed to set trusted_proxies 0."
+        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
+        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
+        echo "Restarting Nextcloud service..."
+        docker compose -f "$COMPOSE_FILE" restart nextcloud
+        wait_for_healthy "nextcloud" 120
+    }
+
+    setup_backup_drive() {
+        echo "[7/10] Setting up backup drive (auto-scan)..."
+        mkdir -p "$BACKUP_MOUNTDIR"
+        if mountpoint -q "$BACKUP_MOUNTDIR"; then 
+            echo "Backup directory is already a mountpoint."; 
+            return 0; 
+        fi
+
+        # Auto-detect
+        if ! auto_detect_backup_drive; then
+            echo "Using local fallback: $BACKUP_MOUNTDIR"
+            return 0
+        fi
+
+        local dev="$usb_dev"  # From auto_detect
+        local fs_type
+        fs_type=$(blkid -o value -s TYPE "$dev" 2>/dev/null)
+
+        if [[ "$AUTO_FORMAT_BACKUP" == "true" && -z "$fs_type" ]]; then
+            echo "[*] Formatting detected drive (destructive—proceed with caution)..."
+            mkfs.ext4 -F -L "$BACKUP_LABEL" "$dev"
+        elif [[ -z "$fs_type" ]]; then
+            die "Drive detected but unformatted. Set AUTO_FORMAT_BACKUP=true in env or format manually."
+        fi
+
+        # Mount idempotently
+        umount "$BACKUP_MOUNTDIR" 2>/dev/null || true
+        mount -t "${fs_type:-ext4}" -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || die "Failed to mount backup drive."
+        
+        # fstab update
+        local UUID
+        UUID=$(blkid -o value -s UUID "$dev")
+        if ! grep -q "$UUID" /etc/fstab; then
+            echo "UUID=$UUID $BACKUP_MOUNTDIR ${fs_type:-ext4} defaults,nofail 0 2" >> /etc/fstab
+            echo "Added backup drive to /etc/fstab."
+        fi
+    }
+
+    offer_restore() {
+        echo "[8/10] Skipping restore check during initial setup."
+    }
+
+    install_backup_cronjob() {
+        echo "[9/10] Installing weekly backup cron job..."
+        if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+            echo "Warning: Backup directory not mounted. Cron job NOT installed."
+            return 0
+        fi
+        local cron_content="# Run weekly Nextcloud backup on Sunday at 03:00\n0 3 * * 0 root /usr/local/sbin/raspi-nextcloud-tui --backup >> /var/log/raspi-nextcloud/backup.log 2>&1\n"
+
+        if [[ -f /etc/cron.d/nextcloud-backup && $(cat /etc/cron.d/nextcloud-backup) == "$cron_content" ]]; then
+            echo "Cron job already installed and up-to-date."
+        else
+            echo "$cron_content" > /etc/cron.d/nextcloud-backup
+            chmod 644 /etc/cron.d/nextcloud-backup
+            echo "Cron job installed/updated."
+        fi
+    }
+
+    validate_setup() {
+        echo "[10/10] Validating setup..."
+        sleep 10
+        if curl -f -k "https://$CF_HOSTNAME/status.php" >/dev/null 2>&1; then
+            echo "✅ Nextcloud is accessible at: https://$CF_HOSTNAME"
+        else
+            echo "⚠️ Setup complete, but accessibility check failed. Check Cloudflare tunnel and firewall."
+        fi
+    }
+
+    # --- Function Entry (replaces original main) ---
+    exec 200>"$LOCK_FILE"
+    flock -n 200 || die "Setup script is already running."
+    trap 'rm -f "$LOCK_FILE"; echo "Lock cleaned up." >&2' EXIT
+    
+    preflight_checks
+    install_dependencies
+    gather_config_from_env
+    setup_cloudflare
+    generate_env_file
+    deploy_docker_stack
+    configure_nextcloud_https
+    #setup_backup_drive
+    #offer_restore
+    #install_backup_cronjob
+    validate_setup
+
+    echo "✅ Installation complete!"
+}
+
+# --- Integrated Backup Function (from backup script) ---
+backup() {
+    set -euo pipefail
+
+    # --- Configuration and Initialization ---
+    REPO_DIR="/opt/raspi-nextcloud-setup"
+    ENV_FILE="$REPO_DIR/.env"
+    LOCK_FILE="/var/run/nextcloud-backup.lock"
+    [[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE"; exit 1; }
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+
+    # Validate required variables
+    : "${BACKUP_MOUNTDIR:?BACKUP_MOUNTDIR not set in .env}"
+    : "${BACKUP_LABEL:?BACKUP_LABEL not set in .env}"
+    : "${BACKUP_RETENTION:?BACKUP_RETENTION not set in .env}"
+    : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
+    : "${MYSQL_USER:?}"
+    : "${MYSQL_PASSWORD:?}"
+    : "${MYSQL_DATABASE:?}"
+
+    auto_mount_backup() {
+        if mountpoint -q "$BACKUP_MOUNTDIR"; then return 0; fi
+        if [[ -n "$BACKUP_LABEL" ]] && blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
+            mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || {
+                echo "[!] Failed to mount $BACKUP_LABEL."
+                exit 1
+            }
+            return 0
+        fi
+        # Auto-scan fallback
+        local usb_dev
+        usb_dev=$(lsblk -o NAME,TYPE,RM,MOUNTPOINT | grep 'disk\|part' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $4=="" {print "/dev/"$1; exit}')  # Removable, unmounted
+        if [[ -n "$usb_dev" ]]; then
+            echo "[*] Auto-detected backup drive: $usb_dev"
+            local fs_type=$(blkid -o value -s TYPE "$usb_dev" 2>/dev/null)
+            if [[ -z "$fs_type" ]]; then
+                BACKUP_LABEL="BackupDrive_$(date +%Y%m%d)"
+                mkfs.ext4 -F -L "$BACKUP_LABEL" "$usb_dev"  # Only format if no filesystem
+                mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || exit 1
+            else
+                BACKUP_LABEL=$(blkid -o value -s LABEL "$usb_dev" 2>/dev/null || "BackupDrive_$(date +%Y%m%d)")
+                if [[ -z $(blkid -o value -s LABEL "$usb_dev") ]]; then
+                    e2label "$usb_dev" "$BACKUP_LABEL"
+                fi
+                mount "$usb_dev" "$BACKUP_MOUNTDIR" || exit 1
+            fi
+            echo "BACKUP_LABEL=$BACKUP_LABEL" >> "$ENV_FILE"  # Update .env idempotently
+        else
+            echo "[!] No external drive found. Using local fallback: $BACKUP_MOUNTDIR (limited space!)"
+            mkdir -p "$BACKUP_MOUNTDIR"
+        fi
+    }
+
+    # --- Locking ---
+    exec 200>"$LOCK_FILE"
+    flock -n 200 || { echo "Backup is already running."; exit 1; }
+
+    # --- Staging and Cleanup ---
+    DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
+    STAGING_DIR=$(mktemp -d -p "$BACKUP_MOUNTDIR" staging_XXXXXX)  # Secure temp
+    ARCHIVE_PATH="$BACKUP_MOUNTDIR/nextcloud_backup_${DATE}.tar.gz"
+
+    # TRAP to ensure cleanup and maintenance mode is turned off on exit/error
+    cleanup() {
+        echo "[*] Cleaning up..."
+        # Turn maintenance mode OFF, suppress errors if already off
+        if [[ -n "${NC_CID:-}" ]] && docker ps -q --no-trunc | grep -q "$NC_CID"; then
+            echo "[*] Ensuring maintenance mode is disabled..."
+            docker exec -u www-data "$NC_CID" php occ maintenance:mode --off || true
+        fi
+        # Remove staging directory
+        if [[ -d "$STAGING_DIR" ]]; then
+            rm -rf "$STAGING_DIR"
+            echo "[*] Staging directory removed."
+        fi
+        rm -f "$LOCK_FILE"  # Ensure lock release
+    }
+    trap cleanup EXIT INT TERM
+
+    # --- Mount Backup Drive ---
+    auto_mount_backup
+
+    # --- Main Backup Logic ---
+    echo "=== Starting Nextcloud Backup: $DATE ==="
+
+    mkdir -p "$STAGING_DIR/data" "$STAGING_DIR/db" "$STAGING_DIR/config"
+    NC_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q nextcloud)"
+
+    echo "[1/6] Checking for sufficient disk space..."
+    ESTIMATED_DATA_KB=$(du -sk "$NEXTCLOUD_DATA_DIR" | awk '{print $1}')
+    ESTIMATED_TOTAL_KB=$((ESTIMATED_DATA_KB + 102400)) # Add 100MB for DB/config
+    AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
+    if [ "$AVAILABLE_KB" -lt "$ESTIMATED_TOTAL_KB" ]; then
+        echo "[!] Not enough free space. Available: $((AVAILABLE_KB / 1024)) MB, Needed: $((ESTIMATED_TOTAL_KB / 1024)) MB. Aborting."
+        exit 1
+    fi
+
+    echo "[2/6] Enabling maintenance mode..."
+    docker exec -u www-data "$NC_CID" php occ maintenance:mode --on
+
+    echo "[3/6] Dumping database..."
+    DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
+    docker run --rm \
+      --network container:"$DB_CID" \
+      -e MYSQL_PWD="$MYSQL_PASSWORD" \
+      mysql:8 \
+      mysqldump --column-statistics=0 -h 127.0.0.1 -u "$MYSQL_USER" "$MYSQL_DATABASE" \
+      > "$STAGING_DIR/db/nextcloud.sql"
+
+    echo "[4/6] Copying data and config..."
+    rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/data/"
+    NC_HTML_VOLUME=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+    docker run --rm -v "${NC_HTML_VOLUME}:/volume:ro" -v "$STAGING_DIR/config":/backup alpine \
+        sh -c "cp -a /volume/config/. /backup/"
+
+    echo "[5/6] Creating compressed archive..."
+    tar -C "$STAGING_DIR" -czf "$ARCHIVE_PATH" data db config
+    sync
+
+    # Maintenance mode is disabled by the 'trap cleanup' function
+
+    echo "[6/6] Applying backup retention policy (keep last $BACKUP_RETENTION)..."
+    ls -tp "$BACKUP_MOUNTDIR"/nextcloud_backup_*.tar.gz 2>/dev/null | tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm --
+    echo "--- Backup Complete: $ARCHIVE_PATH ---"
+}
+
+# --- Integrated Restore Function (from restore script) ---
+restore() {
+    set -euo pipefail
+
+    # --- Configuration and Initialization ---
+    REPO_DIR="/opt/raspi-nextcloud-setup"
+    ENV_FILE="$REPO_DIR/.env"
+    BACKUP_LABEL="${BACKUP_LABEL:-BackupDrive}"
+    COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+    [[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE"; exit 1; }
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+
+    # --- Helper Functions ---
+
+    # Print a formatted error message and exit.
+    die() {
+        echo "[ERROR] $1" >&2
+        exit 1
+    }
+
+    # Helper function to wait for a container to be healthy using `docker inspect`.
+    wait_for_healthy() {
+        local service_name="$1"
+        local timeout_seconds="$2"
+        local container_id
+
+        echo "Waiting for $service_name to become healthy..."
+        
+        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+        if [[ -z "$container_id" ]]; then
+            die "Could not find container for service '$service_name'. Please check Docker logs."
+        fi
+
+        local end_time=$((SECONDS + timeout_seconds))
+        while [ $SECONDS -lt $end_time ]; do
+            local status
+            # Directly inspect the health status from Docker's metadata.
+            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
+            if [ "$status" == "healthy" ]; then
+                echo "✅ $service_name is healthy."
+                return 0
+            fi
+            sleep 5
+        done
+
+        die "$service_name container did not become healthy in time. Check logs with 'docker logs $container_id'."
+    }
+
+    # Validate required variables
+    : "${BACKUP_MOUNTDIR:?BACKUP_MOUNTDIR not set in .env}"
+    : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
+    : "${MYSQL_USER:?}"
+    : "${MYSQL_PASSWORD:?}"
+    : "${MYSQL_DATABASE:?}"
+    : "${MYSQL_ROOT_PASSWORD:?}"
+
+    # --- Temporary Directory and Cleanup ---
+    TMP_DIR=$(mktemp -d -t nextcloud-restore-XXXXXX)
+    trap 'echo "[*] Cleaning up temporary directory..."; rm -rf "$TMP_DIR"' EXIT INT TERM
+
+    # --- Mount Backup Drive ---
+    mkdir -p "$BACKUP_MOUNTDIR"
+    if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+      if blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
+        echo "[*] Mounting backup drive '$BACKUP_LABEL' to $BACKUP_MOUNTDIR..."
+        mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR"
+      else
+        echo "[!] Backup drive with label '$BACKUP_LABEL' not found. Aborting."
+        exit 1
+      fi
+    fi
+
+    # --- Handle --no-prompt flag ---
+    no_prompt=false
+    for arg in "$@"; do
+        if [[ "$arg" == "--no-prompt" ]]; then
+            no_prompt=true
+        fi
+    done
+
+    # --- Select Backup File ---
+    if [[ $# -ge 1 && "$1" != "--no-prompt" ]]; then
+      BACKUP_FILE="$1"
+    else
+      echo "[*] No backup file specified. Finding the latest..."
+      BACKUP_FILE="$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -name 'nextcloud_backup_*.tar.gz' -print0 | xargs -0 ls -t | head -n1)"
+      [[ -n "$BACKUP_FILE" ]] || { echo "No backups found in $BACKUP_MOUNTDIR"; exit 1; }
+    fi
+    [[ -f "$BACKUP_FILE" ]] || { echo "Backup not found: $BACKUP_FILE"; exit 1; }
+    echo "[*] Selected backup for restore: $BACKUP_FILE"
+
+    # --- User Confirmation ---
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "This will COMPLETELY OVERWRITE the following:"
+    echo "  - Nextcloud data: $NEXTCLOUD_DATA_DIR"
+    echo "  - Nextcloud config"
+    echo "  - MariaDB database: $MYSQL_DATABASE"
+    echo "This operation is irreversible."
+    if $no_prompt; then
+        CONFIRM="OVERWRITE"
+    else
+        read -rp "Type 'OVERWRITE' to proceed: " CONFIRM
+    fi
+    [[ "${CONFIRM^^}" == "OVERWRITE" ]] || { echo "Restore aborted by user."; exit 0; }
+
+    # --- Main Restore Logic ---
+    echo "[1/6] Stopping and removing Nextcloud container..."
+    docker compose -f "$REPO_DIR/docker-compose.yml" rm -sf nextcloud
+
+    echo "[2/6] Extracting backup to temporary location..."
+    tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
+    [[ -d "$TMP_DIR/data" && -f "$TMP_DIR/db/nextcloud.sql" && -d "$TMP_DIR/config" ]] || \
+      { echo "Backup archive is malformed (missing data/, db/, or config/ dirs)."; exit 1; }
+
+    echo "[3/6] Restoring data and config directories..."
+    mkdir -p "$NEXTCLOUD_DATA_DIR"
+    rsync -a --delete "$TMP_DIR/data/" "$NEXTCLOUD_DATA_DIR/"
+    # Get volume name idempotently (even if container is stopped)
+    NC_HTML_VOLUME=$(docker volume ls -q -f name=raspi-nextcloud-setup_nextcloud_html)
+    docker run --rm -v "${NC_HTML_VOLUME}:/volume" -v "$TMP_DIR/config:/backup:ro" alpine \
+        sh -c "rm -rf /volume/config/* && cp -a /backup/. /volume/config/"
+
+    echo "[4/6] Resetting and restoring database..."
+    docker compose -f "$REPO_DIR/docker-compose.yml" up -d db
+    echo "[*] Waiting for DB container to be healthy..."
+    wait_for_healthy "db" 120
+    DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
+    NETWORK_NAME=$(docker inspect "$DB_CID" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+
+    # Drop and recreate database to ensure idempotent restore
+    docker run --rm \
+      --network "$NETWORK_NAME" \
+      -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+      mysql:8 \
+      sh -c "mysql -h db -u root -e \"DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;\""
+
+    # Import dump using mysql:8 client container
+    docker run --rm \
+      --network "$NETWORK_NAME" \
+      -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+      -v "$TMP_DIR/db/nextcloud.sql:/restore.sql" \
+      mysql:8 \
+      sh -c "mysql -h db -u root $MYSQL_DATABASE < /restore.sql"
+
+    echo "[5/6] Starting Nextcloud service..."
+    docker compose -f "$REPO_DIR/docker-compose.yml" up -d nextcloud
+
+    echo "[6/6] Verifying services and exiting maintenance mode..."
+    echo "[*] Waiting for Nextcloud container to be healthy..."
+    wait_for_healthy "nextcloud" 180
+    NC_CID_NEW="$(docker compose -f "/opt/raspi-nextcloud-setup/docker-compose.yml" ps -q nextcloud)"
+    docker exec -u www-data "$NC_CID_NEW" php occ maintenance:mode --off || true
+
+    # Temp dir is cleaned up by the trap
+    echo "=== Restore Complete From: $BACKUP_FILE ==="
+}
 
 # --- Helper Functions ---
-die() { dialog --title "Error" --msgbox "$1" 8 60; exit 1; }
+die() {
+    dialog --title "Error" --msgbox "$1" 8 60
+    exit 1
+}
 
 get_nc_cid() {
     docker compose -f "$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true
@@ -68,7 +731,6 @@ reset_terminal() {
     stty sane 2>/dev/null || true
 }
 
-# Auto-detect backup drive (reusable)
 auto_detect_backup_drive() {
     local detected_dev backup_label
     detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
@@ -80,7 +742,6 @@ auto_detect_backup_drive() {
     fi
 }
 
-# Update .env with new values (idempotent)
 update_env() {
     local key="$1" value="$2"
     if grep -q "^$key=" "$ENV_FILE" 2>/dev/null; then
@@ -90,12 +751,11 @@ update_env() {
     fi
 }
 
-# Install/update cron job based on custom schedule
 install_backup_cron() {
     local minute="$1" hour="$2" day_of_month="$3" month="$4" day_of_week="$5"
     local cron_expr="$minute $hour $day_of_month $month $day_of_week"
 
-    local cron_content="# Run Nextcloud backup at $cron_expr\n$cron_expr root $REPO_DIR/backup.sh >> $BACKUP_LOG_FILE 2>&1\n"
+    local cron_content="# Run Nextcloud backup at $cron_expr\n$cron_expr root /usr/local/sbin/raspi-nextcloud-tui --backup >> $BACKUP_LOG_FILE 2>&1\n"
     if [[ -f "$CRON_FILE" && $(cat "$CRON_FILE") == *"$cron_expr"* ]]; then
         echo "Cron job already up-to-date for schedule $cron_expr."
     else
@@ -105,7 +765,6 @@ install_backup_cron() {
     fi
 }
 
-# Configure backup drive (mount/format)
 configure_backup_drive() {
     local backup_label="$1" mount_dir="$2" auto_format="$3"
     local detected_info auto_dev suggested_label
@@ -185,7 +844,6 @@ configure_backup_drive() {
     dialog --title "Success" --msgbox "Backup drive configured and mounted at $new_mount." 8 50
 }
 
-# System Health Check
 system_health_check() {
     touch "$HEALTH_LOG_FILE"
     chmod 644 "$HEALTH_LOG_FILE"
@@ -253,7 +911,7 @@ system_health_check() {
         # Nextcloud occ status (if running)
         if [[ -n "$nc_cid" ]]; then
             echo "[CHECK] Nextcloud status:"
-            docker exec -u www-data "$nc_cid" php occ status 2>/dev/null || echo "  Could not query"
+            docker exec -u www-data "$nc_cid" php occ status 2>/dev/null || echo "  Could not get status."
         fi
 
         echo "=== Health Check Completed at $(date) ==="
@@ -262,84 +920,29 @@ system_health_check() {
     dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
 }
 
-trigger_backup() {
-    source "$ENV_FILE" 2>/dev/null || true
-    local backup_dir="${BACKUP_MOUNTDIR:-/mnt/backup}"
-    if ! mountpoint -q "$backup_dir"; then
-        dialog --title "Error" --msgbox "Backup directory not mounted." 8 50
-        return 1
-    fi
-
-    (
-        "$REPO_DIR/backup.sh"
-    ) >> "$BACKUP_LOG_FILE" 2>&1 &  # Append for history
-    local pid=$!
-
-    dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 &
-    local tail_pid=$!
-
-    wait_for_completion "$pid" "Backup in Progress" "Backing up data... (Check log for details)"
-    local exit_code=$?
-    
-    kill "$tail_pid" 2>/dev/null || true
-    reset_terminal
-    
-    if [ $exit_code -eq 0 ]; then
-        dialog --title "Success" --msgbox "Backup completed successfully!" 8 40
-    else
-        dialog --title "Error" --msgbox "Backup failed. Check logs in $BACKUP_LOG_FILE" 8 60
-    fi
-}
-
-trigger_restore() {
-    source "$ENV_FILE" 2>/dev/null || true
-    local backup_dir="${BACKUP_MOUNTDIR:-/mnt/backup}"
-    # Use time-based sort for newest-first, limit to 20 for usability
-    mapfile -t backups < <(ls -t "$backup_dir"/nextcloud_backup_*.tar.gz 2>/dev/null | xargs -n1 basename | head -20)
-
-    if [ ${#backups[@]} -eq 0 ]; then
-        dialog --title "Error" --msgbox "No backup files found in $backup_dir." 8 50
-        return 1
-    fi
-
-    local options=()
-    for i in "${!backups[@]}"; do
-        options+=("$((i+1))" "${backups[$i]}")
-    done
-    
-    local choice
-    choice=$(dialog --stdout \
-        --title "Select Backup to Restore" \
-        --menu "Choose a backup file:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-        "${options[@]}")
-    local retval=$?
-    if [ $retval -ne 0 ] || [ -z "$choice" ]; then
-        return 0
-    fi
-
-    local selected_file="${backups[$((choice-1))]}"
-    dialog --title "Confirm Restore" --yesno "This will OVERWRITE all current data. Are you absolutely sure you want to restore from:\n\n$selected_file?" 12 60
-    if [ $? -eq 0 ]; then
-        (
-            "$REPO_DIR/restore.sh" "$backup_dir/$selected_file"
-        ) >> "$RESTORE_LOG_FILE" 2>&1 &  # Append for history
-        local pid=$!
-
-        dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 &
-        local tail_pid=$!
-
-        wait_for_completion "$pid" "Restore in Progress" "Restoring data from backup... (Check log for details)"
-        local exit_code=$?
-        
-        kill "$tail_pid" 2>/dev/null || true
-        reset_terminal
-        
-        if [ $exit_code -eq 0 ]; then
-            dialog --title "Success" --msgbox "Restore completed successfully!" 8 40
-        else
-            dialog --title "Error" --msgbox "Restore failed. Check logs in $RESTORE_LOG_FILE" 8 60
+# --- Maintenance Menu ---
+maintenance_menu() {
+    while true; do
+        local choice
+        choice=$(dialog --stdout \
+            --title "Maintenance Menu" \
+            --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            0 "Back to Main Menu" \
+            1 "Toggle Maintenance Mode" \
+            2 "Scan User Files (files:scan)" \
+            3 "Expand Filesystem with LVM")
+        local retval=$?
+        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+            return 0  # Explicit back or cancel -> return to main
         fi
-    fi
+
+        case "$choice" in
+            1) toggle_maintenance_mode ;;
+            2) run_files_scan ;;
+            3) lvm_storage_extension ;;
+        esac
+        reset_terminal  # Clean after actions
+    done
 }
 
 toggle_maintenance_mode() {
@@ -728,109 +1331,7 @@ EOF
     dialog --title "LVM Extension Log" --textbox "$LVM_LOG_FILE" 25 80
 }
 
-main_menu() {
-    while true; do
-        if $is_sd_boot; then
-            local choice
-            choice=$(dialog --backtitle "Nextcloud Pi Manager (SD Boot)" \
-                --stdout \
-                --title "Main Menu" \
-                --cancel-label "Exit" \
-                --menu "Select an option:" \
-                $HEIGHT $WIDTH $CHOICE_HEIGHT \
-                1 "Flash OS to Drive (NVMe/USB SSD)" \
-                2 "Expand Filesystem with LVM")
-            local retval=$?
-            if [ $retval -ne 0 ]; then
-                clear
-                echo "Exiting."
-                exit 0
-            fi
-
-            case "$choice" in
-                1) flash_to_nvme ;;
-                2) lvm_storage_extension ;;
-            esac
-        else
-            local choice
-            choice=$(dialog --backtitle "Nextcloud Pi Manager" \
-                --stdout \
-                --title "Main Menu" \
-                --cancel-label "Exit" \
-                --menu "Select an option:" \
-                $HEIGHT $WIDTH $CHOICE_HEIGHT \
-                1 "Initial System Setup" \
-                2 "Backup/Restore" \
-                3 "Maintenance" \
-                4 "View Logs" \
-                5 "System Health Check")
-            local retval=$?
-            if [ $retval -ne 0 ]; then
-                clear
-                echo "Exiting."
-                exit 0
-            fi
-
-            case "$choice" in
-                1) run_initial_setup ;;
-                2) backup_restore_menu ;;
-                3) maintenance_menu ;;
-                4) logs_menu ;;
-                5) system_health_check ;;
-            esac
-        fi
-        reset_terminal  # Ensure clean state after actions
-    done
-}
-
-backup_restore_menu() {
-    while true; do
-        local choice
-        choice=$(dialog --stdout \
-            --title "Backup/Restore Menu" \
-            --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-            0 "Back to Main Menu" \
-            1 "Configure Backup Settings" \
-            2 "Trigger Manual Backup" \
-            3 "Restore From Backup")
-        local retval=$?
-        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
-            return 0  # Explicit back or cancel -> return to main
-        fi
-
-        case "$choice" in
-            1) configure_backup_settings ;;
-            2) trigger_backup ;;
-            3) trigger_restore ;;
-        esac
-        reset_terminal  # Clean after actions
-    done
-}
-
-maintenance_menu() {
-    while true; do
-        local choice
-        choice=$(dialog --stdout \
-            --title "Maintenance Menu" \
-            --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-            0 "Back to Main Menu" \
-            1 "Toggle Maintenance Mode" \
-            2 "Scan User Files (files:scan)" \
-            3 "Expand Filesystem with LVM")
-        local retval=$?
-        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
-            return 0  # Explicit back or cancel -> return to main
-        fi
-
-        case "$choice" in
-            1) toggle_maintenance_mode ;;
-            2) run_files_scan ;;
-            3) lvm_storage_extension ;;
-        esac
-        reset_terminal  # Clean after actions
-    done
-}
-
+# --- Logs Menu ---
 logs_menu() {
     while true; do
         local choice
@@ -847,7 +1348,7 @@ logs_menu() {
             7 "Flash to Drive Log")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
-            return 0  # Explicit back or cancel -> return to main
+            return 0
         fi
         
         case "$choice" in
@@ -868,10 +1369,11 @@ logs_menu() {
             6) dialog --title "LVM Log" --tailbox "$LVM_LOG_FILE" 25 80 ;;
             7) dialog --title "Flash Log" --tailbox "$FLASH_LOG_FILE" 25 80 ;;
         esac
-        reset_terminal  # Clean after viewing
+        reset_terminal
     done
 }
 
+# --- Configure Backup Settings ---
 configure_backup_settings() {
     source "$ENV_FILE" 2>/dev/null || true
     local current_mount="${BACKUP_MOUNTDIR:-/mnt/backup}"
@@ -930,6 +1432,7 @@ configure_backup_settings() {
     install_backup_cron "$new_minute" "$new_hour" "$new_dom" "$new_month" "$new_dow"
 }
 
+# --- Run Initial Setup ---
 run_initial_setup() {
     # Check if stack is already running (idempotent: warn on re-run)
     if is_stack_running; then
@@ -938,16 +1441,16 @@ run_initial_setup() {
     fi
 
     # Auto-scan backup drive
-    local backup_label detected_dev
-    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
-    if [[ -n "$detected_dev" ]]; then
-        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
-        dialog --msgbox "Detected external drive: $detected_dev\nSuggested label: $backup_label\nFormat if needed?" 8 60
-        export AUTO_FORMAT_BACKUP=true  # Enable if confirmed
-    else
-        backup_label="LocalFallback"
-        export AUTO_FORMAT_BACKUP=false
-    fi
+#    local backup_label detected_dev
+#    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
+#    if [[ -n "$detected_dev" ]]; then
+#        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
+#        dialog --msgbox "Detected external drive: $detected_dev\nSuggested label: $backup_label\nFormat if needed?" 8 60
+#        export AUTO_FORMAT_BACKUP=true  # Enable if confirmed
+#    else
+#        backup_label="LocalFallback"
+#        export AUTO_FORMAT_BACKUP=false
+#    fi
 
     local values
     values=$(dialog --backtitle "Nextcloud Initial Setup" \
@@ -959,8 +1462,7 @@ run_initial_setup() {
         "DB Root Password:" 2 1 ""            2 25 40 0 \
         "DB User Password:" 3 1 ""            3 25 40 0 \
         "Base Domain:"      4 1 "example.com" 4 25 40 0 \
-        "Subdomain:"        5 1 "nextcloud"   5 25 40 0 \
-        "Backup Label:"     6 1 "$backup_label" 6 25 40 0)
+        "Subdomain:"        5 1 "nextcloud"   5 25 40 0)
     local retval=$?
     if [ $retval -ne 0 ] || [ -z "$values" ]; then
         echo "[INFO] User canceled or dialog failed at $(date)" >> "$MAIN_LOG_FILE"
@@ -978,14 +1480,21 @@ run_initial_setup() {
     local DB_USER_PASS="${values_array[2]}"
     local BASE_DOMAIN="${values_array[3]}"
     local SUBDOMAIN="${values_array[4]}"
-    local BACKUP_LABEL="${values_array[5]}"  # Index 5 for new field
-    export BACKUP_LABEL="${BACKUP_LABEL:-$backup_label}"  # Fallback to auto
-    export AUTO_FORMAT_BACKUP=true  # Or from confirmation
 
     # Safeguard empty vars
     if [[ -z "$ADMIN_PASS" || -z "$DB_ROOT_PASS" || -z "$DB_USER_PASS" || -z "$BASE_DOMAIN" ]]; then
         dialog --title "Input Error" --msgbox "One or more fields are empty. Please try again." 8 50
         return 1
+    fi
+
+    # Centralized Cloudflare login
+    if [ ! -f /root/.cloudflared/cert.pem ]; then
+        dialog --msgbox "Cloudflare authentication required. The authentication process will start now, and instructions will be shown in a dialog box." 8 60
+        cloudflared tunnel login | dialog --programbox "Cloudflare Authentication - Open the URL in your browser" 20 80
+        if [ ! -f /root/.cloudflared/cert.pem ]; then
+            dialog --title "Error" --msgbox "Authentication failed or certificate not created. Please try again or manually place cert.pem." 8 60
+            return 1
+        fi
     fi
 
     # Ensure log file exists and is writable
@@ -1000,7 +1509,7 @@ run_initial_setup() {
         export MYSQL_PASSWORD="$DB_USER_PASS"
         export BASE_DOMAIN="$BASE_DOMAIN"
         export SUBDOMAIN="${SUBDOMAIN:-nextcloud}"
-        "$REPO_DIR/setup.sh" --non-interactive
+        setup
     ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
     local pid=$!
 
@@ -1020,6 +1529,154 @@ run_initial_setup() {
     else
         dialog --title "Error" --msgbox "Setup failed. Detailed log saved to:\n\n$MAIN_LOG_FILE" 10 70
     fi
+}
+
+# --- Run Backup ---
+run_backup() {
+    if ! is_stack_running; then
+        dialog --title "Error" --msgbox "Nextcloud stack not running." 8 50
+        return
+    fi
+
+    source "$ENV_FILE" 2>/dev/null || true
+    dialog --title "Confirm" --yesno "Run backup now? Ensure backup drive is mounted." 8 60
+    if [ $? -ne 0 ]; then return; fi
+
+    (
+        backup
+    ) >> "$BACKUP_LOG_FILE" 2>&1 &
+    local pid=$!
+
+    dialog --title "Backup Log" --tailbox "$BACKUP_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Backup in Progress" "Running backup..."
+    local exit_code=$?
+
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Backup completed successfully!" 8 40
+    else
+        dialog --title "Error" --msgbox "Backup failed. Check log at $BACKUP_LOG_FILE." 8 60
+    fi
+}
+
+# --- Run Restore ---
+run_restore() {
+    if ! is_stack_running; then
+        dialog --title "Error" --msgbox "Nextcloud stack not running." 8 50
+        return
+    fi
+
+    source "$ENV_FILE" 2>/dev/null || true
+    if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+        dialog --title "Error" --msgbox "Backup drive not mounted. Configure in settings first." 8 60
+        return
+    fi
+
+    local backups
+    mapfile -t backups < <(find "$BACKUP_MOUNTDIR" -maxdepth 1 -name 'nextcloud_backup_*.tar.gz' -print0 | xargs -0 ls -t)
+    if [ ${#backups[@]} -eq 0 ]; then
+        dialog --title "Error" --msgbox "No backups found in $BACKUP_MOUNTDIR." 8 60
+        return
+    fi
+
+    local options=()
+    for i in "${!backups[@]}"; do
+        options+=("$((i+1))" "$(basename "${backups[$i]}")")
+    done
+
+    local choice
+    choice=$(dialog --stdout --title "Select Backup" --menu "Choose a backup to restore:" $HEIGHT $WIDTH $CHOICE_HEIGHT "${options[@]}")
+    if [ $? -ne 0 ]; then return; fi
+
+    local selected="${backups[$((choice-1))]}"
+
+    dialog --title "WARNING" --yesno "This will OVERWRITE your current data, config, and database with the contents from $selected.\n\nThis operation is irreversible. Proceed?" 10 70
+    if [ $? -ne 0 ]; then return; fi
+
+    (
+        restore "$selected" --no-prompt
+    ) >> "$RESTORE_LOG_FILE" 2>&1 &
+    local pid=$!
+
+    dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 &
+    local tail_pid=$!
+
+    wait_for_completion "$pid" "Restore in Progress" "Running restore..."
+    local exit_code=$?
+
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Restore completed successfully!" 8 40
+    else
+        dialog --title "Error" --msgbox "Restore failed. Check log at $RESTORE_LOG_FILE." 8 60
+    fi
+}
+
+# --- Main Menu ---
+main_menu() {
+    while true; do
+        if $is_sd_boot; then
+            local choice
+            choice=$(dialog --backtitle "Nextcloud Pi Manager (SD Boot)" \
+                --stdout \
+                --title "Main Menu" \
+                --cancel-label "Exit" \
+                --menu "Select an option:" \
+                $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                1 "Flash OS to Drive (NVMe/USB SSD)" \
+                2 "Expand Filesystem with LVM")
+            local retval=$?
+            if [ $retval -ne 0 ]; then
+                clear
+                echo "Exiting."
+                exit 0
+            fi
+
+            case "$choice" in
+                1) flash_to_nvme ;;
+                2) lvm_storage_extension ;;
+            esac
+        else
+            local choice
+            choice=$(dialog --stdout \
+                --backtitle "Raspi Nextcloud TUI" \
+                --title "Main Menu" \
+                --menu "Select an option:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                1 "Initial Setup" \
+                2 "Run Backup" \
+                3 "Run Restore" \
+                4 "Configure Backup Settings" \
+                5 "System Health Check" \
+                6 "Maintenance Menu" \
+                7 "View Logs" \
+                0 "Exit")
+            local retval=$?
+            if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+                clear
+                exit 0
+            fi
+
+            case "$choice" in
+                1) run_initial_setup ;;
+                2) run_backup ;;
+                3) run_restore ;;
+                4) configure_backup_settings ;;
+                5) 
+                    system_health_check
+                    dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
+                    ;;
+                6) maintenance_menu ;;
+                7) logs_menu ;;
+            esac
+        fi
+        reset_terminal  # Ensure clean state after actions
+    done
 }
 
 # --- Script Entrypoint ---
