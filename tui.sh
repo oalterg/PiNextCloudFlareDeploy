@@ -327,65 +327,6 @@ EOF
         wait_for_healthy "nextcloud" 120
     }
 
-    setup_backup_drive() {
-        echo "[7/10] Setting up backup drive (auto-scan)..."
-        mkdir -p "$BACKUP_MOUNTDIR"
-        if mountpoint -q "$BACKUP_MOUNTDIR"; then 
-            echo "Backup directory is already a mountpoint."; 
-            return 0; 
-        fi
-
-        # Auto-detect
-        if ! auto_detect_backup_drive; then
-            echo "Using local fallback: $BACKUP_MOUNTDIR"
-            return 0
-        fi
-
-        local dev="$usb_dev"  # From auto_detect
-        local fs_type
-        fs_type=$(blkid -o value -s TYPE "$dev" 2>/dev/null)
-
-        if [[ "$AUTO_FORMAT_BACKUP" == "true" && -z "$fs_type" ]]; then
-            echo "[*] Formatting detected drive (destructive—proceed with caution)..."
-            mkfs.ext4 -F -L "$BACKUP_LABEL" "$dev"
-        elif [[ -z "$fs_type" ]]; then
-            die "Drive detected but unformatted. Set AUTO_FORMAT_BACKUP=true in env or format manually."
-        fi
-
-        # Mount idempotently
-        umount "$BACKUP_MOUNTDIR" 2>/dev/null || true
-        mount -t "${fs_type:-ext4}" -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || die "Failed to mount backup drive."
-        
-        # fstab update
-        local UUID
-        UUID=$(blkid -o value -s UUID "$dev")
-        if ! grep -q "$UUID" /etc/fstab; then
-            echo "UUID=$UUID $BACKUP_MOUNTDIR ${fs_type:-ext4} defaults,nofail 0 2" >> /etc/fstab
-            echo "Added backup drive to /etc/fstab."
-        fi
-    }
-
-    offer_restore() {
-        echo "[8/10] Skipping restore check during initial setup."
-    }
-
-    install_backup_cronjob() {
-        echo "[9/10] Installing weekly backup cron job..."
-        if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
-            echo "Warning: Backup directory not mounted. Cron job NOT installed."
-            return 0
-        fi
-        local cron_content="# Run weekly Nextcloud backup on Sunday at 03:00\n0 3 * * 0 root /usr/local/sbin/raspi-nextcloud-tui --backup >> /var/log/raspi-nextcloud/backup.log 2>&1\n"
-
-        if [[ -f /etc/cron.d/nextcloud-backup && $(cat /etc/cron.d/nextcloud-backup) == "$cron_content" ]]; then
-            echo "Cron job already installed and up-to-date."
-        else
-            echo "$cron_content" > /etc/cron.d/nextcloud-backup
-            chmod 644 /etc/cron.d/nextcloud-backup
-            echo "Cron job installed/updated."
-        fi
-    }
-
     validate_setup() {
         echo "[10/10] Validating setup..."
         sleep 10
@@ -408,9 +349,6 @@ EOF
     generate_env_file
     deploy_docker_stack
     configure_nextcloud_https
-    #setup_backup_drive
-    #offer_restore
-    #install_backup_cronjob
     validate_setup
 
     echo "✅ Installation complete!"
@@ -543,7 +481,6 @@ backup() {
     echo "--- Backup Complete: $ARCHIVE_PATH ---"
 }
 
-# --- Integrated Restore Function (from restore script) ---
 restore() {
     set -euo pipefail
 
@@ -1439,18 +1376,6 @@ run_initial_setup() {
         dialog --title "Warning" --yesno "Stack is already running. Re-run setup? (May reset config)" 8 50
         [[ $? -ne 0 ]] && return
     fi
-
-    # Auto-scan backup drive
-#    local backup_label detected_dev
-#    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
-#    if [[ -n "$detected_dev" ]]; then
-#        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
-#        dialog --msgbox "Detected external drive: $detected_dev\nSuggested label: $backup_label\nFormat if needed?" 8 60
-#        export AUTO_FORMAT_BACKUP=true  # Enable if confirmed
-#    else
-#        backup_label="LocalFallback"
-#        export AUTO_FORMAT_BACKUP=false
-#    fi
 
     local values
     values=$(dialog --backtitle "Nextcloud Initial Setup" \
