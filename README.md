@@ -24,7 +24,7 @@ It aims to provide a production-ready Nextcloud environment with minimal manual 
 - **Automatic backups** of Nextcloud data and database (compressed, timestamped)  
 - Weekly cron job for unattended backups with disk space management  
 - **Maintenance mode** automation during backup  
-- Minimal manual configuration; fully bootstrapped via `install.sh`
+- Minimal manual configuration; fully bootstrapped via `install`
 
 ---
 
@@ -35,4 +35,4 @@ It aims to provide a production-ready Nextcloud environment with minimal manual 
 Run the following on a clean Raspberry Pi OS Lite installation:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/install | sudo bash

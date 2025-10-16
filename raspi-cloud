@@ -1,5 +1,5 @@
 #!/bin/bash
-# tui — A TUI for managing the Nextcloud environment (now central script with integrated setup, backup, and restore)
+# raspi-cloud — A TUI for managing the Nextcloud environment (now central script with integrated setup, backup, and restore)
 
 set -euo pipefail
 
@@ -39,6 +39,138 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 mkdir -p "$LOG_DIR"
+
+# --- Generate .env.template and docker-compose.yml if not present ---
+generate_env_template() {
+    if [[ ! -f "$REPO_DIR/.env.template" ]]; then
+        cat > "$REPO_DIR/.env.template" << 'EOF'
+# .env.template
+# This file is a template. A final .env file will be generated during setup.
+
+# === Nextcloud Configuration ===
+# The primary administrator account for Nextcloud.
+NEXTCLOUD_ADMIN_USER=admin
+NEXTCLOUD_ADMIN_PASSWORD=changeme
+
+# Space-separated list of domains Nextcloud will trust.
+# This is set automatically during setup if using Cloudflare.
+NEXTCLOUD_TRUSTED_DOMAINS=cloud.yourdomain.com
+
+# The local port on the Raspberry Pi that maps to Nextcloud's port 80.
+NEXTCLOUD_PORT=8080
+
+# === MariaDB Database Configuration ===
+# IMPORTANT: Change these default passwords for production.
+MYSQL_ROOT_PASSWORD=changeme_root
+MYSQL_DATABASE=nextcloud
+MYSQL_USER=nextcloud_user
+MYSQL_PASSWORD=changeme
+
+# === Directory Configuration ===
+# The host path where Nextcloud user data (files, photos, etc.) is stored.
+# This should be on a drive with sufficient space (e.g., an external SSD).
+NEXTCLOUD_DATA_DIR=/home/user/nextcloud
+
+# === Backup Configuration ===
+# The directory where the backup drive will be mounted.
+BACKUP_MOUNTDIR=/mnt/backup
+# The filesystem LABEL of the external backup drive.
+BACKUP_LABEL=BackupDrive
+# Whether to auto-format the backup drive if unformatted (true/false; use with caution).
+AUTO_FORMAT_BACKUP=false
+# The number of old backup archives to keep.
+BACKUP_RETENTION=8
+# Custom cron schedule fields for backup timing (defaults to weekly on Sunday at 03:00).
+# See 'configure_backup_settings' in raspi-cloud for details.
+BACKUP_MINUTE=0
+BACKUP_HOUR=3
+BACKUP_DAY_MONTH=*
+BACKUP_MONTH=*
+BACKUP_DAY_WEEK=0
+
+# === Cloudflare Tunnel (optional) ===
+# The Tunnel ID created by 'cloudflared'. This is set automatically.
+CF_TUNNEL_ID=
+EOF
+    fi
+}
+
+generate_docker_compose() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        cat > "$COMPOSE_FILE" << 'EOF'
+services:
+  nextcloud:
+    image: nextcloud:31-apache # Pinned to a specific major version for stability
+    restart: unless-stopped
+    ports:
+      - "${NEXTCLOUD_PORT}:80"
+    volumes:
+      - nextcloud_html:/var/www/html
+      - ${NEXTCLOUD_DATA_DIR}:/var/www/html/data
+    environment:
+      - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER}
+      - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
+      - NEXTCLOUD_TRUSTED_DOMAINS=${NEXTCLOUD_TRUSTED_DOMAINS}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_HOST=db
+    depends_on:
+      db:
+        condition: service_healthy # Waits for the DB to be ready
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/status.php || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    # deploy: # Optional: Uncomment to limit resources on a Swarm cluster or with 'docker compose --with-deploy'
+    #   resources:
+    #     limits:
+    #       cpus: '1.0'
+    #       memory: 1G
+
+  db:
+    image: mariadb:11.2 # Pinned to a specific major version
+    restart: unless-stopped
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+    volumes:
+      - db_data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--su-mysql", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1.0'
+    #       memory: 1.5G
+
+volumes:
+  nextcloud_html:
+  db_data:
+EOF
+    fi
+}
+
+# Generate files on startup
+generate_env_template
+generate_docker_compose
 
 # --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
 if [ $# -gt 0 ]; then
@@ -967,12 +1099,41 @@ get_ssd_drives() {
     lsblk -d -o NAME -n | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z])$' | sort
 }
 
-fix_cloudflare_repo() {
-    echo "[INFO] Fixing Cloudflare repository configuration" >> "$1"
-    sudo rm -f /etc/apt/sources.list.d/cloudflare*.list >> "$1" 2>&1
-    sudo mkdir -p --mode=0755 /usr/share/keyrings >> "$1" 2>&1
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null 2>> "$1"
-    echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main' | sudo tee /etc/apt/sources.list.d/cloudflared.list >> "$1" 2>&1
+ensure_cloudflare_repo() {
+    local log_file="$1"
+    echo "Ensuring Cloudflare repository is correctly configured for the current OS..." >> "$log_file"
+
+    # Idempotently add or update the repository
+    if [ ! -f /usr/share/keyrings/cloudflared.gpg ]; then
+        mkdir -p --mode=0755 /usr/share/keyrings >> "$log_file" 2>&1
+        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg >> "$log_file" 2>&1 || {
+            echo "Warning: Failed to add Cloudflare GPG key." >> "$log_file"
+        }
+    fi
+
+    local current_codename
+    current_codename=$(lsb_release -cs)
+    local repo_file="/etc/apt/sources.list.d/cloudflared.list"
+
+    if [ -f "$repo_file" ]; then
+        # Check and update codename if necessary
+        if ! grep -q "$current_codename" "$repo_file"; then
+            echo "Updating codename in $repo_file to $current_codename..." >> "$log_file"
+            sed -i "s/ [a-z]\+ main/ $current_codename main/" "$repo_file" >> "$log_file" 2>&1 || {
+                echo "Warning: Failed to update codename in $repo_file." >> "$log_file"
+            }
+        else
+            echo "Cloudflare repository codename is already correct." >> "$log_file"
+        fi
+    else
+        # Add the repository if it doesn't exist
+        echo "Adding Cloudflare repository..." >> "$log_file"
+        echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $current_codename main" | tee "$repo_file" >> "$log_file" 2>&1 || {
+            echo "Warning: Failed to add Cloudflare repository." >> "$log_file"
+        }
+    fi
+
+    # Note: apt update should be called after this function if needed
 }
 
 # New: Flash OS to NVMe and Switch Boot (For Fresh SD to NVMe)
@@ -1020,7 +1181,7 @@ flash_to_nvme() {
     (
         echo "=== Flash to $target_name Started at $(date) ===" >> "$FLASH_LOG_FILE"
 
-        fix_cloudflare_repo "$FLASH_LOG_FILE"
+        ensure_cloudflare_repo "$FLASH_LOG_FILE"
         apt update >> "$FLASH_LOG_FILE" 2>&1 || die "apt update failed."
         apt install -y git rsync >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install dependencies."
         git clone https://github.com/geerlingguy/rpi-clone.git /tmp/rpi-clone >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to clone rpi-clone."
@@ -1032,7 +1193,7 @@ flash_to_nvme() {
         # Add auto-start TUI on first boot
         mkdir -p /mnt/target
         mount "$target_root_part" /mnt/target >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to mount new root."
-        echo "if [ -f /first_boot_tui ]; then sudo $REPO_DIR/tui.sh; rm /first_boot_tui; fi" >> /mnt/target/etc/rc.local
+        echo "if [ -f /first_boot_tui ]; then sudo raspi-cloud; rm /first_boot_tui; fi" >> /mnt/target/etc/rc.local
         touch /mnt/target/first_boot_tui
         umount /mnt/target
 
@@ -1093,7 +1254,7 @@ lvm_storage_extension() {
 
             echo "Current root drive: $current_root_drive. The other drive is: $other_drive." >> "$LVM_LOG_FILE"
 
-            fix_cloudflare_repo "$LVM_LOG_FILE"
+            ensure_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
             apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
             sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
@@ -1162,7 +1323,7 @@ EOF
             original_root_partuuid=$(blkid -o value -s PARTUUID "/dev/${source_drive}${source_suffix}2")
             [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of source drive /dev/${source_drive}${source_suffix}2."
 
-            fix_cloudflare_repo "$LVM_LOG_FILE"
+            ensure_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
             apt install -y lvm2 rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
             
@@ -1220,7 +1381,7 @@ EOF
             [[ -z "$add_dev" ]] && { echo "No suitable device found to add to VG. Skipping Phase 3." >> "$LVM_LOG_FILE"; return 0; }
             echo "Device to add to LVM: $add_dev" >> "$LVM_LOG_FILE"
 
-            fix_cloudflare_repo "$LVM_LOG_FILE"
+            ensure_cloudflare_repo "$LVM_LOG_FILE"
             apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
             apt install -y lvm2 parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install lvm2."
             

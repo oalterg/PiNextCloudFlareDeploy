@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — idempotent and robust bootstrapper for raspi-nextcloud-setup
+# install — idempotent and robust bootstrapper for raspi-cloud
 
 set -Eeuo pipefail
 
@@ -30,21 +30,14 @@ if ! command -v apt-get >/dev/null; then
     exit 1
 fi
 apt-get update -y >/dev/null
-apt-get install -y git ca-certificates curl dialog
+apt-get install -y ca-certificates curl dialog
 
-# --- Repository Management ---
-echo "[2/3] Cloning/updating the repository in $REPO_DIR..."
-if [[ -d "$REPO_DIR/.git" ]]; then
-  echo "Repository exists. Fetching updates and resetting to origin/main..."
-  git -C "$REPO_DIR" fetch --all --prune
-  git -C "$REPO_DIR" reset --hard origin/main
-else
-  echo "Cloning repository..."
-  rm -rf "$REPO_DIR"
-  git clone "https://github.com/oalterg/pinextcloudflaredeploy.git" "$REPO_DIR"
-fi
+# --- Script Management ---
+echo "[2/3] Downloading/updating the main script in /usr/local/sbin..."
+mkdir -p "$REPO_DIR"
+curl -fsSL "https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/raspi-cloud" -o /usr/local/sbin/raspi-cloud
+chmod +x /usr/local/sbin/raspi-cloud
 
 # --- Handoff to TUI Script ---
 echo "[3/3] Handing off to the main TUI script..."
-chmod +x "$REPO_DIR/tui.sh"
-exec "$REPO_DIR/tui.sh"
+exec /usr/local/sbin/raspi-cloud
