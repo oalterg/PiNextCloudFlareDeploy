@@ -1,38 +1,43 @@
 # Raspberry Pi Nextcloud Setup Using Docker and Cloudflare
 
-This repository automates deployment of **Nextcloud** on a **Raspberry Pi 5** using **Docker Compose**, optional **Cloudflare Tunnel** for secure remote access, and a robust **backup system**.
+This project automates the deployment and management of a production-ready Nextcloud instance on a Raspberry Pi 5 or 4.
 
-It aims to provide a production-ready Nextcloud environment with minimal manual setup and automated maintenance.
+It uses a Text User Interface (TUI) to manage a containerized stack (Docker Compose), secure remote access (Cloudflare Tunnel), and a robust backup system.
 
----
+-----
 
 ## Prerequisites
 
-- Domain registered with **Cloudflare**
-- Raspberry Pi 4 or 5 with **Raspberry Pi OS Lite** (fresh installation recommended)
-- SSH access to the Raspberry Pi for headless setup
-- (Optional) Separate SSD or USB drive for backups
-- Internet connection for package installation and Docker setup
+  * A Raspberry Pi 4 or 5 with a fresh installation of Raspberry Pi OS Lite booted from SSD or NVMe.
+  * A domain registered with Cloudflare.
+  * SSH access to the Raspberry Pi.
 
----
+-----
 
 ## Features
 
-- **Nextcloud + MariaDB** fully containerized with Docker Compose  
-- **Cloudflare Tunnel** for remote HTTPS access with automatic DNS updates  
-- **Local-only mode**: access via `http://<raspi-ip>:8080` if Cloudflare is not used  
-- **Automatic backups** of Nextcloud data and database (compressed, timestamped)  
-- Weekly cron job for unattended backups with disk space management  
-- **Maintenance mode** automation during backup  
-- Minimal manual configuration; fully bootstrapped via `install`
+  * **TUI-Driven Management:** A `dialog`-based interface for setup, backups, restores, and maintenance.
+  * **Containerized Stack:** Deploys Nextcloud and MariaDB using Docker Compose.
+  * **Secure Remote Access:** Automatically configures a Cloudflare Tunnel for HTTPS access without opening firewall ports.
+  * **Backup & Restore:** TUI-driven functions to create full backups (data + DB) and restore from an archive.
+  * **Automated Backups:** Configure a weekly cron job for unattended backups and retention.
+  * **Storage Management:**
+      * **OS Cloning:** TUI option to flash the running OS from an SD card to an NVMe/SSD drive.
+      * **LVM Expansion:** A guided, multi-phase process to expand the root filesystem across two separate SSD/NVMe drives.
+  * **System Health:** A TUI dashboard to check Docker status, container health, disk space, and recent log errors.
 
----
+-----
 
 ## Quickstart
 
-### 1. Bootstrap on a Fresh Raspberry Pi
-
-Run the following on a clean Raspberry Pi OS Lite installation:
+Run the following command on a fresh Raspberry Pi OS Lite installation. This will download the installer, install dependencies, and launch the main TUI script.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/install | sudo bash
+```
+
+After installation, you can re-launch the interface at any time by running:
+
+```bash
+sudo raspi-cloud
+```
