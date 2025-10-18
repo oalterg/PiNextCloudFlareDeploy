@@ -221,20 +221,6 @@ setup() {
         die "$service_name did not become healthy. Check logs: 'docker logs $container_id'."
     }
 
-    auto_detect_backup_drive() {
-        # Auto-scan: Largest removable/unmounted disk (non-root)
-        local usb_dev
-        usb_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')  # Removable, unmounted
-        if [[ -n "$usb_dev" ]]; then
-            echo "[*] Auto-detected external drive: $usb_dev ($(lsblk -o SIZE -n -d "$usb_dev"))"
-            return 0
-        else
-            echo "[!] No external drive detected. Using local fallback."
-            BACKUP_MOUNTDIR="/home/$SUDO_USER/backup"  # Safe default
-            return 1
-        fi
-    }
-
     # --- Main Logic ---
     preflight_checks() {
         echo "[*] Running pre-flight checks..."
@@ -898,11 +884,24 @@ configure_backup_drive() {
                 dialog --title "Error" --msgbox "Failed to mount drive." 8 50
                 return 1
             }
-            # Add to fstab if not present
+            # Idempotent fstab update with nofail and timeout
             local uuid
             uuid=$(blkid -o value -s UUID -L "$new_label")
-            if ! grep -q "$uuid" /etc/fstab; then
-                echo "UUID=$uuid $new_mount ext4 defaults,nofail 0 2" >> /etc/fstab
+            if [[ -n "$uuid" ]]; then
+                local fs_type="ext4"
+                local fstab_line="UUID=$uuid $new_mount $fs_type defaults,nofail,x-systemd.device-timeout=10 0 2"
+                
+                # Remove any existing entry for this mount point or UUID (idempotence)
+                sed -i "\|$new_mount|d" /etc/fstab
+                sed -i "\|UUID=$uuid|d" /etc/fstab
+                
+                # Add the new robust entry
+                echo "$fstab_line" >> /etc/fstab
+                
+                # Validate fstab
+                if ! mount -a -t "$fs_type" &>/dev/null; then
+                    dialog --title "Warning" --msgbox "fstab validation failed. Check /etc/fstab manually." 8 60
+                fi
             fi
         else
             dialog --title "Error" --msgbox "Drive with label '$new_label' not found." 8 50
@@ -996,10 +995,12 @@ maintenance_menu() {
         choice=$(dialog --stdout \
             --title "Maintenance Menu" \
             --menu "Select an action (or 0 to return):" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-            0 "Back to Main Menu" \
             1 "Toggle Maintenance Mode" \
             2 "Scan User Files (files:scan)" \
-            3 "Expand Filesystem with LVM")
+            3 "Expand Filesystem with LVM" \
+            4 "Configure Watchdog" \
+            5 "Disable Wireless (WiFi/Bluetooth)" \
+            0 "Back to Main Menu")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
             return 0  # Explicit back or cancel -> return to main
@@ -1009,6 +1010,8 @@ maintenance_menu() {
             1) toggle_maintenance_mode ;;
             2) run_files_scan ;;
             3) lvm_storage_extension ;;
+            4) configure_watchdog ;;
+            5) disable_wireless ;;
         esac
         reset_terminal  # Clean after actions
     done
@@ -1427,6 +1430,178 @@ EOF
     fi
 
     dialog --title "LVM Extension Log" --textbox "$LVM_LOG_FILE" 25 80
+}
+
+# --- Configure Watchdog ---
+configure_watchdog() {
+    dialog --title "Configure Watchdog" --yesno "This will enable the Raspberry Pi's hardware watchdog to automatically reboot the system if it hangs, improving robustness.\n\nSteps:\n- Add dtparam=watchdog=on to boot config (if not present)\n- Install watchdog package (if not installed)\n- Configure /etc/watchdog.conf\n- Enable and start the watchdog service\n\nA reboot is recommended after configuration.\n\nProceed?" 18 70
+    if [ $? -ne 0 ]; then
+        return 0
+    fi
+
+    local log_file="$LOG_DIR/watchdog_config.log"
+    touch "$log_file"
+    chmod 644 "$log_file"
+
+    (
+        set -euo pipefail
+        echo "--- Watchdog Configuration Started at $(date) ---" >> "$log_file"
+
+        # Step 1: Enable hardware watchdog in boot config (idempotent)
+        local config_file="$BOOT_PARTITION/config.txt"
+        if [ ! -f "$config_file" ]; then
+            echo "Error: Boot config file not found at $config_file." >> "$log_file"
+            exit 1
+        fi
+        if ! grep -q "^dtparam=watchdog=on" "$config_file"; then
+            echo "dtparam=watchdog=on" >> "$config_file"
+            echo "Added dtparam=watchdog=on to $config_file" >> "$log_file"
+        else
+            echo "dtparam=watchdog=on already present in $config_file" >> "$log_file"
+        fi
+
+        # Step 2: Install watchdog package (idempotent)
+        apt-get update -y >> "$log_file" 2>&1
+        if ! dpkg -s watchdog >/dev/null 2>&1; then
+            apt-get install -y watchdog >> "$log_file" 2>&1
+            echo "Installed watchdog package" >> "$log_file"
+        else
+            echo "Watchdog package already installed" >> "$log_file"
+        fi
+
+        # Step 3: Configure /etc/watchdog.conf (idempotent)
+        local conf_file="/etc/watchdog.conf"
+        if [ ! -f "$conf_file" ]; then
+            echo "Error: $conf_file not found after installation." >> "$log_file"
+            exit 1
+        fi
+        # Uncomment watchdog-device
+        sed -i 's/^#watchdog-device/watchdog-device/' "$conf_file"
+        # Add or update other settings
+        local settings=(
+            "watchdog-timeout = 15"
+            "interval = 10"
+            "realtime = yes"
+        )
+        for setting in "${settings[@]}"; do
+            local key="${setting%% =*}"
+            if grep -q "^$key" "$conf_file"; then
+                sed -i "s/^$key.*/$setting/" "$conf_file"
+                echo "Updated $key in $conf_file" >> "$log_file"
+            else
+                echo "$setting" >> "$conf_file"
+                echo "Added $setting to $conf_file" >> "$log_file"
+            fi
+        done
+
+        # Step 4: Enable and start service (idempotent)
+        systemctl enable watchdog >> "$log_file" 2>&1 || true
+        systemctl start watchdog >> "$log_file" 2>&1 || true
+        if systemctl is-active --quiet watchdog; then
+            echo "Watchdog service is active" >> "$log_file"
+        else
+            echo "Error: Failed to start watchdog service" >> "$log_file"
+            exit 1
+        fi
+
+        echo "--- Watchdog Configuration Completed at $(date) ---" >> "$log_file"
+    ) & 
+    local pid=$!
+
+    dialog --title "Watchdog Configuration Log" --tailbox "$log_file" 25 80 &
+    local tail_pid=$!
+
+    wait $pid
+    local exit_code=$?
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Watchdog configured successfully. A reboot is required for hardware changes to take effect." 8 60
+        dialog --title "Reboot" --yesno "Reboot now?" 8 50
+        if [ $? -eq 0 ]; then
+            sudo reboot
+        fi
+    else
+        dialog --title "Error" --msgbox "Watchdog configuration failed. Check log at $log_file." 8 60
+    fi
+}
+
+# --- Disable Wireless ---
+disable_wireless() {
+    dialog --title "Disable Wireless" --yesno "This will disable WiFi and Bluetooth to maximize power efficiency.\n\nSteps:\n- Add dtoverlay=disable-wifi and dtoverlay=disable-bt to boot config (if not present)\n- Install rfkill package (if not installed)\n- Block WiFi and Bluetooth immediately via rfkill\n\nA reboot is recommended for changes to take full effect.\n\nProceed?" 18 70
+    if [ $? -ne 0 ]; then
+        return 0
+    fi
+
+    local log_file="$LOG_DIR/wireless_disable.log"
+    touch "$log_file"
+    chmod 644 "$log_file"
+
+    (
+        set -euo pipefail
+        echo "--- Wireless Disable Started at $(date) ---" >> "$log_file"
+
+        # Step 1: Add overlays to boot config (idempotent)
+        local config_file="$BOOT_PARTITION/config.txt"
+        if [ ! -f "$config_file" ]; then
+            echo "Error: Boot config file not found at $config_file." >> "$log_file"
+            exit 1
+        fi
+        if ! grep -q "^dtoverlay=disable-wifi" "$config_file"; then
+            echo "dtoverlay=disable-wifi" >> "$config_file"
+            echo "Added dtoverlay=disable-wifi to $config_file" >> "$log_file"
+        else
+            echo "dtoverlay=disable-wifi already present in $config_file" >> "$log_file"
+        fi
+        if ! grep -q "^dtoverlay=disable-bt" "$config_file"; then
+            echo "dtoverlay=disable-bt" >> "$config_file"
+            echo "Added dtoverlay=disable-bt to $config_file" >> "$log_file"
+        else
+            echo "dtoverlay=disable-bt already present in $config_file" >> "$log_file"
+        fi
+
+        # Step 2: Install rfkill package (idempotent)
+        apt-get update -y >> "$log_file" 2>&1
+        if ! dpkg -s rfkill >/dev/null 2>&1; then
+            apt-get install -y rfkill >> "$log_file" 2>&1
+            echo "Installed rfkill package" >> "$log_file"
+        else
+            echo "rfkill package already installed" >> "$log_file"
+        fi
+
+        # Step 3: Immediately block WiFi and Bluetooth
+        rfkill block wifi >> "$log_file" 2>&1 || echo "Warning: Failed to block WiFi (may already be disabled)" >> "$log_file"
+        rfkill block bluetooth >> "$log_file" 2>&1 || echo "Warning: Failed to block Bluetooth (may already be disabled)" >> "$log_file"
+        echo "Blocked WiFi and Bluetooth via rfkill" >> "$log_file"
+
+        # Step 4: Unload modules if loaded (for immediate effect)
+        modprobe -r brcmfmac 2>> "$log_file" || true
+        modprobe -r hci_uart 2>> "$log_file" || true
+        modprobe -r bluetooth 2>> "$log_file" || true
+        echo "Unloaded wireless modules if present" >> "$log_file"
+
+        echo "--- Wireless Disable Completed at $(date) ---" >> "$log_file"
+    ) & 
+    local pid=$!
+
+    dialog --title "Wireless Disable Log" --tailbox "$log_file" 25 80 &
+    local tail_pid=$!
+
+    wait $pid
+    local exit_code=$?
+    kill "$tail_pid" 2>/dev/null || true
+    reset_terminal
+
+    if [ $exit_code -eq 0 ]; then
+        dialog --title "Success" --msgbox "Wireless disabled successfully. A reboot is recommended for full effect." 8 60
+        dialog --title "Reboot" --yesno "Reboot now?" 8 50
+        if [ $? -eq 0 ]; then
+            sudo reboot
+        fi
+    else
+        dialog --title "Error" --msgbox "Wireless disable failed. Check log at $log_file." 8 60
+    fi
 }
 
 # --- Logs Menu ---
