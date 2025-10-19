@@ -2,7 +2,7 @@
 
 This project automates the deployment and management of a production-ready Nextcloud instance on a Raspberry Pi 5 or 4.
 
-It uses a Text User Interface (TUI) to manage a containerized stack (Docker Compose), secure remote access (Cloudflare Tunnel), and a robust backup system.
+It uses a Terminal User Interface (TUI) to manage a containerized stack (Docker Compose), secure remote access (Cloudflare Tunnel), and a robust backup system.
 
 -----
 
@@ -10,7 +10,7 @@ It uses a Text User Interface (TUI) to manage a containerized stack (Docker Comp
 
   * A Raspberry Pi 4 or 5 with a fresh installation of Raspberry Pi OS Lite booted from SSD or NVMe.
   * A domain registered with Cloudflare.
-  * SSH access to the Raspberry Pi.
+  * If Headless Setup: SSH root access to the Raspberry Pi.
 
 -----
 
@@ -18,9 +18,9 @@ It uses a Text User Interface (TUI) to manage a containerized stack (Docker Comp
 
   * **TUI-Driven Management:** A `dialog`-based interface for setup, backups, restores, and maintenance.
   * **Containerized Stack:** Deploys Nextcloud and MariaDB using Docker Compose.
-  * **Secure Remote Access:** Automatically configures a Cloudflare Tunnel for HTTPS access without opening firewall ports.
+  * **Secure Remote Access:** Automatically configures a Cloudflare Tunnel for HTTPS access eliminating need for static IP/dynamic DNS (DDNS) and router port-forwarding.
   * **Backup & Restore:** TUI-driven functions to create full backups (data + DB) and restore from an archive.
-  * **Automated Backups:** Configure a weekly cron job for unattended backups and retention.
+  * **Automated Backups:** Configure a regular cron job for unattended backups and retention.
   * **Storage Management:**
       * **OS Cloning:** TUI option to flash the running OS from an SD card to an NVMe/SSD drive.
       * **LVM Expansion:** A guided, multi-phase process to expand the root filesystem across two separate SSD/NVMe drives.

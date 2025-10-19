@@ -22,6 +22,9 @@ BOOT_PARTITION="/boot/firmware"  # Standard for Pi 5 Bookworm
 
 # Detect boot device
 root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)
+# Robustly get the parent disk name (e.g., nvme0n1 from /dev/nvme0n1p2 or sda from /dev/sda2)
+root_disk_name=$(lsblk -no PKNAME "$root_dev" 2>/dev/null || basename "$root_dev" | sed 's/p[0-9]*$//')
+
 if [[ $root_dev == /dev/mmcblk* ]]; then
     is_sd_boot=true
 else
@@ -504,14 +507,15 @@ backup() {
         fi
         # Auto-scan fallback
         local usb_dev
-        usb_dev=$(lsblk -o NAME,TYPE,RM,MOUNTPOINT | grep 'disk\|part' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $4=="" {print "/dev/"$1; exit}')  # Removable, unmounted
+        usb_dev=$(lsblk -o NAME,TYPE,RM,MOUNTPOINT | grep 'disk\|part' | grep -v "$root_disk_name" | awk '$3=="1" && $4=="" {print "/dev/"$1; exit}')  # Removable, unmounted
         if [[ -n "$usb_dev" ]]; then
             echo "[*] Auto-detected backup drive: $usb_dev"
             local fs_type=$(blkid -o value -s TYPE "$usb_dev" 2>/dev/null)
             if [[ -z "$fs_type" ]]; then
-                BACKUP_LABEL="BackupDrive_$(date +%Y%m%d)"
-                mkfs.ext4 -F -L "$BACKUP_LABEL" "$usb_dev"  # Only format if no filesystem
-                mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || exit 1
+                # DANGEROUS: A non-interactive (cron) job MUST NOT auto-format a drive.
+                # The user must do this manually or via the 'configure_backup_settings' TUI.
+                echo "[!] Detected drive $usb_dev is unformatted. Cannot mount. Aborting."
+                exit 1
             else
                 BACKUP_LABEL=$(blkid -o value -s LABEL "$usb_dev" 2>/dev/null || "BackupDrive_$(date +%Y%m%d)")
                 if [[ -z $(blkid -o value -s LABEL "$usb_dev") ]]; then
@@ -788,7 +792,7 @@ reset_terminal() {
 
 auto_detect_backup_drive() {
     local detected_dev backup_label
-    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v '^sda\|nvme0n1' | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
+    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v "$root_disk_name" | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
     if [[ -n "$detected_dev" ]]; then
         backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
         echo "$detected_dev|$backup_label"
