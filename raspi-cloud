@@ -292,108 +292,6 @@ setup() {
         TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-127.0.0.1}"
     }
 
-    setup_cloudflare() {
-        echo "[3/10] Setting up Cloudflare Tunnel..."
-        echo "You may need to authenticate with Cloudflare in your browser."
-        if [ ! -f /root/.cloudflared/cert.pem ]; then
-            echo "Certificate still not found after login. If running over SSH, the cert.pem was likely downloaded to your local machine."
-            echo "Please copy cert.pem to /root/.cloudflared/cert.pem on this device and rerun the script."
-            die "Missing Cloudflare certificate."
-        fi
-        local TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
-        CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
-        if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
-            echo "Warning: Tunnel with name $TUNNEL_NAME already exists (ID: $CF_TUNNEL_ID)."
-            local choice
-            if [ -t 0 ]; then
-                read -p "Do you want to (d)elete and recreate, or (c)hoose a different subdomain? [d/c]: " choice
-            else
-                echo "Non-interactive mode detected."
-                if [[ "${FORCE_RECREATE_TUNNEL:-false}" == "true" ]]; then
-                    choice="d"
-                else
-                    choice="r"
-                fi
-            fi
-            case "$choice" in
-                d|D)
-                    echo "Deleting existing tunnel..."
-                    cloudflared tunnel delete "$CF_TUNNEL_ID" || die "Failed to delete existing tunnel."
-                    CF_TUNNEL_ID=""
-                    ;;
-                c|C)
-                    if [ -t 0 ]; then
-                        read -p "Enter a new subdomain: " SUBDOMAIN
-                    else
-                        die "Cannot choose new subdomain in non-interactive mode."
-                    fi
-                    CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
-                    NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
-                    TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
-                    CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
-                    if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
-                        die "Tunnel with new name $TUNNEL_NAME also exists. Please choose another or delete manually."
-                    fi
-                    ;;
-                r|R)
-                    # Reuse
-                    ;;
-                *)
-                    die "Invalid choice. Aborting."
-                    ;;
-            esac
-        fi
-        if [[ -z "$CF_TUNNEL_ID" || "$CF_TUNNEL_ID" == "null" ]]; then
-            echo "Creating new tunnel: $TUNNEL_NAME"
-            CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $NF}')
-        else
-            echo "Reusing existing tunnel ID: $CF_TUNNEL_ID"
-        fi
-        echo "Routing DNS for $CF_HOSTNAME..."
-        cloudflared tunnel route dns --overwrite-dns "$CF_TUNNEL_ID" "$CF_HOSTNAME" || die "Failed to create or update DNS route for $CF_HOSTNAME."
-        local CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
-        if [[ ! -f "$CREDENTIALS_FILE" ]]; then
-            echo "Credentials file missing. Generating by running tunnel temporarily..."
-            cloudflared tunnel --credentials-file "$CREDENTIALS_FILE" run "$TUNNEL_NAME" & 
-            local temp_pid=$!
-            sleep 5
-            kill "$temp_pid" 2>/dev/null || true
-            if [[ ! -f "$CREDENTIALS_FILE" ]]; then
-                die "Failed to generate credentials file."
-            fi
-        fi
-        mkdir -p /etc/cloudflared
-        cat > /etc/cloudflared/config.yml <<EOF
-tunnel: $TUNNEL_NAME
-credentials-file: $CREDENTIALS_FILE
-ingress:
-  - hostname: $CF_HOSTNAME
-    service: http://localhost:$NEXTCLOUD_PORT
-  - service: http_status:404
-EOF
-        cat >/etc/systemd/system/cloudflared.service <<EOF
-[Unit]
-Description=Cloudflare Tunnel for Nextcloud
-After=network-online.target
-[Service]
-Type=notify
-ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run
-Restart=on-failure
-RestartSec=5s
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl daemon-reload
-        if systemctl is-enabled --quiet cloudflared 2>/dev/null; then
-            echo "[*] Service already enabled, restarting..."
-            systemctl restart cloudflared
-        else
-            echo "[*] Enabling and starting service..."
-            systemctl enable --now cloudflared
-        fi
-    }
-
     generate_env_file() {
         echo "[4/10] Generating .env configuration file..."
         [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
@@ -466,7 +364,6 @@ EOF
     preflight_checks
     install_dependencies
     gather_config_from_env
-    setup_cloudflare
     generate_env_file
     deploy_docker_stack
     configure_nextcloud_https
@@ -1175,11 +1072,7 @@ flash_to_nvme() {
     fi
 
     local part_suffix
-    if [[ $target_name =~ ^nvme ]]; then
-        part_suffix="p"
-    else
-        part_suffix=""
-    fi
+    if [[ $target_name =~ ^nvme ]]; then part_suffix="p"; else part_suffix=""; fi
     local target_root_part="/dev/${target_name}${part_suffix}2"
 
     dialog --title "Warning" --yesno "This will clone the current OS from SD to /dev/$target_name, set boot priority, and reboot. The drive will be overwritten. Proceed?" 10 60
@@ -1752,48 +1645,168 @@ run_initial_setup() {
         return 1
     fi
 
-    # Centralized Cloudflare login
-    if [ ! -f /root/.cloudflared/cert.pem ]; then
-        dialog --msgbox "Cloudflare authentication required. The authentication process will start now, and instructions will be shown in a dialog box." 8 60
-        cloudflared tunnel login | dialog --programbox "Cloudflare Authentication - Open the URL in your browser" 20 80
-        if [ ! -f /root/.cloudflared/cert.pem ]; then
-            dialog --title "Error" --msgbox "Authentication failed or certificate not created. Please try again or manually place cert.pem." 8 60
-            return 1
-        fi
-    fi
-
     # Ensure log file exists and is writable
     touch "$MAIN_LOG_FILE"
     chmod 644 "$MAIN_LOG_FILE"
 
-    (
-        set -x
-        echo "--- TUI: Subshell for setup started at $(date) ---"
-        export NEXTCLOUD_ADMIN_PASSWORD="$ADMIN_PASS"
-        export MYSQL_ROOT_PASSWORD="$DB_ROOT_PASS"
-        export MYSQL_PASSWORD="$DB_USER_PASS"
-        export BASE_DOMAIN="$BASE_DOMAIN"
-        export SUBDOMAIN="${SUBDOMAIN:-nextcloud}"
-        setup
-    ) >> "$MAIN_LOG_FILE" 2>&1 &  # Append to preserve history
-    local pid=$!
+    # Set variables for setup
+    NEXTCLOUD_ADMIN_PASSWORD="$ADMIN_PASS"
+    MYSQL_ROOT_PASSWORD="$DB_ROOT_PASS"
+    MYSQL_PASSWORD="$DB_USER_PASS"
+    BASE_DOMAIN="$BASE_DOMAIN"
+    SUBDOMAIN="${SUBDOMAIN:-nextcloud}"
 
-    dialog --title "Initial Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
+    # Start logging
+    {
+        set -x
+        echo "--- TUI: Setup started at $(date) ---"
+    } >> "$MAIN_LOG_FILE" 2>&1
+
+    # Run preflight checks
+    echo "[*] Running pre-flight checks..." >> "$MAIN_LOG_FILE" 2>&1
+    preflight_checks >> "$MAIN_LOG_FILE" 2>&1
+
+    # Install dependencies
+    echo "[1/10] Installing system dependencies..." >> "$MAIN_LOG_FILE" 2>&1
+    install_dependencies >> "$MAIN_LOG_FILE" 2>&1
+
+    # Gather config
+    echo "[2/10] Gathering configuration from environment..." >> "$MAIN_LOG_FILE" 2>&1
+    gather_config_from_env >> "$MAIN_LOG_FILE" 2>&1
+
+    # Consolidated Cloudflare setup - interactive
+    echo "[3/10] Setting up Cloudflare Tunnel..." >> "$MAIN_LOG_FILE" 2>&1
+    if [ ! -f /root/.cloudflared/cert.pem ]; then
+        dialog --msgbox "Cloudflare authentication required. The authentication process will start now." 8 60
+        cloudflared tunnel login | dialog --programbox "Cloudflare Authentication - Open the URL in your browser and follow the instructions." 20 80
+        if [ ! -f /root/.cloudflared/cert.pem ]; then
+            echo "Certificate still not found after login. If running over SSH, the cert.pem was likely downloaded to your local machine." >> "$MAIN_LOG_FILE"
+            echo "Please copy cert.pem to /root/.cloudflared/cert.pem on this device and rerun the script." >> "$MAIN_LOG_FILE"
+            dialog --title "Error" --msgbox "Missing Cloudflare certificate. If over SSH, copy cert.pem manually to /root/.cloudflared/cert.pem and rerun." 10 70
+            return 1
+        fi
+    fi
+
+    local TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+    CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+    if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+        echo "Warning: Tunnel with name $TUNNEL_NAME already exists (ID: $CF_TUNNEL_ID)." >> "$MAIN_LOG_FILE"
+        local choice
+        choice=$(dialog --stdout --title "Existing Tunnel" --menu "Tunnel exists. Choose action:" 12 60 3 \
+            d "Delete and recreate" \
+            c "Choose different subdomain" \
+            r "Reuse existing")
+        if [ $? -ne 0 ]; then return 1; fi
+        case "$choice" in
+            d)
+                echo "Deleting existing tunnel..." >> "$MAIN_LOG_FILE"
+                cloudflared tunnel delete "$CF_TUNNEL_ID" >> "$MAIN_LOG_FILE" 2>&1 || {
+                    dialog --title "Error" --msgbox "Failed to delete existing tunnel." 8 50
+                    return 1
+                }
+                CF_TUNNEL_ID=""
+                ;;
+            c)
+                SUBDOMAIN=$(dialog --stdout --inputbox "Enter a new subdomain:" 8 50)
+                if [ $? -ne 0 ] || [ -z "$SUBDOMAIN" ]; then return 1; fi
+                CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+                NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+                TUNNEL_NAME="nextcloud-tunnel-$SUBDOMAIN"
+                CF_TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" || true)
+                if [[ -n "$CF_TUNNEL_ID" && "$CF_TUNNEL_ID" != "null" ]]; then
+                    dialog --title "Error" --msgbox "Tunnel with new name $TUNNEL_NAME also exists. Please choose another or delete manually." 8 60
+                    return 1
+                fi
+                ;;
+            r)
+                # Reuse
+                ;;
+        esac
+    fi
+    if [[ -z "$CF_TUNNEL_ID" || "$CF_TUNNEL_ID" == "null" ]]; then
+        echo "Creating new tunnel: $TUNNEL_NAME" >> "$MAIN_LOG_FILE"
+        CF_TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '/Created tunnel/{print $NF}')
+        if [ $? -ne 0 ] || [ -z "$CF_TUNNEL_ID" ]; then
+            dialog --title "Error" --msgbox "Failed to create tunnel." 8 50
+            return 1
+        fi
+    else
+        echo "Reusing existing tunnel ID: $CF_TUNNEL_ID" >> "$MAIN_LOG_FILE"
+    fi
+    echo "Routing DNS for $CF_HOSTNAME..." >> "$MAIN_LOG_FILE"
+    cloudflared tunnel route dns --overwrite-dns "$CF_TUNNEL_ID" "$CF_HOSTNAME" >> "$MAIN_LOG_FILE" 2>&1 || {
+        dialog --title "Error" --msgbox "Failed to create or update DNS route for $CF_HOSTNAME." 8 60
+        return 1
+    }
+    local CREDENTIALS_FILE="/root/.cloudflared/${CF_TUNNEL_ID}.json"
+    if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+        echo "Credentials file missing. Generating by running tunnel temporarily..." >> "$MAIN_LOG_FILE"
+        cloudflared tunnel --credentials-file "$CREDENTIALS_FILE" run "$TUNNEL_NAME" & 
+        local temp_pid=$!
+        sleep 5
+        kill "$temp_pid" 2>/dev/null || true
+        if [[ ! -f "$CREDENTIALS_FILE" ]]; then
+            dialog --title "Error" --msgbox "Failed to generate credentials file." 8 50
+            return 1
+        fi
+    fi
+    mkdir -p /etc/cloudflared
+    cat > /etc/cloudflared/config.yml <<EOF
+tunnel: $TUNNEL_NAME
+credentials-file: $CREDENTIALS_FILE
+ingress:
+  - hostname: $CF_HOSTNAME
+    service: http://localhost:$NEXTCLOUD_PORT
+  - service: http_status:404
+EOF
+    cat >/etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Nextcloud
+After=network-online.target
+[Service]
+Type=notify
+ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run
+Restart=on-failure
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload >> "$MAIN_LOG_FILE" 2>&1
+    if systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+        echo "[*] Service already enabled, restarting..." >> "$MAIN_LOG_FILE"
+        systemctl restart cloudflared >> "$MAIN_LOG_FILE" 2>&1
+    else
+        echo "[*] Enabling and starting service..." >> "$MAIN_LOG_FILE"
+        systemctl enable --now cloudflared >> "$MAIN_LOG_FILE" 2>&1
+    fi
+
+    # Generate env file
+    echo "[4/10] Generating .env configuration file..." >> "$MAIN_LOG_FILE" 2>&1
+    generate_env_file >> "$MAIN_LOG_FILE" 2>&1
+
+    # Deploy stack
+    echo "[5/10] Deploying Docker stack..." >> "$MAIN_LOG_FILE" 2>&1
+    deploy_docker_stack >> "$MAIN_LOG_FILE" 2>&1
+
+    # Configure HTTPS
+    echo "[6/10] Applying reverse proxy HTTPS configuration..." >> "$MAIN_LOG_FILE" 2>&1
+    configure_nextcloud_https >> "$MAIN_LOG_FILE" 2>&1
+
+    # Validate
+    echo "[10/10] Validating setup..." >> "$MAIN_LOG_FILE" 2>&1
+    validate_setup >> "$MAIN_LOG_FILE" 2>&1
+
+    echo "✅ Installation complete!" >> "$MAIN_LOG_FILE" 2>&1
+
+    dialog --title "Setup Log" --tailbox "$MAIN_LOG_FILE" 25 80 &
     local tail_pid=$!
 
-    wait_for_completion "$pid" "Setup in Progress" "Running initial setup... (Check log for details)"
-    local exit_code=$?
-    
-    # Clean up tailbox
     sleep 1
     kill "$tail_pid" 2>/dev/null || true
     reset_terminal
-    
-    if [ $exit_code -eq 0 ]; then
-        dialog --title "Success" --msgbox "Setup completed successfully!" 8 40
-    else
-        dialog --title "Error" --msgbox "Setup failed. Detailed log saved to:\n\n$MAIN_LOG_FILE" 10 70
-    fi
+
+    dialog --title "Success" --msgbox "Setup completed successfully!" 8 40
 }
 
 # --- Run Backup ---
