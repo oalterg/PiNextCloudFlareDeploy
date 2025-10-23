@@ -43,6 +43,16 @@ fi
 
 mkdir -p "$LOG_DIR"
 
+# --- Helper Functions (moved up for availability) ---
+update_env() {
+    local key="$1" value="$2"
+    if grep -q "^$key=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^$key=.*|$key=$value|" "$ENV_FILE"
+    else
+        echo "$key=$value" >> "$ENV_FILE"
+    fi
+}
+
 # --- Generate .env.template and docker-compose.yml if not present ---
 generate_env_template() {
     if [[ ! -f "$REPO_DIR/.env.template" ]]; then
@@ -94,6 +104,14 @@ BACKUP_DAY_WEEK=0
 # === Cloudflare Tunnel (optional) ===
 # The Tunnel ID created by 'cloudflared'. This is set automatically.
 CF_TUNNEL_ID=
+
+# Trusted Proxies (for reverse proxy config)
+TRUSTED_PROXIES_0=172.18.0.1
+TRUSTED_PROXIES_1=127.0.0.1
+
+# === Home Assistant Configuration (optional) ===
+HA_PORT=8123
+HA_TRUSTED_DOMAINS=
 EOF
     fi
 }
@@ -296,25 +314,26 @@ setup() {
         echo "[4/10] Generating .env configuration file..."
         [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
 
-        mkdir -p "$NEXTCLOUD_DATA_DIR"
-        chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
-        cp "$ENV_TEMPLATE" "$ENV_FILE"
+        if [[ ! -f "$ENV_FILE" ]]; then
+            cp "$ENV_TEMPLATE" "$ENV_FILE"
+        fi
 
-        # Apply sed with validation
-        sed -i -e "s|^NEXTCLOUD_ADMIN_PASSWORD=.*|NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD|" \
-          -e "s|^NEXTCLOUD_TRUSTED_DOMAINS=.*|NEXTCLOUD_TRUSTED_DOMAINS=$NEXTCLOUD_TRUSTED_DOMAINS|" \
-          -e "s|^NEXTCLOUD_PORT=.*|NEXTCLOUD_PORT=$NEXTCLOUD_PORT|" \
-          -e "s|^MYSQL_ROOT_PASSWORD=.*|MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD|" \
-          -e "s|^MYSQL_PASSWORD=.*|MYSQL_PASSWORD=$MYSQL_PASSWORD|" \
-          -e "s|^NEXTCLOUD_DATA_DIR=.*|NEXTCLOUD_DATA_DIR=$NEXTCLOUD_DATA_DIR|" \
-          -e "s|^BACKUP_MOUNTDIR=.*|BACKUP_MOUNTDIR=$BACKUP_MOUNTDIR|" \
-          -e "s|^BACKUP_LABEL=.*|BACKUP_LABEL=$BACKUP_LABEL|" \
-          -e "s|^BACKUP_RETENTION=.*|BACKUP_RETENTION=$BACKUP_RETENTION|" \
-          -e "s|^CF_TUNNEL_ID=.*|CF_TUNNEL_ID=$CF_TUNNEL_ID|" \
-          -e "s|^TRUSTED_PROXIES_0=.*|TRUSTED_PROXIES_0=$TRUSTED_PROXIES_0|" \
-          -e "s|^TRUSTED_PROXIES_1=.*|TRUSTED_PROXIES_1=$TRUSTED_PROXIES_1|" \
-          -e "s|^AUTO_FORMAT_BACKUP=.*|AUTO_FORMAT_BACKUP=$AUTO_FORMAT_BACKUP|" \
-          "$ENV_FILE"
+        update_env "NEXTCLOUD_ADMIN_USER" "$NEXTCLOUD_ADMIN_USER"
+        update_env "NEXTCLOUD_ADMIN_PASSWORD" "$NEXTCLOUD_ADMIN_PASSWORD"
+        update_env "NEXTCLOUD_TRUSTED_DOMAINS" "$NEXTCLOUD_TRUSTED_DOMAINS"
+        update_env "NEXTCLOUD_PORT" "$NEXTCLOUD_PORT"
+        update_env "MYSQL_ROOT_PASSWORD" "$MYSQL_ROOT_PASSWORD"
+        update_env "MYSQL_DATABASE" "$MYSQL_DATABASE"
+        update_env "MYSQL_USER" "$MYSQL_USER"
+        update_env "MYSQL_PASSWORD" "$MYSQL_PASSWORD"
+        update_env "NEXTCLOUD_DATA_DIR" "$NEXTCLOUD_DATA_DIR"
+        update_env "BACKUP_MOUNTDIR" "$BACKUP_MOUNTDIR"
+        update_env "BACKUP_LABEL" "$BACKUP_LABEL"
+        update_env "AUTO_FORMAT_BACKUP" "$AUTO_FORMAT_BACKUP"
+        update_env "BACKUP_RETENTION" "$BACKUP_RETENTION"
+        update_env "CF_TUNNEL_ID" "$CF_TUNNEL_ID"
+        update_env "TRUSTED_PROXIES_0" "$TRUSTED_PROXIES_0"
+        update_env "TRUSTED_PROXIES_1" "$TRUSTED_PROXIES_1"
 
         # Validate key vars
         grep -q "NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD" "$ENV_FILE" || die "Failed to update .env (admin password)."
@@ -695,15 +714,6 @@ auto_detect_backup_drive() {
         echo "$detected_dev|$backup_label"
     else
         echo "|LocalFallback"
-    fi
-}
-
-update_env() {
-    local key="$1" value="$2"
-    if grep -q "^$key=" "$ENV_FILE" 2>/dev/null; then
-        sed -i "s|^$key=.*|$key=$value|" "$ENV_FILE"
-    else
-        echo "$key=$value" >> "$ENV_FILE"
     fi
 }
 
@@ -1527,7 +1537,7 @@ logs_menu() {
             3) dialog --title "Restore Log" --tailbox "$RESTORE_LOG_FILE" 25 80 ;;
             4) 
                 local temp_log
-                temp_log=$(mktemp /tmp/dockerlogs.XXXXXX)
+                temp_log=$(mktemp)
                 if docker compose -f "$COMPOSE_FILE" logs --tail=100 > "$temp_log" 2>&1; then
                     dialog --title "Docker Logs" --tailbox "$temp_log" 25 80
                 else
@@ -1571,7 +1581,7 @@ configure_backup_settings() {
         "Mount Point:" 1 1 "$current_mount" 1 20 40 0 \
         "Label:" 2 1 "$current_label" 2 20 40 0 \
         "Auto-Format? (Y/N):" 3 1 "$current_format" 3 20 10 0 \
-        "Retention (days):" 4 1 "$current_retention" 4 20 10 0 \
+        "Retention (Max backups to keep):" 4 1 "$current_retention" 4 20 10 0 \
         "Cron Minute (0-59):" 5 1 "$current_minute" 5 20 10 0 \
         "Cron Hour (0-23):" 6 1 "$current_hour" 6 20 10 0 \
         "Cron Day of Month (1-31):" 7 1 "$current_dom" 7 20 10 0 \
@@ -2036,6 +2046,91 @@ EOF
     dialog --title "Success" --msgbox "FTP server setup complete. Connect with user '$ftp_user' and password provided. Uploads to '$upload_dir' will trigger Nextcloud scan." 10 70
 }
 
+# --- Setup Home Assistant ---
+setup_home_assistant() {
+    source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found. Run Nextcloud setup first." 8 50; return; }
+
+    if grep -q "homeassistant:" "$COMPOSE_FILE"; then
+        dialog --title "Warning" --yesno "Home Assistant is already configured in docker-compose.yml. Reconfigure?" 8 50
+        if [ $? -ne 0 ]; then return; fi
+    fi
+
+    local ha_subdomain
+    ha_subdomain=$(dialog --stdout --title "Home Assistant Subdomain" --inputbox "Enter subdomain for Home Assistant (e.g., ha):" 8 50 "ha")
+    if [ $? -ne 0 ] || [ -z "$ha_subdomain" ]; then return; fi
+
+    local base_domain="${BASE_DOMAIN:-example.com}"
+    local ha_hostname="$ha_subdomain.$base_domain"
+    local ha_trusted_domains="$ha_hostname"
+    local ha_port="${HA_PORT:-8123}"
+
+    local zigbee_device
+    zigbee_device=$(dialog --stdout --title "Zigbee Dongle" --inputbox "Enter Zigbee dongle device path (e.g., /dev/ttyACM0; leave blank if none): Run 'ls /dev/tty*' to find it." 10 60)
+    if [ $? -ne 0 ]; then return; fi
+
+    dialog --title "Confirm" --yesno "Setup Home Assistant on port $ha_port with hostname $ha_hostname? Zigbee: ${zigbee_device:-None}. This will update docker-compose.yml and the Cloudflare Tunnel." 10 70
+    if [ $? -ne 0 ]; then return; fi
+
+    # Update .env
+    update_env "HA_PORT" "$ha_port"
+    update_env "HA_TRUSTED_DOMAINS" "$ha_trusted_domains"
+
+    # Add HA to docker-compose.yml (idempotent: remove existing HA block first)
+    sed -i '/homeassistant:/,/^$/d' "$COMPOSE_FILE"  # Remove existing HA block
+    cat >> "$COMPOSE_FILE" << EOF
+
+  homeassistant:
+    image: homeassistant/home-assistant:stable
+    restart: unless-stopped
+    ports:
+      - "${HA_PORT}:8123"
+    volumes:
+      - ha_config:/config
+    environment:
+      - TZ=Etc/UTC  # Adjust timezone as needed
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8123"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+EOF
+
+    if [[ -n "$zigbee_device" ]]; then
+        echo "    devices:" >> "$COMPOSE_FILE"
+        echo "      - $zigbee_device:$zigbee_device" >> "$COMPOSE_FILE"
+    fi
+
+    cat >> "$COMPOSE_FILE" << EOF
+
+volumes:
+  ha_config:
+EOF
+
+    # Update Cloudflare Tunnel config (add ingress rule idempotently)
+    local tunnel_config="/etc/cloudflared/config.yml"
+    if grep -q "hostname: $ha_hostname" "$tunnel_config"; then
+        sed -i "/hostname: $ha_hostname/,/service:/d" "$tunnel_config"
+    fi
+    sed -i '/- service: http_status:404/i \  - hostname: '"$ha_hostname"'\n    service: http://localhost:'"$ha_port" "$tunnel_config"
+
+    # Route DNS for HA
+    cloudflared tunnel route dns --overwrite-dns "$CF_TUNNEL_ID" "$ha_hostname" || {
+        dialog --title "Error" --msgbox "Failed to route DNS for $ha_hostname." 8 50
+        return 1
+    }
+
+    # Deploy and restart
+    docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
+    systemctl restart cloudflared
+
+    dialog --title "Success" --msgbox "Home Assistant setup complete. Access at https://$ha_hostname. Initial setup may take a few minutes. If using Zigbee, configure in HA integrations." 10 70
+}
+
 # --- Main Menu ---
 main_menu() {
     while true; do
@@ -2074,6 +2169,7 @@ main_menu() {
                 6 "Maintenance Menu" \
                 7 "View Logs" \
                 8 "Setup FTP Server" \
+                9 "Setup Home Assistant" \
                 0 "Exit")
             local retval=$?
             if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
@@ -2093,6 +2189,7 @@ main_menu() {
                 6) maintenance_menu ;;
                 7) logs_menu ;;
                 8) setup_ftp_server ;;
+                9) setup_home_assistant ;;
             esac
         fi
         reset_terminal  # Ensure clean state after actions
