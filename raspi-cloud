@@ -391,7 +391,6 @@ setup() {
     echo "✅ Installation complete!"
 }
 
-# --- Integrated Backup Function (from backup script) ---
 backup() {
     set -euo pipefail
 
@@ -415,8 +414,15 @@ backup() {
     auto_mount_backup() {
         if mountpoint -q "$BACKUP_MOUNTDIR"; then return 0; fi
         if [[ -n "$BACKUP_LABEL" ]] && blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
-            mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" || {
-                echo "[!] Failed to mount $BACKUP_LABEL."
+            for attempt in {1..3}; do
+                if mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" 2>> "$BACKUP_LOG_FILE"; then
+                    echo "[INFO] Mounted on attempt $attempt." >> "$BACKUP_LOG_FILE"
+                    break
+                fi
+                echo "[WARN] Mount failed (attempt $attempt); retrying in 5s..." >> "$BACKUP_LOG_FILE"
+                sleep 5
+            done || {
+                echo "[!] Failed to mount $BACKUP_LABEL after retries."
                 exit 1
             }
             return 0
@@ -441,8 +447,8 @@ backup() {
             fi
             echo "BACKUP_LABEL=$BACKUP_LABEL" >> "$ENV_FILE"  # Update .env idempotently
         else
-            echo "[!] No external drive found. Using local fallback: $BACKUP_MOUNTDIR (limited space!)"
-            mkdir -p "$BACKUP_MOUNTDIR"
+            echo "[!] No external drive found. Aborting to avoid cluttering local filesystem."
+            exit 1
         fi
     }
 
@@ -459,9 +465,9 @@ backup() {
     cleanup() {
         echo "[*] Cleaning up..."
         # Turn maintenance mode OFF, suppress errors if already off
-        if [[ -n "${NC_CID:-}" ]] && docker ps -q --no-trunc | grep -q "$NC_CID"; then
+        if [[ -n "${NC_CID:-}" ]] && docker inspect --format '{{.State.Running}}' "$NC_CID" 2>/dev/null | grep -q '^true$'; then
             echo "[*] Ensuring maintenance mode is disabled..."
-            docker exec -u www-data "$NC_CID" php occ maintenance:mode --off || true
+            docker exec -u www-data "$NC_CID" php occ maintenance:mode --off >> "$BACKUP_LOG_FILE" 2>&1 || echo "[WARN] Failed to disable maintenance mode." >> "$BACKUP_LOG_FILE"
         fi
         # Remove staging directory
         if [[ -d "$STAGING_DIR" ]]; then
@@ -480,13 +486,30 @@ backup() {
 
     mkdir -p "$STAGING_DIR/data" "$STAGING_DIR/db" "$STAGING_DIR/config"
     NC_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q nextcloud)"
+    DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
+
+    # Enhanced container checks
+    if [[ -z "$NC_CID" ]] || ! docker inspect --format '{{.State.Running}}' "$NC_CID" 2>/dev/null | grep -q '^true$'; then
+        echo "[!] Nextcloud container not found or not running. Aborting."
+        exit 1
+    fi
+    if [[ -z "$DB_CID" ]] || ! docker inspect --format '{{.State.Running}}' "$DB_CID" 2>/dev/null | grep -q '^true$'; then
+        echo "[!] DB container not found or not running. Aborting."
+        exit 1
+    fi
 
     echo "[1/6] Checking for sufficient disk space..."
     ESTIMATED_DATA_KB=$(du -sk "$NEXTCLOUD_DATA_DIR" | awk '{print $1}')
-    ESTIMATED_TOTAL_KB=$((ESTIMATED_DATA_KB + 102400)) # Add 100MB for DB/config
+    # Dynamically estimate DB size (fallback to 100MB if query fails)
+    ESTIMATED_DB_KB=$(docker exec "$DB_CID" mariadb -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" -e "SELECT ROUND(SUM(data_length + index_length) / 1024) AS size_kb FROM information_schema.tables WHERE table_schema='$MYSQL_DATABASE';" 2>/dev/null | tail -1 || echo "102400")
+    ESTIMATED_CONFIG_KB=51200  # Conservative for config (50MB)
+    ESTIMATED_UNCOMPRESSED_KB=$((ESTIMATED_DATA_KB + ESTIMATED_DB_KB + ESTIMATED_CONFIG_KB))
+    # Peak: ~2.0x for staging + archive (assuming no compression; adjust multiplier if needed)
+    ESTIMATED_PEAK_KB=$((ESTIMATED_UNCOMPRESSED_KB * 2))
     AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
-    if [ "$AVAILABLE_KB" -lt "$ESTIMATED_TOTAL_KB" ]; then
-        echo "[!] Not enough free space. Available: $((AVAILABLE_KB / 1024)) MB, Needed: $((ESTIMATED_TOTAL_KB / 1024)) MB. Aborting."
+    echo "[INFO] Estimated uncompressed: $((ESTIMATED_UNCOMPRESSED_KB / 1024)) MB, Peak: $((ESTIMATED_PEAK_KB / 1024)) MB, Available: $((AVAILABLE_KB / 1024)) MB" >> "$BACKUP_LOG_FILE"
+    if [ "$AVAILABLE_KB" -lt "$ESTIMATED_PEAK_KB" ]; then
+        echo "[!] Not enough free space. Available: $((AVAILABLE_KB / 1024)) MB, Needed (peak): $((ESTIMATED_PEAK_KB / 1024)) MB. Aborting."
         exit 1
     fi
 
@@ -494,7 +517,6 @@ backup() {
     docker exec -u www-data "$NC_CID" php occ maintenance:mode --on
 
     echo "[3/6] Dumping database..."
-    DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
     docker run --rm \
       --network container:"$DB_CID" \
       -e MYSQL_PWD="$MYSQL_PASSWORD" \
@@ -503,20 +525,32 @@ backup() {
       > "$STAGING_DIR/db/nextcloud.sql"
 
     echo "[4/6] Copying data and config..."
-    rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/data/"
+    if ! rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/data/" 2>> "$BACKUP_LOG_FILE"; then
+        echo "[!] Rsync failed. Check permissions or disk space." >> "$BACKUP_LOG_FILE"
+        exit 1
+    fi
     NC_HTML_VOLUME=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
     docker run --rm -v "${NC_HTML_VOLUME}:/volume:ro" -v "$STAGING_DIR/config":/backup alpine \
         sh -c "cp -a /volume/config/. /backup/"
 
     echo "[5/6] Creating compressed archive..."
-    tar -C "$STAGING_DIR" -czf "$ARCHIVE_PATH" data db config
+    if ! tar -C "$STAGING_DIR" -czf "$ARCHIVE_PATH" data db config 2>> "$BACKUP_LOG_FILE"; then
+        echo "[!] Tar failed (possibly out of space). Partial archive may exist: $ARCHIVE_PATH" >> "$BACKUP_LOG_FILE"
+        rm -f "$ARCHIVE_PATH"  # Clean partial file idempotently
+        exit 1
+    fi
     sync
 
     # Maintenance mode is disabled by the 'trap cleanup' function
 
     echo "[6/6] Applying backup retention policy (keep last $BACKUP_RETENTION)..."
+    OLD_BACKUPS=$(ls -tp "$BACKUP_MOUNTDIR"/nextcloud_backup_*.tar.gz 2>/dev/null | tail -n +$((BACKUP_RETENTION+1)))
+    if [[ -n "$OLD_BACKUPS" ]]; then
+        echo "[INFO] Deleting old backups: $OLD_BACKUPS" >> "$BACKUP_LOG_FILE"
+    fi
     ls -tp "$BACKUP_MOUNTDIR"/nextcloud_backup_*.tar.gz 2>/dev/null | tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm --
     echo "--- Backup Complete: $ARCHIVE_PATH ---"
+    rm -f "$LOCK_FILE"  # Redundant lock release for idempotence
 }
 
 restore() {
