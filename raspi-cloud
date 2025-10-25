@@ -193,20 +193,110 @@ EOF
 generate_env_template
 generate_docker_compose
 
-# --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
-if [ $# -gt 0 ]; then
-    case "$1" in
-        --backup)
-            backup
-            exit $?
-            ;;
-        --restore)
-            shift
-            restore "$@"
-            exit $?
-            ;;
-    esac
-fi
+# --- Helper Functions ---
+die() {
+    dialog --title "Error" --msgbox "$1" 8 60
+    exit 1
+}
+
+get_nc_cid() {
+    docker compose -f "$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true
+}
+
+is_stack_running() {
+    [[ -n "$(get_nc_cid)" ]]
+}
+
+wait_for_completion() {
+    local pid=$1
+    local title=$2
+    local text=$3
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+    done
+    wait "$pid"
+    return $?
+}
+
+reset_terminal() {
+    sleep 0.5
+    stty sane 2>/dev/null || true
+}
+
+# --- Maintenance Mode Helpers ---
+
+# Sets maintenance mode.
+# $1: Mode ("--on" or "--off")
+# $2: (Optional) Log file to redirect output to
+set_maintenance_mode() {
+    local mode="$1"
+    local log_file="${2:-/dev/null}" # Default to /dev/null if no log file
+
+    if ! is_stack_running; then
+        echo "[WARN] Stack not running, cannot set maintenance mode." >> "$log_file"
+        return 1
+    fi
+
+    local nc_cid
+    nc_cid=$(get_nc_cid)
+    if [[ -z "$nc_cid" ]]; then
+        echo "[WARN] Nextcloud container not found, cannot set maintenance mode." >> "$log_file"
+        return 1
+    fi
+
+    # Check if container is actually running
+    if ! docker inspect --format '{{.State.Running}}' "$nc_cid" 2>/dev/null | grep -q '^true$'; then
+         echo "[WARN] Nextcloud container not running, cannot set maintenance mode." >> "$log_file"
+         return 1
+    fi
+
+    if docker exec -u www-data "$nc_cid" php occ maintenance:mode "$mode" >> "$log_file" 2>&1; then
+        echo "[INFO] Maintenance mode set to $mode." >> "$log_file"
+        return 0
+    else
+        echo "[WARN] Failed to set maintenance mode to $mode." >> "$log_file"
+        return 1 # Return error
+    fi
+}
+
+# Gets maintenance mode status
+# ECHOES 0 if enabled, 1 if disabled, 2 if error
+# Always exits with 0 to prevent script abort (due to set -e)
+get_maintenance_status() {
+    if ! is_stack_running; then echo 2; return 0; fi # return 0 is for set -e
+    local nc_cid
+    nc_cid=$(get_nc_cid)
+    if [[ -z "$nc_cid" ]]; then echo 2; return 0; fi
+
+    local current_status
+    # Capture the output, exit code since it is 0 in both states
+    current_status=$(docker exec -u www-data "$nc_cid" php occ maintenance:mode 2>&1)
+    if [ $? -ne 0 ]; then
+         return 2 # Error querying
+    fi
+    # Check the text output to determine status
+    if echo "$current_status" | grep -q "enabled"; then
+        echo 0 # Enabled
+    elif echo "$current_status" | grep -q "disabled"; then
+        echo 1 # Disabled
+    else
+        echo 2 # Error
+    fi
+    
+    # Crucially, always exit with success (0)
+    return 0
+ }
+
+auto_detect_backup_drive() {
+    local detected_dev backup_label
+    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v "$root_disk_name" | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
+    if [[ -n "$detected_dev" ]]; then
+        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
+        echo "$detected_dev|$backup_label"
+    else
+        echo "|LocalFallback"
+    fi
+}
 
 # --- Integrated Setup Function (from setup script) ---
 setup() {
@@ -463,12 +553,8 @@ backup() {
 
     # TRAP to ensure cleanup and maintenance mode is turned off on exit/error
     cleanup() {
-        echo "[*] Cleaning up..."
-        # Turn maintenance mode OFF, suppress errors if already off
-        if [[ -n "${NC_CID:-}" ]] && docker inspect --format '{{.State.Running}}' "$NC_CID" 2>/dev/null | grep -q '^true$'; then
-            echo "[*] Ensuring maintenance mode is disabled..."
-            docker exec -u www-data "$NC_CID" php occ maintenance:mode --off >> "$BACKUP_LOG_FILE" 2>&1 || echo "[WARN] Failed to disable maintenance mode." >> "$BACKUP_LOG_FILE"
-        fi
+        echo "[*] Cleaning up... Ensuring maintenance mode is disabled."
+        set_maintenance_mode "--off" "$BACKUP_LOG_FILE" || true # Suppress errors
         # Remove staging directory
         if [[ -d "$STAGING_DIR" ]]; then
             rm -rf "$STAGING_DIR"
@@ -514,7 +600,7 @@ backup() {
     fi
 
     echo "[2/6] Enabling maintenance mode..."
-    docker exec -u www-data "$NC_CID" php occ maintenance:mode --on
+    set_maintenance_mode "--on" "$BACKUP_LOG_FILE" || die "Failed to enable maintenance mode."
 
     echo "[3/6] Dumping database..."
     docker run --rm \
@@ -710,46 +796,20 @@ restore() {
     echo "=== Restore Complete From: $BACKUP_FILE ==="
 }
 
-# --- Helper Functions ---
-die() {
-    dialog --title "Error" --msgbox "$1" 8 60
-    exit 1
-}
-
-get_nc_cid() {
-    docker compose -f "$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true
-}
-
-is_stack_running() {
-    [[ -n "$(get_nc_cid)" ]]
-}
-
-wait_for_completion() {
-    local pid=$1
-    local title=$2
-    local text=$3
-    while kill -0 "$pid" 2>/dev/null; do
-        sleep 1
-    done
-    wait "$pid"
-    return $?
-}
-
-reset_terminal() {
-    sleep 0.5
-    stty sane 2>/dev/null || true
-}
-
-auto_detect_backup_drive() {
-    local detected_dev backup_label
-    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v "$root_disk_name" | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
-    if [[ -n "$detected_dev" ]]; then
-        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
-        echo "$detected_dev|$backup_label"
-    else
-        echo "|LocalFallback"
-    fi
-}
+# --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
+if [ $# -gt 0 ]; then
+    case "$1" in
+        --backup)
+            backup
+            exit $?
+            ;;
+        --restore)
+            shift
+            restore "$@"
+            exit $?
+            ;;
+    esac
+fi
 
 install_backup_cron() {
     local minute="$1" hour="$2" day_of_month="$3" month="$4" day_of_week="$5"
@@ -968,33 +1028,34 @@ toggle_maintenance_mode() {
         return 1
     fi
 
-    local nc_cid
-    nc_cid=$(get_nc_cid)
-    if [[ -z "$nc_cid" ]]; then
-        dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
-        return 1
-    fi
-
     local current_status
-    if ! current_status=$(docker exec -u www-data "$nc_cid" php occ maintenance:mode 2>&1); then
-        dialog --title "Error" --msgbox "Failed to query maintenance mode: $current_status" 8 50
-        return 1
-    fi
+    current_status=$(get_maintenance_status)
 
-    local status new_mode new_status
-    if echo "$current_status" | grep -q "enabled"; then
-        status="enabled"
+    local status
+    case "$current_status" in
+        0) status="enabled" ;;
+        1) status="disabled" ;;
+        *)
+            dialog --title "Error" --msgbox "Failed to query maintenance mode." 8 50
+            return 1
+            ;;
+    esac
+
+    local new_mode new_status
+    if [[ "$status" == "enabled" ]];
+    then
         new_mode="--off"
         new_status="disabled"
     else
-        status="disabled"
         new_mode="--on"
         new_status="enabled"
     fi
 
     dialog --title "Confirm" --yesno "Maintenance mode is currently $status. Do you want to turn it $new_status?" 10 60
-    if [ $? -eq 0 ]; then
-        if docker exec -u www-data "$nc_cid" php occ maintenance:mode "$new_mode" >/dev/null 2>&1; then
+    if [ $? -eq 0 ];
+    then
+        if set_maintenance_mode "$new_mode" >/dev/null 2>&1;
+        then
             dialog --title "Success" --msgbox "Maintenance mode is now $new_status." 8 40
         else
             dialog --title "Error" --msgbox "Failed to toggle maintenance mode." 8 50
