@@ -338,7 +338,7 @@ setup() {
         [[ $EUID -ne 0 ]] && die "This script must be run as root."
 
         if [[ -z "${SUDO_USER-}" ]]; then
-            die "Could not determine the original user. Please run with 'sudo' (e.g., 'sudo /opt/raspi-nextcloud-setup/tui'), not via 'sudo su' or a root shell."
+            die "Could not determine the original user. Please run with 'sudo' (e.g., 'sudo raspi-cloud'), not via 'sudo su' or a root shell."
         fi
 
         for cmd in "${REQUIRED_CMDS[@]}"; do
@@ -815,7 +815,7 @@ install_backup_cron() {
     local minute="$1" hour="$2" day_of_month="$3" month="$4" day_of_week="$5"
     local cron_expr="$minute $hour $day_of_month $month $day_of_week"
 
-    local cron_content="# Run Nextcloud backup at $cron_expr\n$cron_expr root /usr/local/sbin/raspi-nextcloud-tui --backup >> $BACKUP_LOG_FILE 2>&1\n"
+    local cron_content="# Run Nextcloud backup at $cron_expr\n$cron_expr root /usr/local/sbin/raspi-cloud --backup >> $BACKUP_LOG_FILE 2>&1\n"
     if [[ -f "$CRON_FILE" && $(cat "$CRON_FILE") == *"$cron_expr"* ]]; then
         echo "Cron job already up-to-date for schedule $cron_expr."
     else
@@ -2256,7 +2256,7 @@ main_menu() {
                 --backtitle "Raspi Nextcloud TUI" \
                 --title "Main Menu" \
                 --menu "Select an option:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-                1 "Initial Setup" \
+                1 "Initial Nextcloud+Cloudflare Setup" \
                 2 "Run Backup" \
                 3 "Run Restore" \
                 4 "Configure Backup Settings" \
