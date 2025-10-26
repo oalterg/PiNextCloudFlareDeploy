@@ -19,6 +19,7 @@ HEIGHT=20
 WIDTH=70
 CHOICE_HEIGHT=8
 BOOT_PARTITION="/boot/firmware"  # Standard for Pi 5 Bookworm
+BACKUP_MOUNTDIR="/mnt/backup"  # Hardcoded mount point
 
 # Detect boot device
 root_dev=$(findmnt -o SOURCE / | tail -1 | cut -d'[' -f1)
@@ -85,12 +86,6 @@ MYSQL_PASSWORD=changeme
 NEXTCLOUD_DATA_DIR=/home/user/nextcloud
 
 # === Backup Configuration ===
-# The directory where the backup drive will be mounted.
-BACKUP_MOUNTDIR=/mnt/backup
-# The filesystem LABEL of the external backup drive.
-BACKUP_LABEL=BackupDrive
-# Whether to auto-format the backup drive if unformatted (true/false; use with caution).
-AUTO_FORMAT_BACKUP=false
 # The number of old backup archives to keep.
 BACKUP_RETENTION=8
 # Custom cron schedule fields for backup timing (defaults to weekly on Sunday at 03:00).
@@ -287,15 +282,70 @@ get_maintenance_status() {
     return 0
  }
 
-auto_detect_backup_drive() {
-    local detected_dev backup_label
-    detected_dev=$(lsblk -o NAME,TYPE,RM,SIZE,MOUNTPOINT | grep 'disk' | grep -v "$root_disk_name" | awk '$3=="1" && $5=="" {print "/dev/"$1; exit}')
-    if [[ -n "$detected_dev" ]]; then
-        backup_label=$(blkid -o value -s LABEL "$detected_dev" 2>/dev/null || echo "AutoLabel_$(date +%Y%m%d)")
-        echo "$detected_dev|$backup_label"
-    else
-        echo "|LocalFallback"
+select_backup_drive() {  
+    local drives
+    mapfile -t drives < <(lsblk -o NAME,TYPE,RM,SIZE,MODEL | awk -v root="$root_disk_name" '$2=="disk" && $1 != root {print "/dev/" $1 " (" $4 ", " $5 ")"}')
+    if [ ${#drives[@]} -eq 0 ]; then
+        dialog --title "No Drives" --msgbox "No external drives detected. Insert one and try again." 8 50
+        return 1
     fi
+    local options=()
+    for i in "${!drives[@]}"; do
+        options+=("$((i+1))" "${drives[$i]}")
+    done
+
+    local choice
+    choice=$(dialog --stdout --title "Select Backup Drive" --menu "Choose a drive:" $HEIGHT $WIDTH $CHOICE_HEIGHT "${options[@]}")
+    if [ $? -ne 0 ]; then return 1; fi
+
+    local selected_dev="/dev/$(echo "${drives[$((choice-1))]}" | awk '{print $1}' | sed 's/\/dev\///')"
+
+    local fs_type
+    fs_type=$(blkid -o value -s TYPE "$selected_dev")
+
+    local format_choice=1
+    if [[ -n "$fs_type" ]]; then
+        dialog --title "Drive Formatted" --yesno "Drive is formatted as $fs_type. Format anyway? (erases all data)" 8 60
+        format_choice=$?
+    else
+        dialog --title "Unformatted Drive" --yesno "Drive is unformatted. Format now? (required to use)" 8 60
+        format_choice=$?
+    fi
+
+    if [ $format_choice -eq 0 ]; then
+        dialog --title "Confirm Format" --yesno "Formatting will ERASE ALL DATA on $selected_dev. Proceed?" 8 60
+        if [ $? -ne 0 ]; then return 1; fi
+        mkfs.ext4 -F -L "NextcloudBackup" "$selected_dev" >> "$BACKUP_LOG_FILE" 2>&1
+        if [ $? -ne 0 ]; then
+            dialog --title "Error" --msgbox "Failed to format drive." 8 50
+            return 1
+        fi
+        fs_type="ext4"
+    elif [[ -z "$fs_type" ]]; then
+        dialog --title "Error" --msgbox "Drive must be formatted to use." 8 50
+        return 1
+    fi
+
+    local uuid
+    uuid=$(blkid -o value -s UUID "$selected_dev")
+    if [[ -z "$uuid" ]]; then
+        dialog --title "Error" --msgbox "Failed to get UUID." 8 50
+        return 1
+    fi
+
+    mkdir -p "$BACKUP_MOUNTDIR"
+
+    sed -i "\|$BACKUP_MOUNTDIR|d" /etc/fstab
+    echo "UUID=$uuid $BACKUP_MOUNTDIR $fs_type defaults,nofail,x-systemd.device-timeout=10 0 2" >> /etc/fstab
+
+    mount -a >> "$BACKUP_LOG_FILE" 2>&1
+    if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
+        dialog --title "Error" --msgbox "Failed to mount drive." 8 50
+        return 1
+    fi
+
+    dialog --title "Success" --msgbox "Backup drive configured and mounted at $BACKUP_MOUNTDIR." 8 50
+    return 0
 }
 
 # --- Integrated Setup Function (from setup script) ---
@@ -390,11 +440,7 @@ setup() {
         USER_HOME=$(eval echo "~$SUDO_USER")
         NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
         NEXTCLOUD_PORT="8080"
-        BACKUP_LABEL="BackupDrive"
-        BACKUP_MOUNTDIR="/mnt/backup"
         BACKUP_RETENTION=8
-        # New: Auto-confirm format from env (TUI sets)
-        AUTO_FORMAT_BACKUP="${AUTO_FORMAT_BACKUP:-false}"
         # New: Trusted proxies from env or default
         TRUSTED_PROXIES_0="${TRUSTED_PROXIES_0:-172.18.0.1}"
         TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-127.0.0.1}"
@@ -417,9 +463,6 @@ setup() {
         update_env "MYSQL_USER" "$MYSQL_USER"
         update_env "MYSQL_PASSWORD" "$MYSQL_PASSWORD"
         update_env "NEXTCLOUD_DATA_DIR" "$NEXTCLOUD_DATA_DIR"
-        update_env "BACKUP_MOUNTDIR" "$BACKUP_MOUNTDIR"
-        update_env "BACKUP_LABEL" "$BACKUP_LABEL"
-        update_env "AUTO_FORMAT_BACKUP" "$AUTO_FORMAT_BACKUP"
         update_env "BACKUP_RETENTION" "$BACKUP_RETENTION"
         update_env "CF_TUNNEL_ID" "$CF_TUNNEL_ID"
         update_env "TRUSTED_PROXIES_0" "$TRUSTED_PROXIES_0"
@@ -493,8 +536,6 @@ backup() {
     source "$ENV_FILE"
 
     # Validate required variables
-    : "${BACKUP_MOUNTDIR:?BACKUP_MOUNTDIR not set in .env}"
-    : "${BACKUP_LABEL:?BACKUP_LABEL not set in .env}"
     : "${BACKUP_RETENTION:?BACKUP_RETENTION not set in .env}"
     : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
     : "${MYSQL_USER:?}"
@@ -503,43 +544,10 @@ backup() {
 
     auto_mount_backup() {
         if mountpoint -q "$BACKUP_MOUNTDIR"; then return 0; fi
-        if [[ -n "$BACKUP_LABEL" ]] && blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
-            for attempt in {1..3}; do
-                if mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR" 2>> "$BACKUP_LOG_FILE"; then
-                    echo "[INFO] Mounted on attempt $attempt." >> "$BACKUP_LOG_FILE"
-                    break
-                fi
-                echo "[WARN] Mount failed (attempt $attempt); retrying in 5s..." >> "$BACKUP_LOG_FILE"
-                sleep 5
-            done || {
-                echo "[!] Failed to mount $BACKUP_LABEL after retries."
-                exit 1
-            }
-            return 0
-        fi
-        # Auto-scan fallback
-        local usb_dev
-        usb_dev=$(lsblk -o NAME,TYPE,RM,MOUNTPOINT | grep 'disk\|part' | grep -v "$root_disk_name" | awk '$3=="1" && $4=="" {print "/dev/"$1; exit}')  # Removable, unmounted
-        if [[ -n "$usb_dev" ]]; then
-            echo "[*] Auto-detected backup drive: $usb_dev"
-            local fs_type=$(blkid -o value -s TYPE "$usb_dev" 2>/dev/null)
-            if [[ -z "$fs_type" ]]; then
-                # DANGEROUS: A non-interactive (cron) job MUST NOT auto-format a drive.
-                # The user must do this manually or via the 'configure_backup_settings' TUI.
-                echo "[!] Detected drive $usb_dev is unformatted. Cannot mount. Aborting."
-                exit 1
-            else
-                BACKUP_LABEL=$(blkid -o value -s LABEL "$usb_dev" 2>/dev/null || "BackupDrive_$(date +%Y%m%d)")
-                if [[ -z $(blkid -o value -s LABEL "$usb_dev") ]]; then
-                    e2label "$usb_dev" "$BACKUP_LABEL"
-                fi
-                mount "$usb_dev" "$BACKUP_MOUNTDIR" || exit 1
-            fi
-            echo "BACKUP_LABEL=$BACKUP_LABEL" >> "$ENV_FILE"  # Update .env idempotently
-        else
-            echo "[!] No external drive found. Aborting to avoid cluttering local filesystem."
+        mount "$BACKUP_MOUNTDIR" >> "$BACKUP_LOG_FILE" 2>&1 || {
+            echo "[!] Failed to mount $BACKUP_MOUNTDIR. Ensure drive is connected." >> "$BACKUP_LOG_FILE"
             exit 1
-        fi
+        }
     }
 
     # --- Locking ---
@@ -645,7 +653,6 @@ restore() {
     # --- Configuration and Initialization ---
     REPO_DIR="/opt/raspi-nextcloud-setup"
     ENV_FILE="$REPO_DIR/.env"
-    BACKUP_LABEL="${BACKUP_LABEL:-BackupDrive}"
     COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
     [[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE"; exit 1; }
     # shellcheck disable=SC1090
@@ -688,7 +695,6 @@ restore() {
     }
 
     # Validate required variables
-    : "${BACKUP_MOUNTDIR:?BACKUP_MOUNTDIR not set in .env}"
     : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
     : "${MYSQL_USER:?}"
     : "${MYSQL_PASSWORD:?}"
@@ -702,13 +708,10 @@ restore() {
     # --- Mount Backup Drive ---
     mkdir -p "$BACKUP_MOUNTDIR"
     if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
-      if blkid -L "$BACKUP_LABEL" >/dev/null 2>&1; then
-        echo "[*] Mounting backup drive '$BACKUP_LABEL' to $BACKUP_MOUNTDIR..."
-        mount -L "$BACKUP_LABEL" "$BACKUP_MOUNTDIR"
-      else
-        echo "[!] Backup drive with label '$BACKUP_LABEL' not found. Aborting."
+      mount "$BACKUP_MOUNTDIR" || {
+        echo "[!] Failed to mount $BACKUP_MOUNTDIR. Aborting."
         exit 1
-      fi
+      }
     fi
 
     # --- Handle --no-prompt flag ---
@@ -825,98 +828,6 @@ install_backup_cron() {
     fi
 }
 
-configure_backup_drive() {
-    local backup_label="$1" mount_dir="$2" auto_format="$3"
-    local detected_info auto_dev suggested_label
-
-    # Auto-detect suggestion
-    detected_info=$(auto_detect_backup_drive)
-    auto_dev=$(echo "$detected_info" | cut -d'|' -f1)
-    suggested_label=$(echo "$detected_info" | cut -d'|' -f2)
-
-    if [[ "$auto_dev" != "" && "$suggested_label" != "LocalFallback" ]]; then
-        dialog --msgbox "Detected external drive: $auto_dev\nSuggested label: $suggested_label\n(You can override below)" 10 60
-    fi
-
-    local values
-    values=$(dialog --backtitle "Backup Drive Configuration" \
-        --stdout \
-        --title "Configure Backup Drive" \
-        --form "Enter backup drive details:" \
-        15 60 8 \
-        "Mount Point:" 1 1 "$mount_dir" 1 20 40 0 \
-        "Label:"       2 1 "${backup_label:-$suggested_label}" 2 20 40 0 \
-        "Auto-Format? (Y/N):" 3 1 "${auto_format:-N}" 3 20 10 0)
-    local retval=$?
-    if [ $retval -ne 0 ] || [ -z "$values" ]; then
-        return 1
-    fi
-
-    mapfile -t values_array <<< "$values"
-    local new_mount="${values_array[0]}"
-    local new_label="${values_array[1]}"
-    local new_format="${values_array[2]}"
-
-    # Update .env
-    update_env "BACKUP_MOUNTDIR" "$new_mount"
-    update_env "BACKUP_LABEL" "$new_label"
-    update_env "AUTO_FORMAT_BACKUP" "$new_format"
-
-    mkdir -p "$new_mount"
-
-    # Format if requested and needed
-    if [[ "$new_format" == "Y" || "$new_format" == "y" ]]; then
-        dialog --title "WARNING" --yesno "Formatting will ERASE all data on the drive with label '$new_label'. Proceed?" 8 60
-        if [ $? -eq 0 ]; then
-            local dev
-            dev=$(blkid -L "$new_label" 2>/dev/null || echo "$auto_dev")
-            if [[ -n "$dev" ]]; then
-                mkfs.ext4 -F -L "$new_label" "$dev" >> "$BACKUP_LOG_FILE" 2>&1
-                echo "[INFO] Formatted drive $dev with label $new_label" >> "$BACKUP_LOG_FILE"
-            else
-                dialog --title "Error" --msgbox "Drive not found for formatting." 8 50
-                return 1
-            fi
-        else
-            return 0
-        fi
-    fi
-
-    # Mount
-    if ! mountpoint -q "$new_mount"; then
-        if blkid -L "$new_label" >/dev/null 2>&1; then
-            mount -L "$new_label" "$new_mount" || {
-                dialog --title "Error" --msgbox "Failed to mount drive." 8 50
-                return 1
-            }
-            # Idempotent fstab update with nofail and timeout
-            local uuid
-            uuid=$(blkid -o value -s UUID -L "$new_label")
-            if [[ -n "$uuid" ]]; then
-                local fs_type="ext4"
-                local fstab_line="UUID=$uuid $new_mount $fs_type defaults,nofail,x-systemd.device-timeout=10 0 2"
-                
-                # Remove any existing entry for this mount point or UUID (idempotence)
-                sed -i "\|$new_mount|d" /etc/fstab
-                sed -i "\|UUID=$uuid|d" /etc/fstab
-                
-                # Add the new robust entry
-                echo "$fstab_line" >> /etc/fstab
-                
-                # Validate fstab
-                if ! mount -a -t "$fs_type" &>/dev/null; then
-                    dialog --title "Warning" --msgbox "fstab validation failed. Check /etc/fstab manually." 8 60
-                fi
-            fi
-        else
-            dialog --title "Error" --msgbox "Drive with label '$new_label' not found." 8 50
-            return 1
-        fi
-    fi
-
-    dialog --title "Success" --msgbox "Backup drive configured and mounted at $new_mount." 8 50
-}
-
 system_health_check() {
     touch "$HEALTH_LOG_FILE"
     chmod 644 "$HEALTH_LOG_FILE"
@@ -954,7 +865,7 @@ system_health_check() {
         echo "[CHECK] Disk usage:"
         df -h / | tail -1 | awk '{print "  Root: " $5 " used (" $4 " available)"}'
         source "$ENV_FILE" 2>/dev/null || true
-        local backup_dir="${BACKUP_MOUNTDIR:-/mnt/backup}"
+        local backup_dir="$BACKUP_MOUNTDIR"
         if mountpoint -q "$backup_dir"; then
             df -h "$backup_dir" | tail -1 | awk '{print "  Backup: " $5 " used (" $4 " available)"}'
         else
@@ -1651,20 +1562,29 @@ logs_menu() {
 # --- Configure Backup Settings ---
 configure_backup_settings() {
     source "$ENV_FILE" 2>/dev/null || true
-    local current_mount="${BACKUP_MOUNTDIR:-/mnt/backup}"
-    local current_label="${BACKUP_LABEL:-BackupDrive}"
-    local current_format="${AUTO_FORMAT_BACKUP:-N}"
     local current_retention="${BACKUP_RETENTION:-8}"
-    local current_minute="0" current_hour="3" current_dom="*" current_month="*" current_dow="0"  # Default weekly Sunday 03:00
+    local current_minute="${BACKUP_MINUTE:-0}"
+    local current_hour="${BACKUP_HOUR:-3}"
+    local current_dom="${BACKUP_DAY_MONTH:-*}"
+    local current_month="${BACKUP_MONTH:-*}"
+    local current_dow="${BACKUP_DAY_WEEK:-0}"
 
-    # Parse current cron if exists
-    if [[ -f "$CRON_FILE" ]]; then
-        local cron_line=$(grep -v '^#' "$CRON_FILE" | head -1)
-        current_minute=$(echo "$cron_line" | awk '{print $1}')
-        current_hour=$(echo "$cron_line" | awk '{print $2}')
-        current_dom=$(echo "$cron_line" | awk '{print $3}')
-        current_month=$(echo "$cron_line" | awk '{print $4}')
-        current_dow=$(echo "$cron_line" | awk '{print $5}')
+    # Handle backup drive mounting and configuration
+    if mountpoint -q "$BACKUP_MOUNTDIR"; then
+        : # Already mounted, proceed
+    else
+        mount -a >> "$BACKUP_LOG_FILE" 2>&1
+        if mountpoint -q "$BACKUP_MOUNTDIR"; then
+            : # Mounted successfully, proceed
+        else
+            dialog --title "Backup Drive" --yesno "Backup drive not mounted. Would you like to configure it now?" 8 60
+            if [ $? -eq 0 ]; then
+                select_backup_drive || return 0
+            else
+                dialog --title "Warning" --msgbox "Cannot configure backups without a mounted drive." 8 50
+                return 0
+            fi
+        fi
     fi
 
     local values
@@ -1673,37 +1593,32 @@ configure_backup_settings() {
         --title "Configure Backup Settings" \
         --form "Enter backup settings:" \
         18 60 10 \
-        "Mount Point:" 1 1 "$current_mount" 1 20 40 0 \
-        "Label:" 2 1 "$current_label" 2 20 40 0 \
-        "Auto-Format? (Y/N):" 3 1 "$current_format" 3 20 10 0 \
-        "Retention (Max backups to keep):" 4 1 "$current_retention" 4 20 10 0 \
-        "Cron Minute (0-59):" 5 1 "$current_minute" 5 20 10 0 \
-        "Cron Hour (0-23):" 6 1 "$current_hour" 6 20 10 0 \
-        "Cron Day of Month (1-31):" 7 1 "$current_dom" 7 20 10 0 \
-        "Cron Month (1-12):" 8 1 "$current_month" 8 20 10 0 \
-        "Cron Day of Week (0-6):" 9 1 "$current_dow" 9 20 10 0)
+        "Retention (Max backups to keep):" 1 1 "$current_retention" 1 20 10 0 \
+        "Cron Minute (0-59):" 2 1 "$current_minute" 2 20 10 0 \
+        "Cron Hour (0-23):" 3 1 "$current_hour" 3 20 10 0 \
+        "Cron Day of Month (1-31):" 4 1 "$current_dom" 4 20 10 0 \
+        "Cron Month (1-12):" 5 1 "$current_month" 5 20 10 0 \
+        "Cron Day of Week (0-6):" 6 1 "$current_dow" 6 20 10 0)
     local retval=$?
     if [ $retval -ne 0 ] || [ -z "$values" ]; then
         return 0
     fi
 
     mapfile -t values_array <<< "$values"
-    local new_mount="${values_array[0]}"
-    local new_label="${values_array[1]}"
-    local new_format="${values_array[2]}"
-    local new_retention="${values_array[3]}"
-    local new_minute="${values_array[4]}"
-    local new_hour="${values_array[5]}"
-    local new_dom="${values_array[6]}"
-    local new_month="${values_array[7]}"
-    local new_dow="${values_array[8]}"
+    local new_retention="${values_array[0]}"
+    local new_minute="${values_array[1]}"
+    local new_hour="${values_array[2]}"
+    local new_dom="${values_array[3]}"
+    local new_month="${values_array[4]}"
+    local new_dow="${values_array[5]}"
 
-    update_env "BACKUP_MOUNTDIR" "$new_mount"
-    update_env "BACKUP_LABEL" "$new_label"
-    update_env "AUTO_FORMAT_BACKUP" "$new_format"
     update_env "BACKUP_RETENTION" "$new_retention"
+    update_env "BACKUP_MINUTE" "$new_minute"
+    update_env "BACKUP_HOUR" "$new_hour"
+    update_env "BACKUP_DAY_MONTH" "$new_dom"
+    update_env "BACKUP_MONTH" "$new_month"
+    update_env "BACKUP_DAY_WEEK" "$new_dow"
 
-    configure_backup_drive "$new_label" "$new_mount" "$new_format"
     install_backup_cron "$new_minute" "$new_hour" "$new_dom" "$new_month" "$new_dow"
 }
 
