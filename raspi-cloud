@@ -2056,7 +2056,6 @@ EOF
     dialog --title "Success" --msgbox "FTP server setup complete. Connect with user '$ftp_user' and password provided. Uploads to '$upload_dir' will trigger Nextcloud scan." 10 70
 }
 
-# --- Setup Home Assistant ---
 setup_home_assistant() {
     source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found. Run Nextcloud setup first." 8 50; return; }
 
@@ -2069,14 +2068,26 @@ setup_home_assistant() {
     ha_subdomain=$(dialog --stdout --title "Home Assistant Subdomain" --inputbox "Enter subdomain for Home Assistant (e.g., ha):" 8 50 "ha")
     if [ $? -ne 0 ] || [ -z "$ha_subdomain" ]; then return; fi
 
-    local base_domain="${BASE_DOMAIN:-example.com}"
+    local base_domain="${NEXTCLOUD_TRUSTED_DOMAINS#*.}"
     local ha_hostname="$ha_subdomain.$base_domain"
     local ha_trusted_domains="$ha_hostname"
     local ha_port="${HA_PORT:-8123}"
 
-    local zigbee_device
-    zigbee_device=$(dialog --stdout --title "Zigbee Dongle" --inputbox "Enter Zigbee dongle device path (e.g., /dev/ttyACM0; leave blank if none): Run 'ls /dev/tty*' to find it." 10 60)
+    # Improved Zigbee dongle selection: List potential serial devices and allow selection
+    mapfile -t devices < <(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true)
+    local options=("0" "None (skip Zigbee)")
+    for i in "${!devices[@]}"; do
+        options+=("$((i+1))" "${devices[$i]}")
+    done
+
+    local choice
+    choice=$(dialog --stdout --title "Select Zigbee Dongle" --menu "Choose the Zigbee dongle device (if any):" $HEIGHT $WIDTH $CHOICE_HEIGHT "${options[@]}")
     if [ $? -ne 0 ]; then return; fi
+
+    local zigbee_device=""
+    if [ "$choice" != "0" ]; then
+        zigbee_device="${devices[$((choice-1))]}"
+    fi
 
     dialog --title "Confirm" --yesno "Setup Home Assistant on port $ha_port with hostname $ha_hostname? Zigbee: ${zigbee_device:-None}. This will update docker-compose.yml and the Cloudflare Tunnel." 10 70
     if [ $? -ne 0 ]; then return; fi
@@ -2085,41 +2096,34 @@ setup_home_assistant() {
     update_env "HA_PORT" "$ha_port"
     update_env "HA_TRUSTED_DOMAINS" "$ha_trusted_domains"
 
-    # Add HA to docker-compose.yml (idempotent: remove existing HA block first)
-    sed -i '/homeassistant:/,/^$/d' "$COMPOSE_FILE"  # Remove existing HA block
-    cat >> "$COMPOSE_FILE" << EOF
+    # Normalize: Ensure empty line before 'volumes:' if the line before it is not empty
+    awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
 
-  homeassistant:
-    image: homeassistant/home-assistant:stable
-    restart: unless-stopped
-    ports:
-      - "${HA_PORT}:8123"
-    volumes:
-      - ha_config:/config
-    environment:
-      - TZ=Etc/UTC  # Adjust timezone as needed
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8123"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-EOF
+    # Remove existing HA block if present (match indented service name for precision)
+    sed -i '/^  homeassistant:/,/^$/d' "$COMPOSE_FILE"
+
+    # Build the HA service block with \n for newlines
+    local ha_block='  homeassistant:\n    image: homeassistant/home-assistant:stable\n    restart: unless-stopped\n    ports:\n      - "${HA_PORT}:8123"\n    volumes:\n      - ha_config:/config\n    environment:\n      - TZ=Etc/UTC  # Adjust timezone as needed\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "10m"\n        max-file: "3"\n    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost:8123"]\n      interval: 30s\n      timeout: 10s\n      retries: 5'
 
     if [[ -n "$zigbee_device" ]]; then
-        echo "    devices:" >> "$COMPOSE_FILE"
-        echo "      - $zigbee_device:$zigbee_device" >> "$COMPOSE_FILE"
+        ha_block="$ha_block\n    devices:\n      - $zigbee_device:$zigbee_device"
     fi
 
-    cat >> "$COMPOSE_FILE" << EOF
+    ha_block="$ha_block\n"
 
-volumes:
-  ha_config:
-EOF
+    # Interpret \n as actual newlines
+    ha_block=$(echo -e "$ha_block")
+
+    # Insert the block before 'volumes:' using awk
+    awk -v block="$ha_block" '/^volumes:/ { print block } { print }' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
+
+    # Add ha_config to volumes section if not present
+    if ! grep -q "^  ha_config:" "$COMPOSE_FILE"; then
+        sed -i '/^volumes:/a\  ha_config:' "$COMPOSE_FILE"
+    fi
+
+    # Normalize again after insertion to ensure consistent formatting
+    awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
 
     # Update Cloudflare Tunnel config (add ingress rule idempotently)
     local tunnel_config="/etc/cloudflared/config.yml"
@@ -2135,7 +2139,70 @@ EOF
     }
 
     # Deploy and restart
-    docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
+    cd "$REPO_DIR" && docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
+
+    # Define local wait_for_healthy
+    local wait_for_healthy
+    wait_for_healthy() {
+        local service_name="$1"
+        local timeout_seconds="$2"
+        local container_id
+        echo "Waiting for $service_name to become healthy..." >> "$MAIN_LOG_FILE" 2>&1
+        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+        [[ -z "$container_id" ]] && { dialog --title "Error" --msgbox "Could not find container for service '$service_name'." 8 60; return 1; }
+        local end_time=$((SECONDS + timeout_seconds))
+        while [ $SECONDS -lt $end_time ]; do
+            local status
+            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
+            [ "$status" == "healthy" ] && { echo "✅ $service_name is healthy." >> "$MAIN_LOG_FILE" 2>&1; return 0; }
+            sleep 5
+        done
+        dialog --title "Error" --msgbox "$service_name did not become healthy. Check logs: 'docker logs $container_id'." 8 60
+        return 1
+    }
+
+    # Wait for healthy
+    wait_for_healthy "homeassistant" 180 || return 1
+
+    # Configure HA for reverse proxy
+    echo "Configuring Home Assistant for reverse proxy..." >> "$MAIN_LOG_FILE" 2>&1
+
+    local ha_cid
+    ha_cid=$(docker compose -f "$COMPOSE_FILE" ps -q homeassistant)
+
+    # Trigger a request with X-Forwarded-For to generate the log entry if not configured
+    curl -s -o /dev/null -H "X-Forwarded-For: 1.2.3.4" "http://localhost:${ha_port}"
+
+    sleep 2
+
+    # Fetch logs and parse for proxy warning
+    local log_entry
+    log_entry=$(docker logs "$ha_cid" 2>&1 | grep "A request from a reverse proxy was received from" | tail -1)
+
+    if [[ -n "$log_entry" ]]; then
+        local proxy_ip
+        proxy_ip=$(echo "$log_entry" | sed 's/.*from \([0-9.]\+\),.*/\1/')
+        echo "Detected proxy IP: $proxy_ip" >> "$MAIN_LOG_FILE" 2>&1
+
+        # Append to configuration.yaml if not already present
+        docker exec "$ha_cid" sh -c '
+            if ! grep -q "use_x_forwarded_for:" /config/configuration.yaml; then
+                echo "
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - '"$proxy_ip"'
+" >> /config/configuration.yaml
+            fi
+        '
+
+        # Restart HA to apply changes
+        docker compose -f "$COMPOSE_FILE" restart homeassistant
+        wait_for_healthy "homeassistant" 180 || return 1
+    else
+        echo "No proxy warning found; assuming already configured." >> "$MAIN_LOG_FILE" 2>&1
+    fi
+
     systemctl restart cloudflared
 
     dialog --title "Success" --msgbox "Home Assistant setup complete. Access at https://$ha_hostname. Initial setup may take a few minutes. If using Zigbee, configure in HA integrations." 10 70
