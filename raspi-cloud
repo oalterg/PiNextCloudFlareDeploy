@@ -14,6 +14,7 @@ FLASH_LOG_FILE="$LOG_DIR/flash_to_drive.log"
 ENV_FILE="$REPO_DIR/.env"
 COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
 CRON_FILE="/etc/cron.d/nextcloud-backup"
+NEXTCLOUD_CRON_FILE="/etc/cron.d/nextcloud-cron"
 HEALTH_LOG_FILE="$LOG_DIR/health_check.log"
 HEIGHT=20
 WIDTH=70
@@ -916,6 +917,7 @@ maintenance_menu() {
             3 "Expand Filesystem with LVM" \
             4 "Configure Watchdog" \
             5 "Disable Wireless (WiFi/Bluetooth)" \
+            6 "Setup Nextcloud Cronjob" \
             0 "Back to Main Menu")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
@@ -928,6 +930,7 @@ maintenance_menu() {
             3) lvm_storage_extension ;;
             4) configure_watchdog ;;
             5) disable_wireless ;;
+            6) setup_nextcloud_cron ;;
         esac
         reset_terminal  # Clean after actions
     done
@@ -1438,6 +1441,38 @@ configure_watchdog() {
     else
         dialog --title "Error" --msgbox "Watchdog configuration failed. Check log at $log_file." 8 60
     fi
+}
+
+# --- Setup Nextcloud Cronjob ---
+setup_nextcloud_cron() {
+    if ! is_stack_running; then
+        dialog --title "Error" --msgbox "Nextcloud stack is not running." 8 50
+        return 1
+    fi
+
+    local nc_cid=$(get_nc_cid)
+    if [[ -z "$nc_cid" ]]; then
+        dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
+        return 1
+    fi
+
+    local current_mode=$(docker exec -u www-data "$nc_cid" php occ config:app:get core backgroundjobs_mode 2>/dev/null || echo "unknown")
+    if [[ "$current_mode" == "cron" ]]; then
+        dialog --title "Info" --yesno "Background jobs are already set to cron. Reconfigure cron job anyway?" 8 60
+        if [ $? -ne 0 ]; then return 0; fi
+    else
+        dialog --title "Confirm" --yesno "Set background jobs to cron and install system cron job?" 8 60
+        if [ $? -ne 0 ]; then return 0; fi
+        if ! docker exec -u www-data "$nc_cid" php occ background:cron; then
+            dialog --title "Error" --msgbox "Failed to set background mode to cron." 8 50
+            return 1
+        fi
+    fi
+
+    local cron_content="*/5 * * * * root docker exec -u www-data \$(docker compose -f \"$COMPOSE_FILE\" ps -q nextcloud) php cron.php > /dev/null 2>&1"
+    echo "$cron_content" > "$NEXTCLOUD_CRON_FILE"
+    chmod 644 "$NEXTCLOUD_CRON_FILE"
+    dialog --title "Success" --msgbox "Nextcloud cron job setup complete." 8 40
 }
 
 # --- Disable Wireless ---
