@@ -12,6 +12,7 @@ RESTORE_LOG_FILE="$LOG_DIR/restore.log"
 LVM_LOG_FILE="$LOG_DIR/lvm_migration.log"
 FLASH_LOG_FILE="$LOG_DIR/flash_to_drive.log"
 ENV_FILE="$REPO_DIR/.env"
+ENV_TEMPLATE="$REPO_DIR/.env.template"
 COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
 CRON_FILE="/etc/cron.d/nextcloud-backup"
 NEXTCLOUD_CRON_FILE="/etc/cron.d/nextcloud-cron"
@@ -219,6 +220,24 @@ reset_terminal() {
     stty sane 2>/dev/null || true
 }
 
+wait_for_healthy() {
+    local service_name="$1"
+    local timeout_seconds="$2"
+    local container_id
+    echo "Waiting for $service_name to become healthy..."
+    container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+    [[ -z "$container_id" ]] && { echo "Could not find container for service '$service_name'."; return 1; }
+    local end_time=$((SECONDS + timeout_seconds))
+    while [ $SECONDS -lt $end_time ]; do
+        local status
+        status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
+        [ "$status" == "healthy" ] && { echo "✅ $service_name is healthy."; return 0; }
+        sleep 5
+    done
+    echo "❌ $service_name did not become healthy." >&2
+    return 1
+}
+
 # --- Maintenance Mode Helpers ---
 
 # Sets maintenance mode.
@@ -349,180 +368,139 @@ select_backup_drive() {
     return 0
 }
 
-# --- Integrated Setup Function (from setup script) ---
-setup() {
-    echo "--- setup script started ---"
-
-    set -euo pipefail
-
-    # --- Constants ---
-    readonly REPO_DIR="/opt/raspi-nextcloud-setup"
-    readonly ENV_FILE="$REPO_DIR/.env"
-    readonly ENV_TEMPLATE="$REPO_DIR/.env.template"
-    readonly COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
-    readonly LOCK_FILE="/var/run/raspi-nextcloud-setup.lock"
-    readonly REQUIRED_CMDS=("curl" "git" "jq" "parted" "lsblk" "blkid" "docker" "cloudflared" "gpg")
-
-    # --- Helper Functions ---
-    die() { echo "[ERROR] $1" >&2; exit 1; }
-
-    wait_for_healthy() {
-        local service_name="$1"
-        local timeout_seconds="$2"
-        local container_id
-        echo "Waiting for $service_name to become healthy..."
-        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
-        [[ -z "$container_id" ]] && die "Could not find container for service '$service_name'."
-        local end_time=$((SECONDS + timeout_seconds))
-        while [ $SECONDS -lt $end_time ]; do
-            local status
-            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
-            [ "$status" == "healthy" ] && { echo "✅ $service_name is healthy."; return 0; }
-            sleep 5
-        done
-        die "$service_name did not become healthy. Check logs: 'docker logs $container_id'."
-    }
-
-    # --- Main Logic ---
-    preflight_checks() {
-        echo "[*] Running pre-flight checks..."
-        [[ $EUID -ne 0 ]] && die "This script must be run as root."
-
-        if [[ -z "${SUDO_USER-}" ]]; then
-            die "Could not determine the original user. Please run with 'sudo' (e.g., 'sudo raspi-cloud'), not via 'sudo su' or a root shell."
-        fi
-
-        for cmd in "${REQUIRED_CMDS[@]}"; do
-            if ! command -v "$cmd" &>/dev/null; then
-                [[ "$cmd" == "curl" || "$cmd" == "git" ]] && die "Required command '$cmd' is not installed."
-            fi
-        done
-        cd "$REPO_DIR"
-        USER_HOME=$(eval echo "~$SUDO_USER")
-        [[ -d "$USER_HOME" ]] || die "Could not determine home directory for user '$SUDO_USER'."
-    }
-
-    install_dependencies() {
-        echo "[1/10] Installing system dependencies..."
-        apt-get install -y ca-certificates curl gnupg lsb-release cron jq moreutils parted gpg
-
-        # Docker setup (idempotent)
-        if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
-            mkdir -p /etc/apt/keyrings
-            curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-            apt-get update -y
-        fi
-        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-
-        # Ensure Docker is running
-        systemctl enable --now docker
-        if ! systemctl is-active --quiet docker; then
-            die "Docker failed to start. Check systemctl status docker."
-        fi
-        if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
-            mkdir -p --mode=0755 /usr/share/keyrings
-            curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg
-            echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" > /etc/apt/sources.list.d/cloudflared.list
-            apt-get update -y
-        fi
-        apt-get install -y cloudflared
-    }
-
-    gather_config_from_env() {
-        echo "[2/10] Gathering configuration from environment..."
-        : "${NEXTCLOUD_ADMIN_PASSWORD:?}" "${MYSQL_ROOT_PASSWORD:?}" "${MYSQL_PASSWORD:?}" "${BASE_DOMAIN:?}"
-        SUBDOMAIN=${SUBDOMAIN:-nextcloud}
-        CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
-        NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
-        NEXTCLOUD_ADMIN_USER="admin"
-        MYSQL_USER="nextcloud_user"
-        MYSQL_DATABASE="nextcloud"
-        USER_HOME=$(eval echo "~$SUDO_USER")
-        NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
-        NEXTCLOUD_PORT="8080"
-        BACKUP_RETENTION=8
-        # New: Trusted proxies from env or default
-        TRUSTED_PROXIES_0="${TRUSTED_PROXIES_0:-172.18.0.1}"
-        TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-127.0.0.1}"
-    }
-
-    generate_env_file() {
-        echo "[4/10] Generating .env configuration file..."
-        [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
-
-        if [[ ! -f "$ENV_FILE" ]]; then
-            cp "$ENV_TEMPLATE" "$ENV_FILE"
-        fi
-
-        update_env "NEXTCLOUD_ADMIN_USER" "$NEXTCLOUD_ADMIN_USER"
-        update_env "NEXTCLOUD_ADMIN_PASSWORD" "$NEXTCLOUD_ADMIN_PASSWORD"
-        update_env "NEXTCLOUD_TRUSTED_DOMAINS" "$NEXTCLOUD_TRUSTED_DOMAINS"
-        update_env "NEXTCLOUD_PORT" "$NEXTCLOUD_PORT"
-        update_env "MYSQL_ROOT_PASSWORD" "$MYSQL_ROOT_PASSWORD"
-        update_env "MYSQL_DATABASE" "$MYSQL_DATABASE"
-        update_env "MYSQL_USER" "$MYSQL_USER"
-        update_env "MYSQL_PASSWORD" "$MYSQL_PASSWORD"
-        update_env "NEXTCLOUD_DATA_DIR" "$NEXTCLOUD_DATA_DIR"
-        update_env "BACKUP_RETENTION" "$BACKUP_RETENTION"
-        update_env "CF_TUNNEL_ID" "$CF_TUNNEL_ID"
-        update_env "TRUSTED_PROXIES_0" "$TRUSTED_PROXIES_0"
-        update_env "TRUSTED_PROXIES_1" "$TRUSTED_PROXIES_1"
-
-        # Validate key vars
-        grep -q "NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD" "$ENV_FILE" || die "Failed to update .env (admin password)."
-        grep -q "CF_TUNNEL_ID=$CF_TUNNEL_ID" "$ENV_FILE" || die "Failed to update .env (tunnel ID)."
-
-        chmod 600 "$ENV_FILE"
-    }
-
-    deploy_docker_stack() {
-        echo "[5/10] Deploying Docker stack, may take a while..."
-        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
-        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
-        wait_for_healthy "db" 120
-        wait_for_healthy "nextcloud" 600
-    }
-
-    configure_nextcloud_https() {
-        echo "[6/10] Applying reverse proxy HTTPS configuration..."
-        local NC_CID
-        NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
-        [[ -z "$NC_CID" ]] && die "Nextcloud container not ready."
-
-        docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || die "Failed to set overwriteprotocol."
-        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || die "Failed to set trusted_proxies 0."
-        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
-        docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
-        echo "Restarting Nextcloud service..."
-        docker compose -f "$COMPOSE_FILE" restart nextcloud
-        wait_for_healthy "nextcloud" 120
-    }
-
-    validate_setup() {
-        echo "[10/10] Validating setup..."
-        sleep 10
-        if curl -f -k "https://$CF_HOSTNAME/status.php" >/dev/null 2>&1; then
-            echo "✅ Nextcloud is accessible at: https://$CF_HOSTNAME"
-        else
-            echo "⚠️ Setup complete, but accessibility check failed. Check Cloudflare tunnel and firewall."
-        fi
-    }
-
-    # --- Function Entry (replaces original main) ---
-    exec 200>"$LOCK_FILE"
-    flock -n 200 || die "Setup script is already running."
-    trap 'rm -f "$LOCK_FILE"; echo "Lock cleaned up." >&2' EXIT
+# --- Installation Helper Functions ---
+preflight_checks() {
+    echo "[*] Running pre-flight checks..."
+    [[ $EUID -ne 0 ]] && { dialog --title "Error" --msgbox "This script must be run as root." 8 60; exit 1; }
     
-    preflight_checks
-    install_dependencies
-    gather_config_from_env
-    generate_env_file
-    deploy_docker_stack
-    configure_nextcloud_https
-    validate_setup
+    if [[ -z "${SUDO_USER-}" ]]; then
+        echo "Could not determine the original user. Please run with 'sudo' (e.g., 'sudo raspi-cloud'), not via 'sudo su' or a root shell." >&2
+        exit 1
+    fi
+    
+    for cmd in "${REQUIRED_CMDS[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            [[ "$cmd" == "curl" || "$cmd" == "git" ]] && die "Required command '$cmd' is not installed."
+        fi
+    done
+    cd "$REPO_DIR"
+    USER_HOME=$(eval echo "~$SUDO_USER")
+    [[ -d "$USER_HOME" ]] || die "Could not determine home directory for user '$SUDO_USER'."
+}
+    # --- Helper Functions ---
+die() { echo "[ERROR] $1" >&2; exit 1; }
 
-    echo "✅ Installation complete!"
+
+install_dependencies() {
+    echo "[1/10] Installing system dependencies..."
+    apt-get install -y ca-certificates curl gnupg lsb-release cron jq moreutils parted gpg git rsync lvm2 initramfs-tools
+    
+    # Docker setup (idempotent)
+    if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+        apt-get update -y
+    fi
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    
+    # Ensure Docker is running
+    systemctl enable --now docker
+    if ! systemctl is-active --quiet docker; then
+        die "Docker failed to start. Check systemctl status docker."
+    fi
+    if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
+        mkdir -p --mode=0755 /usr/share/keyrings
+        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg
+        # Fix for Debian Trixie/Testing: Fallback to Bookworm if current codename is not supported
+        local release
+        release=$(lsb_release -cs)
+        if [[ "$release" == "trixie" ]]; then release="bookworm"; fi
+        
+        echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $release main" > /etc/apt/sources.list.d/cloudflared.list
+        apt-get update -y
+    fi
+    apt-get install -y cloudflared
+}
+
+gather_config_from_env() {
+    echo "[2/10] Gathering configuration from environment..."
+    : "${NEXTCLOUD_ADMIN_PASSWORD:?}" "${MYSQL_ROOT_PASSWORD:?}" "${MYSQL_PASSWORD:?}" "${BASE_DOMAIN:?}"
+    SUBDOMAIN=${SUBDOMAIN:-nextcloud}
+    CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
+    NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+    NEXTCLOUD_ADMIN_USER="admin"
+    MYSQL_USER="nextcloud_user"
+    MYSQL_DATABASE="nextcloud"
+    USER_HOME=$(eval echo "~$SUDO_USER")
+    NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
+    NEXTCLOUD_PORT="8080"
+    BACKUP_RETENTION=8
+    # New: Trusted proxies from env or default
+    TRUSTED_PROXIES_0="${TRUSTED_PROXIES_0:-172.18.0.1}"
+    TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-127.0.0.1}"
+}
+
+generate_env_file() {
+    echo "[4/10] Generating .env configuration file..."
+    [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
+    
+    if [[ ! -f "$ENV_FILE" ]]; then
+        cp "$ENV_TEMPLATE" "$ENV_FILE"
+    fi
+     
+    update_env "NEXTCLOUD_ADMIN_USER" "$NEXTCLOUD_ADMIN_USER"
+    update_env "NEXTCLOUD_ADMIN_PASSWORD" "$NEXTCLOUD_ADMIN_PASSWORD"
+    update_env "NEXTCLOUD_TRUSTED_DOMAINS" "$NEXTCLOUD_TRUSTED_DOMAINS"
+    update_env "NEXTCLOUD_PORT" "$NEXTCLOUD_PORT"
+    update_env "MYSQL_ROOT_PASSWORD" "$MYSQL_ROOT_PASSWORD"
+    update_env "MYSQL_DATABASE" "$MYSQL_DATABASE"
+    update_env "MYSQL_USER" "$MYSQL_USER"
+    update_env "MYSQL_PASSWORD" "$MYSQL_PASSWORD"
+    update_env "NEXTCLOUD_DATA_DIR" "$NEXTCLOUD_DATA_DIR"
+    update_env "BACKUP_RETENTION" "$BACKUP_RETENTION"
+    update_env "CF_TUNNEL_ID" "$CF_TUNNEL_ID"
+    update_env "TRUSTED_PROXIES_0" "$TRUSTED_PROXIES_0"
+    update_env "TRUSTED_PROXIES_1" "$TRUSTED_PROXIES_1"
+    
+    # Validate key vars
+    grep -q "NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD" "$ENV_FILE" || die "Failed to update .env (admin password)."
+    grep -q "CF_TUNNEL_ID=$CF_TUNNEL_ID" "$ENV_FILE" || die "Failed to update .env (tunnel ID)."
+    
+    chmod 600 "$ENV_FILE"
+}
+ 
+deploy_docker_stack() {
+    echo "[5/10] Deploying Docker stack, may take a while..."
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
+    wait_for_healthy "db" 120 || exit 1
+    wait_for_healthy "nextcloud" 600 || exit 1
+}
+  
+configure_nextcloud_https() {
+    echo "[6/10] Applying reverse proxy HTTPS configuration..."
+    local NC_CID
+    NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
+    [[ -z "$NC_CID" ]] && die "Nextcloud container not ready."
+     
+    docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || die "Failed to set overwriteprotocol."
+    docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || die "Failed to set trusted_proxies 0."
+    docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
+    docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
+    echo "Restarting Nextcloud service..."
+    docker compose -f "$COMPOSE_FILE" restart nextcloud
+    wait_for_healthy "nextcloud" 120 || exit 1
+}
+     
+validate_setup() {
+    echo "[10/10] Validating setup..."
+    sleep 10
+    if curl -f -k "https://$CF_HOSTNAME/status.php" >/dev/null 2>&1; then
+        echo "✅ Nextcloud is accessible at: https://$CF_HOSTNAME"
+    else
+        echo "⚠️ Setup complete, but accessibility check failed. Check Cloudflare tunnel and firewall."
+    fi
 }
 
 backup() {
@@ -659,42 +637,6 @@ restore() {
     # shellcheck disable=SC1090
     source "$ENV_FILE"
 
-    # --- Helper Functions ---
-
-    # Print a formatted error message and exit.
-    die() {
-        echo "[ERROR] $1" >&2
-        exit 1
-    }
-
-    # Helper function to wait for a container to be healthy using `docker inspect`.
-    wait_for_healthy() {
-        local service_name="$1"
-        local timeout_seconds="$2"
-        local container_id
-
-        echo "Waiting for $service_name to become healthy..."
-        
-        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
-        if [[ -z "$container_id" ]]; then
-            die "Could not find container for service '$service_name'. Please check Docker logs."
-        fi
-
-        local end_time=$((SECONDS + timeout_seconds))
-        while [ $SECONDS -lt $end_time ]; do
-            local status
-            # Directly inspect the health status from Docker's metadata.
-            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
-            if [ "$status" == "healthy" ]; then
-                echo "✅ $service_name is healthy."
-                return 0
-            fi
-            sleep 5
-        done
-
-        die "$service_name container did not become healthy in time. Check logs with 'docker logs $container_id'."
-    }
-
     # Validate required variables
     : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
     : "${MYSQL_USER:?}"
@@ -768,7 +710,7 @@ restore() {
     echo "[4/6] Resetting and restoring database..."
     docker compose -f "$REPO_DIR/docker-compose.yml" up -d db
     echo "[*] Waiting for DB container to be healthy..."
-    wait_for_healthy "db" 120
+    wait_for_healthy "db" 120 || exit 1
     DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
     NETWORK_NAME=$(docker inspect "$DB_CID" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
 
@@ -792,7 +734,7 @@ restore() {
 
     echo "[6/6] Verifying services and exiting maintenance mode..."
     echo "[*] Waiting for Nextcloud container to be healthy..."
-    wait_for_healthy "nextcloud" 180
+    wait_for_healthy "nextcloud" 180 || exit 1
     NC_CID_NEW="$(docker compose -f "/opt/raspi-nextcloud-setup/docker-compose.yml" ps -q nextcloud)"
     docker exec -u www-data "$NC_CID_NEW" php occ maintenance:mode --off || true
 
@@ -1022,43 +964,6 @@ get_ssd_drives() {
     lsblk -d -o NAME -n | grep -E '^(nvme[0-9]+n[0-9]+|sd[a-z])$' | sort
 }
 
-ensure_cloudflare_repo() {
-    local log_file="$1"
-    echo "Ensuring Cloudflare repository is correctly configured for the current OS..." >> "$log_file"
-
-    # Idempotently add or update the repository
-    if [ ! -f /usr/share/keyrings/cloudflared.gpg ]; then
-        mkdir -p --mode=0755 /usr/share/keyrings >> "$log_file" 2>&1
-        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg >> "$log_file" 2>&1 || {
-            echo "Warning: Failed to add Cloudflare GPG key." >> "$log_file"
-        }
-    fi
-
-    local current_codename
-    current_codename=$(lsb_release -cs)
-    local repo_file="/etc/apt/sources.list.d/cloudflared.list"
-
-    if [ -f "$repo_file" ]; then
-        # Check and update codename if necessary
-        if ! grep -q "$current_codename" "$repo_file"; then
-            echo "Updating codename in $repo_file to $current_codename..." >> "$log_file"
-            sed -i "s/ [a-z]\+ main/ $current_codename main/" "$repo_file" >> "$log_file" 2>&1 || {
-                echo "Warning: Failed to update codename in $repo_file." >> "$log_file"
-            }
-        else
-            echo "Cloudflare repository codename is already correct." >> "$log_file"
-        fi
-    else
-        # Add the repository if it doesn't exist
-        echo "Adding Cloudflare repository..." >> "$log_file"
-        echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $current_codename main" | tee "$repo_file" >> "$log_file" 2>&1 || {
-            echo "Warning: Failed to add Cloudflare repository." >> "$log_file"
-        }
-    fi
-
-    # Note: apt update should be called after this function if needed
-}
-
 # New: Flash OS to NVMe and Switch Boot (For Fresh SD to NVMe)
 flash_to_nvme() {
     local root_dev
@@ -1100,9 +1005,7 @@ flash_to_nvme() {
     (
         echo "=== Flash to $target_name Started at $(date) ===" >> "$FLASH_LOG_FILE"
 
-        ensure_cloudflare_repo "$FLASH_LOG_FILE"
-        apt update >> "$FLASH_LOG_FILE" 2>&1 || die "apt update failed."
-        apt install -y git rsync >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+        install_dependencies >> "$FLASH_LOG_FILE" 2>&1        
         git clone https://github.com/geerlingguy/rpi-clone.git /tmp/rpi-clone >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to clone rpi-clone."
         cd /tmp/rpi-clone
         sudo cp rpi-clone rpi-clone-setup /usr/local/bin >> "$FLASH_LOG_FILE" 2>&1 || die "Failed to copy rpi-clone scripts."
@@ -1172,10 +1075,8 @@ lvm_storage_extension() {
             [[ -z "$other_drive" ]] && die "Could not determine the other drive for initramfs preparation."
 
             echo "Current root drive: $current_root_drive. The other drive is: $other_drive." >> "$LVM_LOG_FILE"
+            install_dependencies >> "$LVM_LOG_FILE" 2>&1
 
-            ensure_cloudflare_repo "$LVM_LOG_FILE"
-            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
-            apt install -y lvm2 initramfs-tools rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
             sed -i 's/^MODULES=.*/MODULES=most/' /etc/initramfs-tools/initramfs.conf
             # Add required modules for LVM on NVMe/USB
             cat <<EOF >> /etc/initramfs-tools/modules
@@ -1242,9 +1143,7 @@ EOF
             original_root_partuuid=$(blkid -o value -s PARTUUID "/dev/${source_drive}${source_suffix}2")
             [[ -z "$original_root_partuuid" ]] && die "Could not determine PARTUUID of source drive /dev/${source_drive}${source_suffix}2."
 
-            ensure_cloudflare_repo "$LVM_LOG_FILE"
-            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
-            apt install -y lvm2 rsync parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install dependencies."
+            install_dependencies >> "$LVM_LOG_FILE" 2>&1            
             
             echo "Setting up LVM on target drive $target_drive..." >> "$LVM_LOG_FILE"
             # Clean up and create LVM on the target drive
@@ -1300,9 +1199,7 @@ EOF
             [[ -z "$add_dev" ]] && { echo "No suitable device found to add to VG. Skipping Phase 3." >> "$LVM_LOG_FILE"; return 0; }
             echo "Device to add to LVM: $add_dev" >> "$LVM_LOG_FILE"
 
-            ensure_cloudflare_repo "$LVM_LOG_FILE"
-            apt update >> "$LVM_LOG_FILE" 2>&1 || die "apt update failed."
-            apt install -y lvm2 parted >> "$LVM_LOG_FILE" 2>&1 || die "Failed to install lvm2."
+            install_dependencies >> "$LVM_LOG_FILE" 2>&1
             
             echo "Wiping and adding $add_dev to volume group..." >> "$LVM_LOG_FILE"
             umount "$add_dev" 2>/dev/null || true
@@ -2176,28 +2073,8 @@ setup_home_assistant() {
     # Deploy and restart
     cd "$REPO_DIR" && docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
 
-    # Define local wait_for_healthy
-    local wait_for_healthy
-    wait_for_healthy() {
-        local service_name="$1"
-        local timeout_seconds="$2"
-        local container_id
-        echo "Waiting for $service_name to become healthy..." >> "$MAIN_LOG_FILE" 2>&1
-        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
-        [[ -z "$container_id" ]] && { dialog --title "Error" --msgbox "Could not find container for service '$service_name'." 8 60; return 1; }
-        local end_time=$((SECONDS + timeout_seconds))
-        while [ $SECONDS -lt $end_time ]; do
-            local status
-            status=$(docker inspect --format="{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$container_id" 2>/dev/null || echo "inspecting")
-            [ "$status" == "healthy" ] && { echo "✅ $service_name is healthy." >> "$MAIN_LOG_FILE" 2>&1; return 0; }
-            sleep 5
-        done
-        dialog --title "Error" --msgbox "$service_name did not become healthy. Check logs: 'docker logs $container_id'." 8 60
-        return 1
-    }
-
     # Wait for healthy
-    wait_for_healthy "homeassistant" 180 || return 1
+    wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1 || return 1
 
     # Configure HA for reverse proxy
     echo "Configuring Home Assistant for reverse proxy..." >> "$MAIN_LOG_FILE" 2>&1
@@ -2233,7 +2110,7 @@ http:
 
         # Restart HA to apply changes
         docker compose -f "$COMPOSE_FILE" restart homeassistant
-        wait_for_healthy "homeassistant" 180 || return 1
+        wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1 || return 1
     else
         echo "No proxy warning found; assuming already configured." >> "$MAIN_LOG_FILE" 2>&1
     fi
@@ -2243,67 +2120,196 @@ http:
     dialog --title "Success" --msgbox "Home Assistant setup complete. Access at https://$ha_hostname. Initial setup may take a few minutes. If using Zigbee, configure in HA integrations." 10 70
 }
 
+# --- Setup Pangolin / Newt ---
+setup_pangolin_newt() {
+    source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found. Run Initial Setup first." 8 50; return; }
+
+    dialog --title "Pangolin / Newt Setup" --yesno "This will configure the 'Newt' service to tunnel traffic to a Pangolin server.\n\nYou need your:\n- Pangolin Endpoint\n- Newt ID\n- Newt Secret\n\nProceed?" 15 60
+    if [ $? -ne 0 ]; then return; fi
+
+    # 1. Gather Credentials
+    local values
+    values=$(dialog --backtitle "Pangolin Configuration" \
+        --stdout \
+        --title "Newt Credentials" \
+        --form "Enter values from your Pangolin Dashboard:" \
+        15 60 3 \
+        "Endpoint URL:" 1 1 "${PANGOLIN_ENDPOINT:-https://}" 1 16 60 0 \
+        "Newt ID:"      2 1 "${NEWT_ID:-}" 2 16 60 0 \
+        "Newt Secret:"  3 1 "${NEWT_SECRET:-}" 3 16 60 0)
+    
+    local retval=$?
+    if [ $retval -ne 0 ] || [ -z "$values" ]; then return; fi
+
+    mapfile -t values_array <<< "$values"
+    local p_endpoint="${values_array[0]}"
+    local p_id="${values_array[1]}"
+    local p_secret="${values_array[2]}"
+
+    if [[ -z "$p_id" || -z "$p_secret" ]]; then
+        dialog --title "Error" --msgbox "ID and Secret are required." 8 50
+        return
+    fi
+
+    # 2. Update .env
+    update_env "PANGOLIN_ENDPOINT" "$p_endpoint"
+    update_env "NEWT_ID" "$p_id"
+    update_env "NEWT_SECRET" "$p_secret"
+
+    # 3. Update docker-compose.yml
+    echo "Configuring Newt service in Docker Compose..." >> "$MAIN_LOG_FILE" 2>&1
+    
+    # Safe Removal of existing newt block
+    awk '
+    BEGIN { inside=0 }
+    /^  newt:/ { inside=1; next }
+    inside && /^[a-z]/ { inside=0 }
+    inside && /^  [a-z]/ { inside=0 }
+    inside { next }
+    { print }
+    ' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
+
+    # Ensure clean spacing before volumes
+    awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
+
+    # Construct Newt Block
+    local newt_block='  newt:\n    image: fosrl/newt:latest\n    restart: unless-stopped\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock:ro\n    environment:\n      - PANGOLIN_ENDPOINT=${PANGOLIN_ENDPOINT}\n      - NEWT_ID=${NEWT_ID}\n      - NEWT_SECRET=${NEWT_SECRET}\n'
+    newt_block=$(echo -e "$newt_block")
+
+    # Insert before 'volumes:'
+    awk -v block="$newt_block" '/^volumes:/ { print block } { print }' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
+
+    # 4. Deploy
+    dialog --title "Deploy" --infobox "Deploying Newt service... This may take a moment." 5 50
+    if docker compose -f "$COMPOSE_FILE" up -d newt; then
+        local hints="Newt service deployed successfully!\n\nTo configure in Pangolin Dashboard:\n1. Log in at ${PANGOLIN_ENDPOINT:-your-endpoint}.\n2. Go to 'Sites' > Your Site > 'Resources'.\n3. Add Resource:\n   - Type: HTTP\n   - Name: e.g., 'Nextcloud Tunnel'\n   - Targets: Address 'nextcloud', Port '80' (fallback: Address 'localhost', Port '8080')\n   - Public Routing: Unique subdomain (e.g., pangolin-cloud.yourdomain.com)\n4. Save & test URL.\n\nTips: Ensure DNS points subdomain to Pangolin host. Check Newt logs if issues."
+        if grep -q "homeassistant:" "$COMPOSE_FILE"; then
+            hints+="\n\nFor Home Assistant:\n- Add separate Resource: Address 'homeassistant', Port '8123' (fallback: Address 'localhost', Port '8123')\n- Use unique subdomain (e.g., pangolin-ha.yourdomain.com)."
+        fi
+        
+        dialog --title "Success & Hints" --msgbox "$hints" 25 80
+    else
+        dialog --title "Error" --msgbox "Failed to deploy Newt service. Check logs." 8 50
+        return 1
+    fi
+
+    # 5. Configure Nextcloud for Pangolin
+    if is_stack_running; then
+        local nc_domain
+        nc_domain=$(dialog --stdout --title "Nextcloud Domain" --inputbox "Enter the full domain for Nextcloud via Pangolin (e.g., pangolin-cloud.yourdomain.com):" 8 60)
+        if [ $? -eq 0 ] && [ -n "$nc_domain" ]; then
+            local NC_CID=$(get_nc_cid)
+            if [[ -n "$NC_CID" ]]; then
+                echo "[*] Configuring Nextcloud for Pangolin domain: $nc_domain" >> "$MAIN_LOG_FILE" 2>&1
+                docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 2 --value="$nc_domain" >> "$MAIN_LOG_FILE" 2>&1
+                docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https >> "$MAIN_LOG_FILE" 2>&1
+                docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 2 --value="127.0.0.1" >> "$MAIN_LOG_FILE" 2>&1
+                docker compose -f "$COMPOSE_FILE" restart nextcloud >> "$MAIN_LOG_FILE" 2>&1
+                wait_for_healthy "nextcloud" 120 >> "$MAIN_LOG_FILE" 2>&1 || echo "[WARN] Nextcloud health check failed after config." >> "$MAIN_LOG_FILE"
+                dialog --title "Success" --msgbox "Nextcloud configured for Pangolin. Test access via $nc_domain." 8 60
+            fi
+        fi
+    fi
+
+    # 6. Configure Home Assistant for Pangolin (if present)
+    if grep -q "homeassistant:" "$COMPOSE_FILE"; then
+        local ha_domain
+        ha_domain=$(dialog --stdout --title "Home Assistant Domain" --inputbox "Enter the full domain for Home Assistant via Pangolin (e.g., pangolin-ha.yourdomain.com):" 8 60)
+        if [ $? -eq 0 ] && [ -n "$ha_domain" ]; then
+            local ha_cid=$(docker compose -f "$COMPOSE_FILE" ps -q homeassistant)
+            if [[ -n "$ha_cid" ]]; then
+                echo "[*] Configuring Home Assistant for Pangolin domain: $ha_domain" >> "$MAIN_LOG_FILE" 2>&1
+                
+                # Determine the actual Docker Subnet instead of chasing shifting IPs
+                local net_name
+                net_name=$(docker inspect "$ha_cid" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+                local subnet
+                subnet=$(docker network inspect "$net_name" --format='{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
+
+                if [[ -z "$subnet" ]]; then
+                    echo "[WARN] Could not detect Docker subnet. Falling back to permissive local range." >> "$MAIN_LOG_FILE"
+                    subnet="172.16.0.0/12" # Fallback for standard Docker ranges
+                else
+                    echo "[INFO] Detected Docker Subnet: $subnet. Trusting this range for HA proxies." >> "$MAIN_LOG_FILE"
+                fi
+
+                # Inject logic that handles both fresh installs and existing Cloudflare setups
+                # This explicitly adds the detected subnet to trusted_proxies, regardless of what's already there.
+                docker exec "$ha_cid" sh -c "
+                    CONF='/config/configuration.yaml'
+                    # 1. Check if the subnet is already trusted
+                    if grep -Fq '$subnet' \"\$CONF\"; then
+                        echo 'Subnet already trusted.'
+                    else
+                        # 2. Check if trusted_proxies block exists
+                        if grep -q 'trusted_proxies:' \"\$CONF\"; then
+                            # Append to existing list
+                            sed -i '/trusted_proxies:/a \    - $subnet' \"\$CONF\"
+                        # 3. Check if http block exists but no proxies
+                        elif grep -q '^http:' \"\$CONF\"; then
+                            sed -i '/^http:/a \  use_x_forwarded_for: true\n  trusted_proxies:\n    - $subnet' \"\$CONF\"
+                        # 4. No http block at all
+                        else
+                            echo '
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - $subnet
+' >> \"\$CONF\"
+                        fi
+                    fi
+                " >> "$MAIN_LOG_FILE" 2>&1
+
+                docker compose -f "$COMPOSE_FILE" restart homeassistant >> "$MAIN_LOG_FILE" 2>&1
+                wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1 || echo "[WARN] HA health check failed after config." >> "$MAIN_LOG_FILE"
+                dialog --title "Success" --msgbox "Home Assistant configured for Pangolin. Test access via $ha_domain." 8 60
+            else
+                dialog --title "Warning" --msgbox "Home Assistant container not found; skipping config." 8 50
+            fi
+        fi
+    fi
+}
+
 # --- Main Menu ---
 main_menu() {
     while true; do
-        if $is_sd_boot; then
-            local choice
-            choice=$(dialog --backtitle "Nextcloud Pi Manager (SD Boot)" \
-                --stdout \
-                --title "Main Menu" \
-                --cancel-label "Exit" \
-                --menu "Select an option:" \
-                $HEIGHT $WIDTH $CHOICE_HEIGHT \
-                1 "Flash OS to Drive (NVMe/USB SSD)" \
-                2 "Expand Filesystem with LVM")
-            local retval=$?
-            if [ $retval -ne 0 ]; then
-                clear
-                echo "Exiting."
-                exit 0
-            fi
-
-            case "$choice" in
-                1) flash_to_nvme ;;
-                2) lvm_storage_extension ;;
-            esac
-        else
-            local choice
-            choice=$(dialog --stdout \
-                --backtitle "Raspi Nextcloud TUI" \
-                --title "Main Menu" \
-                --menu "Select an option:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-                1 "Initial Nextcloud+Cloudflare Setup" \
-                2 "Run Backup" \
-                3 "Run Restore" \
-                4 "Configure Backup Settings" \
-                5 "System Health Check" \
-                6 "Maintenance Menu" \
-                7 "View Logs" \
-                8 "Setup FTP Server" \
-                9 "Setup Home Assistant" \
-                0 "Exit")
-            local retval=$?
-            if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
-                clear
-                exit 0
-            fi
-
-            case "$choice" in
-                1) run_initial_setup ;;
-                2) run_backup ;;
-                3) run_restore ;;
-                4) configure_backup_settings ;;
-                5) 
-                    system_health_check
-                    dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
-                    ;;
-                6) maintenance_menu ;;
-                7) logs_menu ;;
-                8) setup_ftp_server ;;
-                9) setup_home_assistant ;;
-            esac
+        local choice
+        choice=$(dialog --stdout \
+            --backtitle "Raspi Nextcloud TUI" \
+            --title "Main Menu" \
+            --menu "Select an option:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+            1 "Initial Nextcloud+Cloudflare Setup" \
+            2 "Run Backup" \
+            3 "Run Restore" \
+            4 "Configure Backup Settings" \
+            5 "System Health Check" \
+            6 "Maintenance Menu" \
+            7 "View Logs" \
+            8 "Setup FTP Server" \
+            9 "Setup Home Assistant" \
+            10 "Setup Pangolin/Newt Tunnel" \
+            0 "Exit")
+        local retval=$?
+        if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
+            clear
+            exit 0
         fi
+         
+        case "$choice" in
+            1) run_initial_setup ;;
+            2) run_backup ;;
+            3) run_restore ;;
+            4) configure_backup_settings ;;
+            5) 
+                system_health_check
+                dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
+                ;;
+            6) maintenance_menu ;;
+            7) logs_menu ;;
+            8) setup_ftp_server ;;
+            9) setup_home_assistant ;;
+            10) setup_pangolin_newt ;;
+        esac
         reset_terminal  # Ensure clean state after actions
     done
 }
