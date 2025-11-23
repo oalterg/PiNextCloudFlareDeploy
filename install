@@ -3,10 +3,15 @@
 
 set -Eeuo pipefail
 
+# --- Configuration ---
 REPO_DIR="/opt/raspi-nextcloud-setup"
+BIN_DIR="/usr/local/sbin"
 LOG_DIR="/var/log/raspi-nextcloud"
 LOG_FILE="$LOG_DIR/bootstrap.log"
 LOCK_FILE="/var/run/raspi-nextcloud-install.lock"
+
+# GitHub Raw Base URL (Replace 'main' with specific tag/branch for stability in production)
+BASE_URL="https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main"
 
 # --- Pre-flight Checks ---
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -29,17 +34,48 @@ if ! command -v apt-get >/dev/null; then
     echo "This script requires a Debian-based OS (using apt-get). Aborting." >&2
     exit 1
 fi
+
+# Quietly update and install curl/dialog if missing
 echo "[1/3] Updating package lists..."
-apt-get update -y
+apt-get update -qq -y
 echo "[1/3] Installing dependencies..."
-apt-get install -y ca-certificates curl dialog
+apt-get install -qq -y ca-certificates curl dialog
 
 # --- Script Management ---
-echo "[2/3] Downloading/updating the main script in /usr/local/sbin..."
+echo "[2/3] Setting up repository at $REPO_DIR..."
 mkdir -p "$REPO_DIR"
-curl -fsSL "https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/raspi-cloud" -o /usr/local/sbin/raspi-cloud
-chmod +x /usr/local/sbin/raspi-cloud
 
-# --- Handoff to TUI Script ---
-echo "[3/3] Handing off to the main TUI script..."
-exec /usr/local/sbin/raspi-cloud
+# Download raspi-cloud (The TUI/Manager)
+echo "      Downloading raspi-cloud..."
+if curl -fsSL "$BASE_URL/raspi-cloud" -o "$REPO_DIR/raspi-cloud"; then
+    chmod +x "$REPO_DIR/raspi-cloud"
+    # Symlink to /usr/local/sbin for global path access
+    ln -sf "$REPO_DIR/raspi-cloud" "$BIN_DIR/raspi-cloud"
+    echo "      raspi-cloud installed to $REPO_DIR and linked to $BIN_DIR."
+else
+    echo "Error: Failed to download raspi-cloud." >&2
+    exit 1
+fi
+
+# Download provision.sh (The Factory/Provisioning script)
+echo "      Downloading provision.sh..."
+if curl -fsSL "$BASE_URL/provision.sh" -o "$REPO_DIR/provision.sh"; then
+    chmod +x "$REPO_DIR/provision.sh"
+    echo "      provision.sh installed to $REPO_DIR."
+else
+    echo "Error: Failed to download provision.sh." >&2
+    exit 1
+fi
+
+# --- Handoff ---
+# Note: In a factory setting, provision.sh is called explicitly. 
+# In a user setting, we might run raspi-cloud directly.
+echo "[3/3] Installation complete."
+echo "      Run 'raspi-cloud' to start the TUI."
+echo "      Run '$REPO_DIR/provision.sh' for factory provisioning."
+
+# If we are running interactively, verify raspi-cloud works
+if [ -t 1 ]; then
+    echo "      Handing off to the main TUI script..."
+    exec raspi-cloud
+fi

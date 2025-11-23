@@ -39,10 +39,6 @@ if ! command -v dialog >/dev/null 2>&1; then
     echo "Error: 'dialog' is required but not installed." >&2
     exit 1
 fi
-if ! command -v docker >/dev/null 2>&1; then
-    echo "Error: 'docker' is required but not installed." >&2
-    exit 1
-fi
 
 mkdir -p "$LOG_DIR"
 
@@ -56,57 +52,32 @@ update_env() {
     fi
 }
 
+die() { echo "[ERROR] $1" >&2; exit 1; }
+
+
 # --- Generate .env.template and docker-compose.yml if not present ---
 generate_env_template() {
     if [[ ! -f "$REPO_DIR/.env.template" ]]; then
         cat > "$REPO_DIR/.env.template" << 'EOF'
 # .env.template
-# This file is a template. A final .env file will be generated during setup.
-
-# === Nextcloud Configuration ===
-# The primary administrator account for Nextcloud.
 NEXTCLOUD_ADMIN_USER=admin
 NEXTCLOUD_ADMIN_PASSWORD=changeme
-
-# Space-separated list of domains Nextcloud will trust.
-# This is set automatically during setup if using Cloudflare.
 NEXTCLOUD_TRUSTED_DOMAINS=cloud.yourdomain.com
-
-# The local port on the Raspberry Pi that maps to Nextcloud's port 80.
 NEXTCLOUD_PORT=8080
-
-# === MariaDB Database Configuration ===
-# IMPORTANT: Change these default passwords for production.
 MYSQL_ROOT_PASSWORD=changeme_root
 MYSQL_DATABASE=nextcloud
 MYSQL_USER=nextcloud_user
 MYSQL_PASSWORD=changeme
-
-# === Directory Configuration ===
-# The host path where Nextcloud user data (files, photos, etc.) is stored.
-# This should be on a drive with sufficient space (e.g., an external SSD).
 NEXTCLOUD_DATA_DIR=/home/user/nextcloud
-
-# === Backup Configuration ===
-# The number of old backup archives to keep.
 BACKUP_RETENTION=8
-# Custom cron schedule fields for backup timing (defaults to weekly on Sunday at 03:00).
-# See 'configure_backup_settings' in raspi-cloud for details.
 BACKUP_MINUTE=0
 BACKUP_HOUR=3
 BACKUP_DAY_MONTH=*
 BACKUP_MONTH=*
 BACKUP_DAY_WEEK=0
-
-# === Cloudflare Tunnel (optional) ===
-# The Tunnel ID created by 'cloudflared'. This is set automatically.
 CF_TUNNEL_ID=
-
-# Trusted Proxies (for reverse proxy config)
 TRUSTED_PROXIES_0=172.18.0.1
 TRUSTED_PROXIES_1=127.0.0.1
-
-# === Home Assistant Configuration (optional) ===
 HA_PORT=8123
 HA_TRUSTED_DOMAINS=
 EOF
@@ -118,7 +89,7 @@ generate_docker_compose() {
         cat > "$COMPOSE_FILE" << 'EOF'
 services:
   nextcloud:
-    image: nextcloud:31-apache # Pinned to a specific major version for stability
+    image: nextcloud:31-apache
     restart: unless-stopped
     ports:
       - "${NEXTCLOUD_PORT}:80"
@@ -135,7 +106,7 @@ services:
       - MYSQL_HOST=db
     depends_on:
       db:
-        condition: service_healthy # Waits for the DB to be ready
+        condition: service_healthy
     logging:
       driver: "json-file"
       options:
@@ -146,14 +117,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-    # deploy: # Optional: Uncomment to limit resources on a Swarm cluster or with 'docker compose --with-deploy'
-    #   resources:
-    #     limits:
-    #       cpus: '1.0'
-    #       memory: 1G
 
   db:
-    image: mariadb:11.2 # Pinned to a specific major version
+    image: mariadb:11.2
     restart: unless-stopped
     command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
     volumes:
@@ -173,11 +139,6 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: '1.0'
-    #       memory: 1.5G
 
 volumes:
   nextcloud_html:
@@ -191,7 +152,7 @@ generate_env_template
 generate_docker_compose
 
 # --- Helper Functions ---
-die() {
+die_tui() {
     dialog --title "Error" --msgbox "$1" 8 60
     exit 1
 }
@@ -225,8 +186,18 @@ wait_for_healthy() {
     local timeout_seconds="$2"
     local container_id
     echo "Waiting for $service_name to become healthy..."
-    container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+    
+    # Retry loop to find container ID (crucial during startup when containers are just created)
+    local retries=10
+    while [[ $retries -gt 0 ]]; do
+        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+        if [[ -n "$container_id" ]]; then break; fi
+        sleep 2
+        ((retries--))
+    done
+
     [[ -z "$container_id" ]] && { echo "Could not find container for service '$service_name'."; return 1; }
+    
     local end_time=$((SECONDS + timeout_seconds))
     while [ $SECONDS -lt $end_time ]; do
         local status
@@ -373,23 +344,11 @@ preflight_checks() {
     echo "[*] Running pre-flight checks..."
     [[ $EUID -ne 0 ]] && { dialog --title "Error" --msgbox "This script must be run as root." 8 60; exit 1; }
     
-    if [[ -z "${SUDO_USER-}" ]]; then
-        echo "Could not determine the original user. Please run with 'sudo' (e.g., 'sudo raspi-cloud'), not via 'sudo su' or a root shell." >&2
-        exit 1
+    if [[ -z "${SUDO_USER-}" && -z "${HEADLESS_MODE-}" ]]; then
+        # In headless mode we might run as root directly via systemd
+        echo "Could not determine SUDO_USER, assuming root context is intentional for headless/setup."
     fi
-    
-    for cmd in "${REQUIRED_CMDS[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            [[ "$cmd" == "curl" || "$cmd" == "git" ]] && die "Required command '$cmd' is not installed."
-        fi
-    done
-    cd "$REPO_DIR"
-    USER_HOME=$(eval echo "~$SUDO_USER")
-    [[ -d "$USER_HOME" ]] || die "Could not determine home directory for user '$SUDO_USER'."
 }
-    # --- Helper Functions ---
-die() { echo "[ERROR] $1" >&2; exit 1; }
-
 
 install_dependencies() {
     echo "[1/10] Installing system dependencies..."
@@ -404,19 +363,15 @@ install_dependencies() {
     fi
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
     
-    # Ensure Docker is running
     systemctl enable --now docker
-    if ! systemctl is-active --quiet docker; then
-        die "Docker failed to start. Check systemctl status docker."
-    fi
+    
     if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
         mkdir -p --mode=0755 /usr/share/keyrings
         curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg
         # Fix for Debian Trixie/Testing: Fallback to Bookworm if current codename is not supported
         local release
         release=$(lsb_release -cs)
-        if [[ "$release" == "trixie" ]]; then release="bookworm"; fi
-        
+        [[ "$release" == "trixie" ]] && release="bookworm"
         echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $release main" > /etc/apt/sources.list.d/cloudflared.list
         apt-get update -y
     fi
@@ -425,18 +380,21 @@ install_dependencies() {
 
 gather_config_from_env() {
     echo "[2/10] Gathering configuration from environment..."
-    : "${NEXTCLOUD_ADMIN_PASSWORD:?}" "${MYSQL_ROOT_PASSWORD:?}" "${MYSQL_PASSWORD:?}" "${BASE_DOMAIN:?}"
-    SUBDOMAIN=${SUBDOMAIN:-nextcloud}
-    CF_HOSTNAME="$SUBDOMAIN.$BASE_DOMAIN"
-    NEXTCLOUD_TRUSTED_DOMAINS="$CF_HOSTNAME"
+    # Only enforce variables that MUST be present. In headless, these come from .env
+    : "${NEXTCLOUD_ADMIN_PASSWORD:?}" "${MYSQL_ROOT_PASSWORD:?}" "${MYSQL_PASSWORD:?}"
     NEXTCLOUD_ADMIN_USER="admin"
     MYSQL_USER="nextcloud_user"
     MYSQL_DATABASE="nextcloud"
-    USER_HOME=$(eval echo "~$SUDO_USER")
-    NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
+    # HEADLESS_MODE handling for HOME dir
+    if [[ -n "${HEADLESS_MODE-}" ]]; then
+         # In headless, use /home/admin or explicit var
+         NEXTCLOUD_DATA_DIR="${NEXTCLOUD_DATA_DIR:-/home/admin/nextcloud}"
+    else
+         USER_HOME=$(eval echo "~$SUDO_USER")
+         NEXTCLOUD_DATA_DIR="$USER_HOME/nextcloud"
+    fi
     NEXTCLOUD_PORT="8080"
     BACKUP_RETENTION=8
-    # New: Trusted proxies from env or default
     TRUSTED_PROXIES_0="${TRUSTED_PROXIES_0:-172.18.0.1}"
     TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-127.0.0.1}"
 }
@@ -445,13 +403,11 @@ generate_env_file() {
     echo "[4/10] Generating .env configuration file..."
     [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
     
-    if [[ ! -f "$ENV_FILE" ]]; then
-        cp "$ENV_TEMPLATE" "$ENV_FILE"
-    fi
+    if [[ ! -f "$ENV_FILE" ]]; then cp "$ENV_TEMPLATE" "$ENV_FILE"; fi
      
     update_env "NEXTCLOUD_ADMIN_USER" "$NEXTCLOUD_ADMIN_USER"
     update_env "NEXTCLOUD_ADMIN_PASSWORD" "$NEXTCLOUD_ADMIN_PASSWORD"
-    update_env "NEXTCLOUD_TRUSTED_DOMAINS" "$NEXTCLOUD_TRUSTED_DOMAINS"
+    update_env "NEXTCLOUD_TRUSTED_DOMAINS" "${NEXTCLOUD_TRUSTED_DOMAINS:-}"
     update_env "NEXTCLOUD_PORT" "$NEXTCLOUD_PORT"
     update_env "MYSQL_ROOT_PASSWORD" "$MYSQL_ROOT_PASSWORD"
     update_env "MYSQL_DATABASE" "$MYSQL_DATABASE"
@@ -459,25 +415,28 @@ generate_env_file() {
     update_env "MYSQL_PASSWORD" "$MYSQL_PASSWORD"
     update_env "NEXTCLOUD_DATA_DIR" "$NEXTCLOUD_DATA_DIR"
     update_env "BACKUP_RETENTION" "$BACKUP_RETENTION"
-    update_env "CF_TUNNEL_ID" "$CF_TUNNEL_ID"
     update_env "TRUSTED_PROXIES_0" "$TRUSTED_PROXIES_0"
     update_env "TRUSTED_PROXIES_1" "$TRUSTED_PROXIES_1"
-    
-    # Validate key vars
-    grep -q "NEXTCLOUD_ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD" "$ENV_FILE" || die "Failed to update .env (admin password)."
-    grep -q "CF_TUNNEL_ID=$CF_TUNNEL_ID" "$ENV_FILE" || die "Failed to update .env (tunnel ID)."
     
     chmod 600 "$ENV_FILE"
 }
  
 deploy_docker_stack() {
-    echo "[5/10] Deploying Docker stack, may take a while..."
+    echo "[5/10] Deploying Docker stack..."
+    
+    # Ensure docker is running (if just installed)
+    if ! systemctl is-active --quiet docker; then
+        echo "Waiting for Docker service..."
+        systemctl start docker
+        sleep 5
+    fi
+
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
     wait_for_healthy "db" 120 || exit 1
     wait_for_healthy "nextcloud" 600 || exit 1
 }
-  
+
 configure_nextcloud_https() {
     echo "[6/10] Applying reverse proxy HTTPS configuration..."
     local NC_CID
@@ -742,20 +701,6 @@ restore() {
     echo "=== Restore Complete From: $BACKUP_FILE ==="
 }
 
-# --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
-if [ $# -gt 0 ]; then
-    case "$1" in
-        --backup)
-            backup
-            exit $?
-            ;;
-        --restore)
-            shift
-            restore "$@"
-            exit $?
-            ;;
-    esac
-fi
 
 install_backup_cron() {
     local minute="$1" hour="$2" day_of_month="$3" month="$4" day_of_week="$5"
@@ -1988,6 +1933,76 @@ EOF
     dialog --title "Success" --msgbox "FTP server setup complete. Connect with user '$ftp_user' and password provided. Uploads to '$upload_dir' will trigger Nextcloud scan." 10 70
 }
 
+# Injects HA service block into docker-compose.yml
+# usage: inject_home_assistant_service <port> <zigbee_device_path|empty>
+inject_home_assistant_service() {
+    local ha_port="$1"
+    local zigbee_device="$2"
+
+    echo "[INFO] Injecting Home Assistant service into compose file..."
+
+    # Normalize: Ensure empty line before 'volumes:' if the line before it is not empty
+    awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
+
+    # Remove existing HA block if present
+    sed -i '/^  homeassistant:/,/^$/d' "$COMPOSE_FILE"
+
+    # Build the HA service block
+    local ha_block='  homeassistant:\n    image: homeassistant/home-assistant:stable\n    restart: unless-stopped\n    ports:\n      - "${HA_PORT}:8123"\n    volumes:\n      - ha_config:/config\n    environment:\n      - TZ=Etc/UTC\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "10m"\n        max-file: "3"\n    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost:8123"]\n      interval: 30s\n      timeout: 10s\n      retries: 5'
+
+    if [[ -n "$zigbee_device" ]]; then
+        ha_block="$ha_block\n    devices:\n      - $zigbee_device:$zigbee_device"
+    fi
+
+    ha_block="$ha_block\n"
+    ha_block=$(echo -e "$ha_block")
+
+    # Insert the block before 'volumes:'
+    awk -v block="$ha_block" '/^volumes:/ { print block } { print }' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
+
+    # Add ha_config to volumes section if not present
+    if ! grep -q "^  ha_config:" "$COMPOSE_FILE"; then
+        sed -i '/^volumes:/a\  ha_config:' "$COMPOSE_FILE"
+    fi
+
+    # Normalize again
+    awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
+}
+
+# Configures Trusted Proxies in Home Assistant configuration.yaml
+# usage: configure_ha_proxy_settings <subnet_cidr> <ha_container_id>
+configure_ha_proxy_settings() {
+    local subnet="$1"
+    local cid="$2"
+
+    echo "[INFO] Configuring Home Assistant trusted proxies for subnet: $subnet"
+
+    docker exec "$cid" sh -c "
+        CONF='/config/configuration.yaml'
+        # 1. Check if the subnet is already trusted
+        if grep -Fq '$subnet' \"\$CONF\"; then
+            echo 'Subnet already trusted.'
+        else
+            # 2. Check if trusted_proxies block exists
+            if grep -q 'trusted_proxies:' \"\$CONF\"; then
+                # Append to existing list
+                sed -i '/trusted_proxies:/a \    - $subnet' \"\$CONF\"
+            # 3. Check if http block exists but no proxies
+            elif grep -q '^http:' \"\$CONF\"; then
+                sed -i '/^http:/a \  use_x_forwarded_for: true\n  trusted_proxies:\n    - $subnet' \"\$CONF\"
+            # 4. No http block at all
+            else
+                echo '
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - $subnet
+' >> \"\$CONF\"
+            fi
+        fi
+    "
+}
+
 setup_home_assistant() {
     source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found. Run Nextcloud setup first." 8 50; return; }
 
@@ -2005,7 +2020,7 @@ setup_home_assistant() {
     local ha_trusted_domains="$ha_hostname"
     local ha_port="${HA_PORT:-8123}"
 
-    # Improved Zigbee dongle selection: List potential serial devices and allow selection
+    # Zigbee dongle selection
     mapfile -t devices < <(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true)
     local options=("0" "None (skip Zigbee)")
     for i in "${!devices[@]}"; do
@@ -2021,254 +2036,167 @@ setup_home_assistant() {
         zigbee_device="${devices[$((choice-1))]}"
     fi
 
-    dialog --title "Confirm" --yesno "Setup Home Assistant on port $ha_port with hostname $ha_hostname? Zigbee: ${zigbee_device:-None}. This will update docker-compose.yml and the Cloudflare Tunnel." 10 70
+    dialog --title "Confirm" --yesno "Setup Home Assistant on port $ha_port with hostname $ha_hostname? Zigbee: ${zigbee_device:-None}." 10 70
     if [ $? -ne 0 ]; then return; fi
 
     # Update .env
     update_env "HA_PORT" "$ha_port"
     update_env "HA_TRUSTED_DOMAINS" "$ha_trusted_domains"
 
-    # Normalize: Ensure empty line before 'volumes:' if the line before it is not empty
-    awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
+    # Reuse Helper Function to modify Compose
+    inject_home_assistant_service "$ha_port" "$zigbee_device"
 
-    # Remove existing HA block if present (match indented service name for precision)
-    sed -i '/^  homeassistant:/,/^$/d' "$COMPOSE_FILE"
-
-    # Build the HA service block with \n for newlines
-    local ha_block='  homeassistant:\n    image: homeassistant/home-assistant:stable\n    restart: unless-stopped\n    ports:\n      - "${HA_PORT}:8123"\n    volumes:\n      - ha_config:/config\n    environment:\n      - TZ=Etc/UTC  # Adjust timezone as needed\n    logging:\n      driver: "json-file"\n      options:\n        max-size: "10m"\n        max-file: "3"\n    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost:8123"]\n      interval: 30s\n      timeout: 10s\n      retries: 5'
-
-    if [[ -n "$zigbee_device" ]]; then
-        ha_block="$ha_block\n    devices:\n      - $zigbee_device:$zigbee_device"
-    fi
-
-    ha_block="$ha_block\n"
-
-    # Interpret \n as actual newlines
-    ha_block=$(echo -e "$ha_block")
-
-    # Insert the block before 'volumes:' using awk
-    awk -v block="$ha_block" '/^volumes:/ { print block } { print }' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
-
-    # Add ha_config to volumes section if not present
-    if ! grep -q "^  ha_config:" "$COMPOSE_FILE"; then
-        sed -i '/^volumes:/a\  ha_config:' "$COMPOSE_FILE"
-    fi
-
-    # Normalize again after insertion to ensure consistent formatting
-    awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > temp.yml && mv temp.yml "$COMPOSE_FILE"
-
-    # Update Cloudflare Tunnel config (add ingress rule idempotently)
+    # Update Cloudflare Tunnel config (Add ingress rule)
     local tunnel_config="/etc/cloudflared/config.yml"
-    if grep -q "hostname: $ha_hostname" "$tunnel_config"; then
-        sed -i "/hostname: $ha_hostname/,/service:/d" "$tunnel_config"
+    if [ -f "$tunnel_config" ]; then
+        if grep -q "hostname: $ha_hostname" "$tunnel_config"; then
+            sed -i "/hostname: $ha_hostname/,/service:/d" "$tunnel_config"
+        fi
+        sed -i '/- service: http_status:404/i \  - hostname: '"$ha_hostname"'\n    service: http://localhost:'"$ha_port" "$tunnel_config"
+        
+        # Route DNS
+        local cf_tunnel_id="${CF_TUNNEL_ID:-}"
+        if [[ -n "$cf_tunnel_id" ]]; then
+             cloudflared tunnel route dns --overwrite-dns "$cf_tunnel_id" "$ha_hostname" || true
+             systemctl restart cloudflared
+        fi
     fi
-    sed -i '/- service: http_status:404/i \  - hostname: '"$ha_hostname"'\n    service: http://localhost:'"$ha_port" "$tunnel_config"
 
-    # Route DNS for HA
-    cloudflared tunnel route dns --overwrite-dns "$CF_TUNNEL_ID" "$ha_hostname" || {
-        dialog --title "Error" --msgbox "Failed to route DNS for $ha_hostname." 8 50
-        return 1
-    }
-
-    # Deploy and restart
+    # Deploy
     cd "$REPO_DIR" && docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
 
-    # Wait for healthy
     wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1 || return 1
 
-    # Configure HA for reverse proxy
-    echo "Configuring Home Assistant for reverse proxy..." >> "$MAIN_LOG_FILE" 2>&1
-
-    local ha_cid
-    ha_cid=$(docker compose -f "$COMPOSE_FILE" ps -q homeassistant)
-
-    # Trigger a request with X-Forwarded-For to generate the log entry if not configured
+    # Configure Proxy
+    local ha_cid=$(docker compose -f "$COMPOSE_FILE" ps -q homeassistant)
+    
+    # Detect IP
     curl -s -o /dev/null -H "X-Forwarded-For: 1.2.3.4" "http://localhost:${ha_port}"
-
     sleep 2
-
-    # Fetch logs and parse for proxy warning
-    local log_entry
-    log_entry=$(docker logs "$ha_cid" 2>&1 | grep "A request from a reverse proxy was received from" | tail -1)
-
+    local log_entry=$(docker logs "$ha_cid" 2>&1 | grep "A request from a reverse proxy was received from" | tail -1)
+    
     if [[ -n "$log_entry" ]]; then
-        local proxy_ip
-        proxy_ip=$(echo "$log_entry" | sed 's/.*from \([0-9.]\+\),.*/\1/')
-        echo "Detected proxy IP: $proxy_ip" >> "$MAIN_LOG_FILE" 2>&1
-
-        # Append to configuration.yaml if not already present
-        docker exec "$ha_cid" sh -c '
-            if ! grep -q "use_x_forwarded_for:" /config/configuration.yaml; then
-                echo "
-http:
-  use_x_forwarded_for: true
-  trusted_proxies:
-    - '"$proxy_ip"'
-" >> /config/configuration.yaml
-            fi
-        '
-
-        # Restart HA to apply changes
+        local proxy_ip=$(echo "$log_entry" | sed 's/.*from \([0-9.]\+\),.*/\1/')
+        # Reuse Helper Function
+        configure_ha_proxy_settings "$proxy_ip" "$ha_cid"
         docker compose -f "$COMPOSE_FILE" restart homeassistant
-        wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1 || return 1
-    else
-        echo "No proxy warning found; assuming already configured." >> "$MAIN_LOG_FILE" 2>&1
+        wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1
     fi
 
-    systemctl restart cloudflared
-
-    dialog --title "Success" --msgbox "Home Assistant setup complete. Access at https://$ha_hostname. Initial setup may take a few minutes. If using Zigbee, configure in HA integrations." 10 70
+    dialog --title "Success" --msgbox "Home Assistant setup complete." 10 70
 }
 
-# --- Setup Pangolin / Newt ---
-setup_pangolin_newt() {
-    source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found. Run Initial Setup first." 8 50; return; }
-
-    dialog --title "Pangolin / Newt Setup" --yesno "This will configure the 'Newt' service to tunnel traffic to a Pangolin server.\n\nYou need your:\n- Pangolin Endpoint\n- Newt ID\n- Newt Secret\n\nProceed?" 15 60
-    if [ $? -ne 0 ]; then return; fi
-
-    # 1. Gather Credentials
-    local values
-    values=$(dialog --backtitle "Pangolin Configuration" \
-        --stdout \
-        --title "Newt Credentials" \
-        --form "Enter values from your Pangolin Dashboard:" \
-        15 60 3 \
-        "Endpoint URL:" 1 1 "${PANGOLIN_ENDPOINT:-https://}" 1 16 60 0 \
-        "Newt ID:"      2 1 "${NEWT_ID:-}" 2 16 60 0 \
-        "Newt Secret:"  3 1 "${NEWT_SECRET:-}" 3 16 60 0)
+# --- Setup Pangolin / Newt Headless ---
+setup_pangolin_newt_headless() {
+    # Non-interactive version
+    source "$ENV_FILE"
+    echo "Configuring Newt Headless..."
     
-    local retval=$?
-    if [ $retval -ne 0 ] || [ -z "$values" ]; then return; fi
-
-    mapfile -t values_array <<< "$values"
-    local p_endpoint="${values_array[0]}"
-    local p_id="${values_array[1]}"
-    local p_secret="${values_array[2]}"
-
-    if [[ -z "$p_id" || -z "$p_secret" ]]; then
-        dialog --title "Error" --msgbox "ID and Secret are required." 8 50
-        return
-    fi
-
-    # 2. Update .env
-    update_env "PANGOLIN_ENDPOINT" "$p_endpoint"
-    update_env "NEWT_ID" "$p_id"
-    update_env "NEWT_SECRET" "$p_secret"
-
-    # 3. Update docker-compose.yml
-    echo "Configuring Newt service in Docker Compose..." >> "$MAIN_LOG_FILE" 2>&1
-    
-    # Safe Removal of existing newt block
-    awk '
-    BEGIN { inside=0 }
-    /^  newt:/ { inside=1; next }
-    inside && /^[a-z]/ { inside=0 }
-    inside && /^  [a-z]/ { inside=0 }
-    inside { next }
-    { print }
-    ' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
-
-    # Ensure clean spacing before volumes
+    # Inject Newt Block (Idempotent)
+    awk 'BEGIN {inside=0} /^  newt:/ {inside=1; next} inside && /^[a-z]/ {inside=0} inside && /^  [a-z]/ {inside=0} inside {next} {print}' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
     awk 'BEGIN {prev=""} {if (/^volumes:/ && prev != "") {print ""} print $0; prev=$0}' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
-
-    # Construct Newt Block
+    
     local newt_block='  newt:\n    image: fosrl/newt:latest\n    restart: unless-stopped\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock:ro\n    environment:\n      - PANGOLIN_ENDPOINT=${PANGOLIN_ENDPOINT}\n      - NEWT_ID=${NEWT_ID}\n      - NEWT_SECRET=${NEWT_SECRET}\n'
     newt_block=$(echo -e "$newt_block")
-
-    # Insert before 'volumes:'
+    
     awk -v block="$newt_block" '/^volumes:/ { print block } { print }' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
 
-    # 4. Deploy
-    dialog --title "Deploy" --infobox "Deploying Newt service... This may take a moment." 5 50
-    if docker compose -f "$COMPOSE_FILE" up -d newt; then
-        local hints="Newt service deployed successfully!\n\nTo configure in Pangolin Dashboard:\n1. Log in at ${PANGOLIN_ENDPOINT:-your-endpoint}.\n2. Go to 'Sites' > Your Site > 'Resources'.\n3. Add Resource:\n   - Type: HTTP\n   - Name: e.g., 'Nextcloud Tunnel'\n   - Targets: Address 'nextcloud', Port '80' (fallback: Address 'localhost', Port '8080')\n   - Public Routing: Unique subdomain (e.g., pangolin-cloud.yourdomain.com)\n4. Save & test URL.\n\nTips: Ensure DNS points subdomain to Pangolin host. Check Newt logs if issues."
-        if grep -q "homeassistant:" "$COMPOSE_FILE"; then
-            hints+="\n\nFor Home Assistant:\n- Add separate Resource: Address 'homeassistant', Port '8123' (fallback: Address 'localhost', Port '8123')\n- Use unique subdomain (e.g., pangolin-ha.yourdomain.com)."
-        fi
-        
-        dialog --title "Success & Hints" --msgbox "$hints" 25 80
-    else
-        dialog --title "Error" --msgbox "Failed to deploy Newt service. Check logs." 8 50
-        return 1
+    # Start the Newt service!
+    echo "Starting Newt service..."
+    docker compose -f "$COMPOSE_FILE" up -d newt
+    
+    # Configure Nextcloud trusted domains
+    local NC_CID=$(get_nc_cid)
+    if [[ -n "$NC_CID" ]]; then
+         docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || true
+         docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || true
+         docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || true
+         docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || true
+         docker compose -f "$COMPOSE_FILE" restart nextcloud || true
     fi
 
-    # 5. Configure Nextcloud for Pangolin
-    if is_stack_running; then
-        local nc_domain
-        nc_domain=$(dialog --stdout --title "Nextcloud Domain" --inputbox "Enter the full domain for Nextcloud via Pangolin (e.g., pangolin-cloud.yourdomain.com):" 8 60)
-        if [ $? -eq 0 ] && [ -n "$nc_domain" ]; then
-            local NC_CID=$(get_nc_cid)
-            if [[ -n "$NC_CID" ]]; then
-                echo "[*] Configuring Nextcloud for Pangolin domain: $nc_domain" >> "$MAIN_LOG_FILE" 2>&1
-                docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 2 --value="$nc_domain" >> "$MAIN_LOG_FILE" 2>&1
-                docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https >> "$MAIN_LOG_FILE" 2>&1
-                docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 2 --value="127.0.0.1" >> "$MAIN_LOG_FILE" 2>&1
-                docker compose -f "$COMPOSE_FILE" restart nextcloud >> "$MAIN_LOG_FILE" 2>&1
-                wait_for_healthy "nextcloud" 120 >> "$MAIN_LOG_FILE" 2>&1 || echo "[WARN] Nextcloud health check failed after config." >> "$MAIN_LOG_FILE"
-                dialog --title "Success" --msgbox "Nextcloud configured for Pangolin. Test access via $nc_domain." 8 60
-            fi
-        fi
-    fi
-
-    # 6. Configure Home Assistant for Pangolin (if present)
+    # Configure Home Assistant Trusted Proxies (Headless Requirement #3)
     if grep -q "homeassistant:" "$COMPOSE_FILE"; then
-        local ha_domain
-        ha_domain=$(dialog --stdout --title "Home Assistant Domain" --inputbox "Enter the full domain for Home Assistant via Pangolin (e.g., pangolin-ha.yourdomain.com):" 8 60)
-        if [ $? -eq 0 ] && [ -n "$ha_domain" ]; then
-            local ha_cid=$(docker compose -f "$COMPOSE_FILE" ps -q homeassistant)
-            if [[ -n "$ha_cid" ]]; then
-                echo "[*] Configuring Home Assistant for Pangolin domain: $ha_domain" >> "$MAIN_LOG_FILE" 2>&1
-                
-                # Determine the actual Docker Subnet instead of chasing shifting IPs
-                local net_name
-                net_name=$(docker inspect "$ha_cid" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
-                local subnet
-                subnet=$(docker network inspect "$net_name" --format='{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
-
-                if [[ -z "$subnet" ]]; then
-                    echo "[WARN] Could not detect Docker subnet. Falling back to permissive local range." >> "$MAIN_LOG_FILE"
-                    subnet="172.16.0.0/12" # Fallback for standard Docker ranges
-                else
-                    echo "[INFO] Detected Docker Subnet: $subnet. Trusting this range for HA proxies." >> "$MAIN_LOG_FILE"
-                fi
-
-                # Inject logic that handles both fresh installs and existing Cloudflare setups
-                # This explicitly adds the detected subnet to trusted_proxies, regardless of what's already there.
-                docker exec "$ha_cid" sh -c "
-                    CONF='/config/configuration.yaml'
-                    # 1. Check if the subnet is already trusted
-                    if grep -Fq '$subnet' \"\$CONF\"; then
-                        echo 'Subnet already trusted.'
-                    else
-                        # 2. Check if trusted_proxies block exists
-                        if grep -q 'trusted_proxies:' \"\$CONF\"; then
-                            # Append to existing list
-                            sed -i '/trusted_proxies:/a \    - $subnet' \"\$CONF\"
-                        # 3. Check if http block exists but no proxies
-                        elif grep -q '^http:' \"\$CONF\"; then
-                            sed -i '/^http:/a \  use_x_forwarded_for: true\n  trusted_proxies:\n    - $subnet' \"\$CONF\"
-                        # 4. No http block at all
-                        else
-                            echo '
-http:
-  use_x_forwarded_for: true
-  trusted_proxies:
-    - $subnet
-' >> \"\$CONF\"
-                        fi
-                    fi
-                " >> "$MAIN_LOG_FILE" 2>&1
-
-                docker compose -f "$COMPOSE_FILE" restart homeassistant >> "$MAIN_LOG_FILE" 2>&1
-                wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1 || echo "[WARN] HA health check failed after config." >> "$MAIN_LOG_FILE"
-                dialog --title "Success" --msgbox "Home Assistant configured for Pangolin. Test access via $ha_domain." 8 60
-            else
-                dialog --title "Warning" --msgbox "Home Assistant container not found; skipping config." 8 50
-            fi
+        echo "[INFO] Configuring Home Assistant proxy settings for Pangolin..."
+        local ha_cid=$(docker compose -f "$COMPOSE_FILE" ps -q homeassistant)
+        if [[ -n "$ha_cid" ]]; then
+             # Determine the actual Docker Subnet
+             local net_name=$(docker inspect "$ha_cid" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+             local subnet=$(docker network inspect "$net_name" --format='{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)
+             
+             if [[ -z "$subnet" ]]; then
+                 subnet="172.16.0.0/12" # Fallback
+             fi
+             
+             # Apply config using reusable helper
+             configure_ha_proxy_settings "$subnet" "$ha_cid"
+             
+             docker compose -f "$COMPOSE_FILE" restart homeassistant || true
+             echo "[INFO] Home Assistant proxy configured."
         fi
     fi
 }
+
+run_headless_setup(){
+    echo "Starting Headless Setup..." > "$MAIN_LOG_FILE"
+    
+    # 1. Load Environment (Pre-populated by Python)
+    if [[ -f "$ENV_FILE" ]]; then
+        source "$ENV_FILE"
+    else
+        die "Environment file not found for headless setup."
+    fi
+    
+    # 2. Run Dependencies & Config
+    HEADLESS_MODE=true preflight_checks >> "$MAIN_LOG_FILE" 2>&1
+    install_dependencies >> "$MAIN_LOG_FILE" 2>&1
+    generate_env_template
+    generate_docker_compose
+    
+    # 3. Gather Config (but respect existing .env values)
+    gather_config_from_env >> "$MAIN_LOG_FILE" 2>&1
+    generate_env_file >> "$MAIN_LOG_FILE" 2>&1
+
+    # 4. Check for Home Assistant Request (Headless Requirement #2)
+    # provision.sh sets HA_ENABLED=true if domain is provided
+    if [[ "${HA_ENABLED:-false}" == "true" ]]; then
+        echo "[INFO] Home Assistant requested via factory config. Enabling..." >> "$MAIN_LOG_FILE"
+        # Inject HA into docker-compose BEFORE deploy
+        # Default port 8123, no Zigbee (can't select dongle headlessly reliably without more complex logic)
+        inject_home_assistant_service "${HA_PORT:-8123}" ""
+    fi
+    
+    # 5. Deploy Stack (Now includes HA if requested)
+    deploy_docker_stack >> "$MAIN_LOG_FILE" 2>&1
+    
+    # 6. Configure Pangolin/Newt and App-Specific Settings
+    # This handles Nextcloud settings AND HA Proxy settings
+    setup_pangolin_newt_headless >> "$MAIN_LOG_FILE" 2>&1
+    
+    # 7. Finish
+    touch "$REPO_DIR/.setup_complete"
+    echo "✅ Installation complete!" >> "$MAIN_LOG_FILE"
+    exit 0
+}
+
+# --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
+if [ $# -gt 0 ]; then
+    case "$1" in
+        --backup)
+            backup
+            exit $?
+            ;;
+        --restore)
+            shift
+            restore "$@"
+            exit $?
+            ;;
+        --headless)
+            run_headless_setup
+            exit $?
+            ;;
+    esac
+fi
 
 # --- Main Menu ---
 main_menu() {
@@ -2291,26 +2219,21 @@ main_menu() {
             0 "Exit")
         local retval=$?
         if [ $retval -ne 0 ] || [ "$choice" = "0" ]; then
-            clear
-            exit 0
+            clear; exit 0
         fi
-         
         case "$choice" in
             1) run_initial_setup ;;
             2) run_backup ;;
             3) run_restore ;;
             4) configure_backup_settings ;;
-            5) 
-                system_health_check
-                dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80
-                ;;
+            5) system_health_check; dialog --title "System Health Check" --textbox "$HEALTH_LOG_FILE" 25 80 ;;
             6) maintenance_menu ;;
             7) logs_menu ;;
             8) setup_ftp_server ;;
             9) setup_home_assistant ;;
             10) setup_pangolin_newt ;;
         esac
-        reset_terminal  # Ensure clean state after actions
+        reset_terminal
     done
 }
 
