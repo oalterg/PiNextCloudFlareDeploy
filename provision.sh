@@ -73,6 +73,7 @@ import threading
 import json
 import hashlib
 import logging
+import shlex
 from flask import Flask, render_template, jsonify, request
 
 app = Flask(__name__)
@@ -523,13 +524,25 @@ def do_manager_update():
     if not os.path.exists(FACTORY_CONFIG):
          return jsonify({"error": "Factory config missing, cannot re-provision safely"}), 500
 
-    # Since we use quoted EOF, we do NOT need to escape $NEWT_ID here inside the Python string
+    # Retrieve existing factory config via Python to safely pass to the new script.
+    # We avoid relying on shell 'source' which can fail to export variables to child processes.
+    config = get_factory_config()
+    
+    # Prepare arguments using shlex.quote to prevent shell injection/corruption
+    args = [
+        config.get('NEWT_ID', ''),
+        config.get('NEWT_SECRET', ''),
+        config.get('NC_DOMAIN', ''),
+        config.get('HA_DOMAIN', ''),
+        config.get('PANGOLIN_ENDPOINT', '')
+    ]
+    safe_args = " ".join([shlex.quote(a) for a in args])
+
     cmd = (
         f"echo 'Updating Device Manager...' > {LOG_FILES['update']}; "
         f"curl -fsSL {UPDATE_URL} -o {PROVISION_SCRIPT} >> {LOG_FILES['update']} 2>&1; "
         f"chmod +x {PROVISION_SCRIPT}; "
-        f"source {FACTORY_CONFIG}; "
-        f"bash {PROVISION_SCRIPT} \"$NEWT_ID\" \"$NEWT_SECRET\" \"$NC_DOMAIN\" \"$HA_DOMAIN\" \"$PANGOLIN_ENDPOINT\" >> {LOG_FILES['update']} 2>&1; "
+        f"bash {PROVISION_SCRIPT} {safe_args} >> {LOG_FILES['update']} 2>&1; "
         "systemctl restart appliance-manager"
     )
     
