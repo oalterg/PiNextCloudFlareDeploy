@@ -148,9 +148,16 @@ def get_env_config():
 
 def update_env_var(key, value):
     try:
+        # If value is None, remove the line
+        if value is None:
+             subprocess.run(["sed", "-i", f"/^{key}=/d", ENV_FILE])
+             return True
+
         rc = subprocess.call(f"grep -q '^{key}=' {ENV_FILE}", shell=True)
         if rc == 0:
-            subprocess.run(["sed", "-i", f"s|^{key}=.*|{key}={value}|", ENV_FILE])
+            # Use | delimiter for sed to handle complex strings
+            safe_val = value.replace("|", "\\|")
+            subprocess.run(["sed", "-i", f"s|^{key}=.*|{key}={safe_val}|", ENV_FILE])
         else:
             with open(ENV_FILE, "a") as f:
                 f.write(f"\n{key}={value}")
@@ -177,31 +184,55 @@ def index():
     factory = get_factory_config()
     env = get_env_config()
     
-    is_custom = env.get('PANGOLIN_ENDPOINT') != factory.get('PANGOLIN_ENDPOINT')
+    # Determine Tunnel Provider Mode
+    # If any CF token exists, we are in Cloudflare mode
+    cf_mode = bool(env.get('CF_TOKEN_NC') or env.get('CF_TOKEN_HA'))
+    
+    # Check if Pangolin is custom (only relevant if not in CF mode)
+    is_custom_pangolin = False
+    if not cf_mode:
+        is_custom_pangolin = env.get('PANGOLIN_ENDPOINT') != factory.get('PANGOLIN_ENDPOINT')
         
     return render_template('dashboard.html', 
                          nc_domain=env.get('NEXTCLOUD_TRUSTED_DOMAINS'), 
                          ha_domain=env.get('HA_TRUSTED_DOMAINS'),
                          creds={"user": env.get('NEXTCLOUD_ADMIN_USER'), "pass": env.get('NEXTCLOUD_ADMIN_PASSWORD')},
-                         tunnel={"factory": factory, "current": env, "is_custom": is_custom})
+                         tunnel={
+                             "factory": factory, 
+                             "current": env, 
+                             "mode": "cloudflare" if cf_mode else "pangolin",
+                             "is_custom_pangolin": is_custom_pangolin
+                         })
 
 # --- Routes: API Status ---
 @app.route('/api/status')
 def system_status():
-    services = {"nextcloud": "stopped", "db": "stopped", "homeassistant": "missing", "newt": "stopped"}
+    services = {"nextcloud": "stopped", "db": "stopped", "homeassistant": "missing", "tunnel": "stopped"}
     try:
         # Docker Services Check
+        # We need to check for either newt OR cloudflared-*
         out = subprocess.check_output(f"docker compose -f {COMPOSE_FILE} ps --format '{{{{.Service}}}}:{{{{.State}}}}:{{{{.Health}}}}'", shell=True).decode()
+        
+        tunnel_status = "stopped"
+        
         for line in out.splitlines():
             parts = line.split(':')
             if len(parts) >= 2:
                 svc = parts[0]
                 state = parts[1]
                 health = parts[2] if len(parts) > 2 else ""
+                
                 status = "running" if "running" in state else "stopped"
                 if "unhealthy" in health: status = "unhealthy"
                 elif "starting" in health: status = "starting"
+                
                 if svc in services: services[svc] = status
+                
+                # Consolidate Tunnel Status
+                if svc == "newt" or svc.startswith("cloudflared"):
+                    if status == "running": tunnel_status = "running"
+        
+        services["tunnel"] = tunnel_status
 
         # Maintenance Mode Check
         try:
@@ -311,20 +342,14 @@ def format_drive():
     if not drive_path or "mmcblk" in drive_path: 
         return jsonify({"error": "Invalid drive"}), 400
 
-    # Escaped \$UUID and \$(blkid) are NO LONGER NEEDED with quoted EOF, 
-    # but we must use standard string concatenation or f-strings in Python carefully.
-    # Since this is inside Python code string, we just write valid Python.
-    # Note: The 'cmd' variable below is a Python string being sent to subprocess.
-    # We must ensure the SHELL (inside subprocess) sees the right variables.
-    
     cmd = (
         f"umount {drive_path}* || true; "
         f"wipefs -a {drive_path}; "
         f"mkfs.ext4 -F -L 'NextcloudBackup' {drive_path}; "
         f"mkdir -p {BACKUP_DIR}; "
-        f"UUID=$(blkid -o value -s UUID {drive_path}); "  # Removed backslash before $
+        f"UUID=$(blkid -o value -s UUID {drive_path}); "
         f"sed -i '\|{BACKUP_DIR}|d' /etc/fstab; "
-        f"echo \"UUID=$UUID {BACKUP_DIR} ext4 defaults,nofail 0 2\" >> /etc/fstab; " # Removed backslash before $
+        f"echo \"UUID=$UUID {BACKUP_DIR} ext4 defaults,nofail 0 2\" >> /etc/fstab; "
         f"mount -a;"
     )
     
@@ -337,7 +362,6 @@ def backup_stats():
     # Check if mounted
     if not os.path.ismount(BACKUP_DIR):
          return jsonify({"mounted": False, "free_gb": 0, "total_gb": 0, "percent": 0})
-    
     try:
         total, used, free = shutil.disk_usage(BACKUP_DIR)
         return jsonify({
@@ -454,21 +478,77 @@ def trigger_restore():
 def update_tunnel():
     if current_task_status["status"] == "running": return jsonify({"error": "Task running"}), 409
     
-    action = request.json.get('action')
+    data = request.json
+    action = data.get('action')
+
+    # Ensure we are in Pangolin mode: Clear CF tokens
+    update_env_var('CF_TOKEN_NC', None)
+    update_env_var('CF_TOKEN_HA', None)
+    
     if action == 'revert':
         factory = get_factory_config()
         update_env_var('PANGOLIN_ENDPOINT', factory.get('PANGOLIN_ENDPOINT', ''))
         update_env_var('NEWT_ID', factory.get('NEWT_ID', ''))
         update_env_var('NEWT_SECRET', factory.get('NEWT_SECRET', ''))
     else:
-        data = request.json
         update_env_var('PANGOLIN_ENDPOINT', data.get('endpoint'))
         update_env_var('NEWT_ID', data.get('id'))
         update_env_var('NEWT_SECRET', data.get('secret'))
     
-    cmd = f"docker compose -f {COMPOSE_FILE} up -d --force-recreate newt"
-    threading.Thread(target=run_background_task, args=("Tunnel Configuration", cmd, "setup")).start()
+    # Trigger raspi-cloud to update stack logic
+    cmd = f"{RASPI_CLOUD_BIN} --update-tunnels >> {LOG_FILES['setup']} 2>&1"
+    threading.Thread(target=run_background_task, args=("Update Tunnel (Pangolin)", cmd, "setup")).start()
     return jsonify({"status": "started"})
+
+# --- Routes: Tunnel Management (Cloudflare) ---
+@app.route('/api/tunnel/cloudflare', methods=['POST'])
+def update_tunnel_cloudflare():
+    if current_task_status["status"] == "running": return jsonify({"error": "Task running"}), 409
+    
+    domain = request.json.get('domain')
+    service = request.json.get('service') # 'nc' or 'ha'
+    token = request.json.get('token')
+    
+    if not token or not service:
+        return jsonify({"error": "Missing token or service definition"}), 400
+
+    # Write Token to .env
+    if service == 'nc':
+        update_env_var('NEXTCLOUD_TRUSTED_DOMAINS', domain)
+        update_env_var('CF_TOKEN_NC', token)
+    elif service == 'ha':
+        update_env_var('HA_TRUSTED_DOMAINS', domain)
+        update_env_var('CF_TOKEN_HA', token)
+
+    # NOTE: We do not explicitly unset PANGOLIN vars here because 
+    # raspi-cloud prioritize CF tokens if present.
+    # This allows a cleaner "Revert" later.
+    
+    cmd = f"{RASPI_CLOUD_BIN} --update-tunnels >> {LOG_FILES['setup']} 2>&1"
+    threading.Thread(target=run_background_task, args=("Update Tunnel (Cloudflare)", cmd, "setup")).start()
+    return jsonify({"status": "started"})
+
+@app.route('/api/tunnel/revert', methods=['POST'])
+def revert_tunnel_provider():
+    if current_task_status["status"] == "running": return jsonify({"error": "Task running"}), 409
+
+    # To revert to factory (Pangolin)
+    # 1. Clear CF tokens
+    update_env_var('CF_TOKEN_NC', None)
+    update_env_var('CF_TOKEN_HA', None)
+    
+    # 2. Restore Factory Pangolin vars
+    factory = get_factory_config()
+    update_env_var('PANGOLIN_ENDPOINT', factory.get('PANGOLIN_ENDPOINT', ''))
+    update_env_var('NEWT_ID', factory.get('NEWT_ID', ''))
+    update_env_var('NEWT_SECRET', factory.get('NEWT_SECRET', ''))
+    update_env_var('NEXTCLOUD_TRUSTED_DOMAINS', factory.get('NC_DOMAIN', ''))
+    update_env_var('HA_TRUSTED_DOMAINS', factory.get('HA_DOMAIN', ''))
+    
+    cmd = f"{RASPI_CLOUD_BIN} --update-tunnels >> {LOG_FILES['setup']} 2>&1"
+    threading.Thread(target=run_background_task, args=("Revert to Factory Settings", cmd, "setup")).start()
+    return jsonify({"status": "started"})
+
 
 # --- Routes: Maintenance & Updates ---
 @app.route('/api/maintenance/mode', methods=['POST'])
@@ -590,12 +670,16 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
         .progress-text { position: absolute; width: 100%; text-align: center; top: 0; font-size: 12px; line-height: 20px; text-shadow: 1px 1px 2px #000; }
         
         .stat-item { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 0.9em; }
+        .provider-mode { text-align: right; font-size: 0.8em; color: #aaa; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>Device Manager</h1>
-        <div id="global-status">System Active</div>
+        <div style="text-align:right">
+             <div id="global-status">System Active</div>
+             <div class="provider-mode">Tunnel: {{ tunnel.mode.upper() }}</div>
+        </div>
     </div>
 
     <div class="tabs">
@@ -611,7 +695,7 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
                 <h3>Services</h3>
                 <p>Nextcloud: <span id="st-nc" class="status-badge status-unknown">...</span></p>
                 <p>Database: <span id="st-db" class="status-badge status-unknown">...</span></p>
-                <p>Tunnel: <span id="st-newt" class="status-badge status-unknown">...</span></p>
+                <p>Tunnel: <span id="st-tunnel" class="status-badge status-unknown">...</span></p>
                 {% if ha_domain %}
                 <p>Home Assistant: <span id="st-ha" class="status-badge status-unknown">...</span></p>
                 {% endif %}
@@ -667,7 +751,9 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
                         <option value="nextcloud">Nextcloud Container</option>
                         <option value="db">Database Container</option>
                         <option value="homeassistant">Home Assistant Container</option>
-                        <option value="newt">Tunnel (Newt) Container</option>
+                        <option value="newt">Pangolin (Newt) Container</option>
+                        <option value="cloudflared-nc">Cloudflare (NC) Container</option>
+                        <option value="cloudflared-ha">Cloudflare (HA) Container</option>
                     </optgroup>
                 </select>
                 <button onclick="pollLogs()">Refresh</button>
@@ -761,30 +847,95 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
             <p><strong>User:</strong> {{ creds.user }}</p>
             <p><strong>Pass:</strong> {{ creds.pass }}</p>
         </div>
+
+        <!-- Tunnel Provider Toggle Logic -->
         <div class="card">
-            <h3>Pangolin Tunnel Connection</h3>
-            <p>
-                Current Status: 
-                {% if tunnel.is_custom %}
-                    <strong style="color: #e67e22">CUSTOM CONFIGURATION</strong>
-                {% else %}
-                    <strong style="color: #2ecc71">FACTORY DEFAULT</strong>
+            <h3>Tunnel Configuration</h3>
+            
+            {% if tunnel.mode == 'pangolin' %}
+                <!-- Pangolin View -->
+                <p>
+                    Current Provider: <strong style="color: #2ecc71">Pangolin (Factory Default)</strong>
+                    {% if tunnel.is_custom_pangolin %}(Customized){% endif %}
+                </p>
+                <form onsubmit="updatePangolin(event)">
+                    <label>Endpoint:</label>
+                    <input type="text" id="tun-ep" value="{{ tunnel.current.PANGOLIN_ENDPOINT }}">
+                    <label>ID:</label>
+                    <input type="text" id="tun-id" value="{{ tunnel.current.NEWT_ID }}">
+                    <label>Secret:</label>
+                    <input type="password" id="tun-sec" value="{{ tunnel.current.NEWT_SECRET }}">
+                    <button type="submit">Update Connection</button>
+                </form>
+                {% if tunnel.is_custom_pangolin %}
+                    <hr>
+                    <button style="background-color: #e74c3c;" onclick="revertPangolin()">Reset Pangolin Defaults</button>
                 {% endif %}
-            </p>
-            
-            <form onsubmit="updateTunnel(event)">
-                <label>Endpoint:</label>
-                <input type="text" id="tun-ep" value="{{ tunnel.current.PANGOLIN_ENDPOINT }}">
-                <label>ID:</label>
-                <input type="text" id="tun-id" value="{{ tunnel.current.NEWT_ID }}">
-                <label>Secret:</label>
-                <input type="password" id="tun-sec" value="{{ tunnel.current.NEWT_SECRET }}">
-                <button type="submit">Save & Restart Tunnel</button>
-            </form>
-            
-            {% if tunnel.is_custom %}
-            <hr>
-            <button style="background-color: #e74c3c;" onclick="revertTunnel()">Revert to Factory Settings</button>
+                
+                <hr>
+                <h4>Switch Provider</h4>
+                <p>Switch to Cloudflare Tunnel (requires Cloudflare account). This will disable Pangolin.</p>
+                <button onclick="showCloudflareForm()" style="background-color: #f39c12; color: #000;">Switch to Cloudflare</button>
+                
+                <!-- Hidden CF Form for switching -->
+                <div id="cf-form-container" style="display:none; margin-top:15px; background: #333; padding: 15px; border-radius: 5px;">
+                    <h4>Cloudflare Setup</h4>
+                    <p style="font-size:0.9em;">
+                        1. Create tunnel in Cloudflare Dashboard (Network > Tunnels).<br>
+                        2. Select "Docker" environment.<br>
+                        3. Copy the token.<br>
+                        4. <strong>Important:</strong> Configure Public Hostname service in dashboard to:<br>
+                           - Nextcloud: <code>http://nextcloud:80</code><br>
+                           - Home Assistant: <code>http://homeassistant:8123</code>
+                    <label>Domain (e.g., mycloud.example.com):</label>
+                    <input type="text" id="cf-domain" placeholder="mycloud.example.com" required>
+                    </p>
+                    <form onsubmit="updateCloudflare(event)">
+                        <label>Service:</label>
+                        <select id="cf-service">
+                            <option value="nc">Nextcloud</option>
+                            {% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}
+                        </select>
+                        <label>Tunnel Token:</label>
+                        <input type="text" id="cf-token" placeholder="eyJhIjoi...">
+                        <button type="submit">Activate Cloudflare</button>
+                    </form>
+                </div>
+
+            {% else %}
+                <!-- Cloudflare View -->
+                <p>Current Provider: <strong style="color: #f39c12">Cloudflare</strong></p>
+                
+                <div>
+                    <h4>Active Tunnels</h4>
+                    <ul>
+                    {% if tunnel.current.CF_TOKEN_NC %}
+                        <li><strong>Nextcloud:</strong> Configured (Token: {{ tunnel.current.CF_TOKEN_NC[:10] }}...)</li>
+                    {% else %}
+                        <li><strong>Nextcloud:</strong> Not Configured</li>
+                    {% endif %}
+                    {% if tunnel.current.CF_TOKEN_HA %}
+                        <li><strong>Home Assistant:</strong> Configured (Token: {{ tunnel.current.CF_TOKEN_HA[:10] }}...)</li>
+                    {% endif %}
+                    </ul>
+                </div>
+
+                <hr>
+                <h4>Add/Update Tunnel</h4>
+                <form onsubmit="updateCloudflare(event)">
+                    <label>Service:</label>
+                    <select id="cf-service">
+                        <option value="nc">Nextcloud</option>
+                        {% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}
+                    </select>
+                    <label>Domain (e.g., mycloud.example.com):</label> <input type="text" id="cf-domain" placeholder="mycloud.example.com" required>
+                    <label>Token (from Cloudflare Dashboard):</label>
+                    <input type="text" id="cf-token" placeholder="eyJhIjoi..." required>
+                    <button type="submit">Save Tunnel</button>
+                </form>
+
+                <hr>
+                <button style="background-color: #e74c3c;" onclick="revertToFactory()">Revert to Factory (Pangolin)</button>
             {% endif %}
         </div>
     </div>
@@ -835,8 +986,8 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
                 const data = await res.json();
                 
                 // Services
-                ['nc','db','ha','newt'].forEach(k => {
-                    if(document.getElementById('st-'+k)) setStatus('st-'+k, data[k === 'nc' ? 'nextcloud' : (k==='newt'?'newt':(k==='ha'?'homeassistant':'db'))]);
+                ['nc','db','ha','tunnel'].forEach(k => {
+                    if(document.getElementById('st-'+k)) setStatus('st-'+k, data[k === 'nc' ? 'nextcloud' : (k==='tunnel'?'tunnel':(k==='ha'?'homeassistant':'db'))]);
                 });
                 if(document.getElementById('st-maint')) document.getElementById('st-maint').innerText = (data.maintenance_mode || 'unknown').toUpperCase();
 
@@ -862,6 +1013,52 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
             el.innerText = (status || 'unknown').toUpperCase();
         }
 
+        // --- Tunnel Functions ---
+        function showCloudflareForm() {
+            document.getElementById('cf-form-container').style.display = 'block';
+        }
+
+        async function updatePangolin(e) {
+            e.preventDefault();
+            const data = {
+                endpoint: document.getElementById('tun-ep').value,
+                id: document.getElementById('tun-id').value,
+                secret: document.getElementById('tun-sec').value
+            };
+            if(confirm("Update Pangolin settings? Connection may restart.")) {
+                triggerAction('/api/tunnel/pangolin', 'Update Tunnel', data);
+                setTimeout(() => location.reload(), 3000);
+            }
+        }
+
+        async function revertPangolin() {
+            if(confirm("Revert Pangolin to factory defaults?")) {
+                triggerAction('/api/tunnel/pangolin', 'Revert Tunnel', {action:'revert'});
+                setTimeout(() => location.reload(), 3000);
+            }
+        }
+
+        async function updateCloudflare(e) {
+            e.preventDefault();
+            const token = document.getElementById('cf-token').value;
+            const service = document.getElementById('cf-service').value;
+            if(!token) return alert("Token required");
+            const domain = document.getElementById('cf-domain').value; if(!domain) return alert("Domain required");
+
+            if(confirm("Switch/Update Cloudflare Tunnel for " + service.toUpperCase() + "? This will modify your connection settings.")) {
+                triggerAction('/api/tunnel/cloudflare', 'Cloudflare Update', {domain: domain, token: token, service: service});
+                setTimeout(() => location.reload(), 3000);
+            }
+        }
+
+        async function revertToFactory() {
+            if(confirm("Disable Cloudflare and revert to Factory Pangolin settings?")) {
+                triggerAction('/api/tunnel/revert', 'Revert to Factory', {});
+                setTimeout(() => location.reload(), 3000);
+            }
+        }
+
+        // --- Standard Functions (Backup, Drives, Logs) ---
         async function loadDrives() {
             const el = document.getElementById('drive-list');
             el.innerHTML = 'Scanning...';
@@ -909,7 +1106,7 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
                 }
             } catch(e) {}
         }
-
+        
         async function loadBackupConfig() {
             const res = await fetch('/api/backup/config');
             const d = await res.json();
@@ -975,7 +1172,7 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
             const strategy = document.getElementById('backup-strategy').value;
             triggerAction('/api/backup/now', 'Backup', {strategy: strategy});
         }
-
+        
         async function loadBackups() {
             const res = await fetch('/api/backups/list');
             const list = await res.json();
@@ -997,26 +1194,6 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
             }
         }
 
-        async function updateTunnel(e) {
-            e.preventDefault();
-            const data = {
-                endpoint: document.getElementById('tun-ep').value,
-                id: document.getElementById('tun-id').value,
-                secret: document.getElementById('tun-sec').value
-            };
-            if(confirm("Change tunnel settings? Device connection may be lost momentarily.")) {
-                const res = await fetch('/api/tunnel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
-                if(res.ok) setTimeout(() => location.reload(), 5000);
-            }
-        }
-
-        async function revertTunnel() {
-            if(confirm("Revert to Factory Connection settings?")) {
-                const res = await fetch('/api/tunnel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'revert'})});
-                if(res.ok) setTimeout(() => location.reload(), 5000);
-            }
-        }
-
         async function triggerAction(endpoint, name, body={}) {
             try {
                 const res = await fetch(endpoint, {
@@ -1033,7 +1210,7 @@ cat > "$APP_DIR/templates/dashboard.html" <<'EOF'
                 }
             } catch(e) { alert("Request failed"); }
         }
-
+        
         async function toggleMaintenance(mode) {
             await fetch('/api/maintenance/mode', {
                 method: 'POST', 

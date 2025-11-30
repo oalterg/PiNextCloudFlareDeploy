@@ -80,6 +80,9 @@ TRUSTED_PROXIES_0=172.18.0.1
 TRUSTED_PROXIES_1=127.0.0.1
 HA_PORT=8123
 HA_TRUSTED_DOMAINS=
+# Cloudflare Tokens (Set via GUI or manual)
+CF_TOKEN_NC=
+CF_TOKEN_HA=
 EOF
     fi
 }
@@ -209,8 +212,143 @@ wait_for_healthy() {
     return 1
 }
 
-# --- Maintenance Mode Helpers ---
+# --- Tunnel Management (Cloudflare & Pangolin) ---
 
+# Helps configure Trusted Proxies for Docker subnet to allow Cloudflare Tunnel traffic
+configure_docker_subnet_trust() {
+    echo "[INFO] Configuring trusted proxies for Docker Subnet..."
+    local nc_cid=$(get_nc_cid)
+    local ha_cid=$(docker compose -f "$COMPOSE_FILE" ps -q homeassistant 2>/dev/null || true)
+    
+    # Get Docker Bridge Subnet
+    local subnet
+    # Try to find the network used by nextcloud
+    if [[ -n "$nc_cid" ]]; then
+        local net_name=$(docker inspect "$nc_cid" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+        if [[ -n "$net_name" ]]; then
+            subnet=$(docker network inspect "$net_name" --format='{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)
+        fi
+    fi
+    
+    # Fallback default if detection fails
+    if [[ -z "$subnet" ]]; then
+        subnet="172.16.0.0/12"
+    fi
+    echo "[INFO] Detected Docker Subnet: $subnet"
+
+    # 1. Update Nextcloud Trusted Proxies
+    if [[ -n "$nc_cid" ]]; then
+        # Use index 10 to avoid conflict with existing static ones
+        docker exec -u www-data "$nc_cid" php occ config:system:set trusted_proxies 10 --value="$subnet" || true
+        # Also ensure localhost is trusted
+        docker exec -u www-data "$nc_cid" php occ config:system:set trusted_proxies 11 --value="127.0.0.1" || true
+    fi
+
+    # 2. Update Home Assistant Trusted Proxies
+    if [[ -n "$ha_cid" ]]; then
+        configure_ha_proxy_settings "$subnet" "$ha_cid"
+    fi
+}
+
+update_tunnel_services() {
+    echo "[INFO] Updating tunnel services in docker-compose.yml..."
+    source "$ENV_FILE"
+
+    # 1. Strip existing service definitions (Newt and Cloudflared)
+    # We use awk to filter out specific blocks. This assumes standard indentation.
+    # It removes lines starting with '  newt:', '  cloudflared-nc:', '  cloudflared-ha:' and their indented children.
+    
+    cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
+    
+    awk '
+    BEGIN { skip=0; indent=0 }
+    /^  (newt|cloudflared-nc|cloudflared-ha):/ { skip=1; indent=length($0)-length($2); next }
+    skip && /^ +/ { next } # Skip indented lines if skipping
+    skip && !/^ +/ { skip=0 } # Stop skipping if indent is gone
+    { print }
+    ' "${COMPOSE_FILE}.bak" > "$COMPOSE_FILE"
+
+    # 2. Prepare New Blocks
+    local new_blocks=""
+    
+    # Logic: If ANY Cloudflare token is present, we disable Pangolin (Newt)
+    if [[ -n "${CF_TOKEN_NC:-}" ]] || [[ -n "${CF_TOKEN_HA:-}" ]]; then
+        echo "[INFO] Cloudflare Mode Active."
+        
+        if [[ -n "${CF_TOKEN_NC:-}" ]]; then
+            echo "[INFO] Adding Cloudflare Tunnel for Nextcloud..."
+            new_blocks="${new_blocks}
+  cloudflared-nc:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=\${CF_TOKEN_NC}
+    depends_on:
+      - nextcloud
+"
+        fi
+        
+        if [[ -n "${CF_TOKEN_HA:-}" ]]; then
+            echo "[INFO] Adding Cloudflare Tunnel for Home Assistant..."
+             new_blocks="${new_blocks}
+  cloudflared-ha:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=\${CF_TOKEN_HA}
+"
+             # Depends on HA if HA is in the file? 
+             if grep -q "homeassistant:" "$COMPOSE_FILE"; then
+                  new_blocks="${new_blocks}    depends_on:
+      - homeassistant
+"
+             fi
+        fi
+        
+    elif [[ -n "${PANGOLIN_ENDPOINT:-}" ]]; then
+        echo "[INFO] Pangolin Mode Active."
+        new_blocks="${new_blocks}
+  newt:
+    image: fosrl/newt:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - PANGOLIN_ENDPOINT=\${PANGOLIN_ENDPOINT}
+      - NEWT_ID=\${NEWT_ID}
+      - NEWT_SECRET=\${NEWT_SECRET}
+"
+    else
+        echo "[WARN] No tunnel configuration found (Pangolin or Cloudflare)."
+    fi
+
+    # 3. Inject New Blocks
+    # Insert before 'volumes:' line
+    if [[ -n "$new_blocks" ]]; then
+        # Use a temp file for safety
+        awk -v block="$new_blocks" '/^volumes:/ { print block } { print }' "$COMPOSE_FILE" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "$COMPOSE_FILE"
+    fi
+    
+    # 4. Apply Changes
+    echo "[INFO] Redeploying stack..."
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
+    
+    # 5. Configure Trust
+    # Wait briefly for containers to spin up so network inspection works
+    sleep 5
+    #configure_docker_subnet_trust
+    configure_nextcloud_https
+
+    # Restart NC/HA to apply proxy trust changes if needed
+    echo "[INFO] Reloading services to apply proxy settings..."
+    docker compose -f "$COMPOSE_FILE" restart nextcloud homeassistant 2>/dev/null || true
+    
+    echo "[INFO] Tunnel configuration complete."
+}
+
+# --- Maintenance Mode Helpers ---
 # Sets maintenance mode.
 # $1: Mode ("--on" or "--off")
 # $2: (Optional) Log file to redirect output to
@@ -364,18 +502,6 @@ install_dependencies() {
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
     
     systemctl enable --now docker
-    
-    if ! [ -f /usr/share/keyrings/cloudflared.gpg ]; then
-        mkdir -p --mode=0755 /usr/share/keyrings
-        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflared.gpg
-        # Fix for Debian Trixie/Testing: Fallback to Bookworm if current codename is not supported
-        local release
-        release=$(lsb_release -cs)
-        [[ "$release" == "trixie" ]] && release="bookworm"
-        echo "deb [signed-by=/usr/share/keyrings/cloudflared.gpg] https://pkg.cloudflare.com/cloudflared $release main" > /etc/apt/sources.list.d/cloudflared.list
-        apt-get update -y
-    fi
-    apt-get install -y cloudflared
 }
 
 gather_config_from_env() {
@@ -404,7 +530,7 @@ generate_env_file() {
     [[ -f "$ENV_TEMPLATE" ]] || die "Missing .env.template file."
     
     if [[ ! -f "$ENV_FILE" ]]; then cp "$ENV_TEMPLATE" "$ENV_FILE"; fi
-     
+    
     update_env "NEXTCLOUD_ADMIN_USER" "$NEXTCLOUD_ADMIN_USER"
     update_env "NEXTCLOUD_ADMIN_PASSWORD" "$NEXTCLOUD_ADMIN_PASSWORD"
     update_env "NEXTCLOUD_TRUSTED_DOMAINS" "${NEXTCLOUD_TRUSTED_DOMAINS:-}"
@@ -439,14 +565,17 @@ deploy_docker_stack() {
 
 configure_nextcloud_https() {
     echo "[6/10] Applying reverse proxy HTTPS configuration..."
-    local NC_CID
-    NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
+    local NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
     [[ -z "$NC_CID" ]] && die "Nextcloud container not ready."
      
     docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || die "Failed to set overwriteprotocol."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || die "Failed to set trusted_proxies 0."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
+    
+    # Also apply subnet trust if applicable (Headless/Cloudflare)
+    configure_docker_subnet_trust
+    
     echo "Restarting Nextcloud service..."
     docker compose -f "$COMPOSE_FILE" restart nextcloud
     wait_for_healthy "nextcloud" 120 || exit 1
@@ -2080,9 +2209,11 @@ setup_home_assistant() {
         # Reuse Helper Function
         configure_ha_proxy_settings "$proxy_ip" "$ha_cid"
         docker compose -f "$COMPOSE_FILE" restart homeassistant
-        wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1
+    wait_for_healthy "homeassistant" 180 >> "$MAIN_LOG_FILE" 2>&1
     fi
-
+    
+    # Configure Trust via helper
+    configure_docker_subnet_trust
     dialog --title "Success" --msgbox "Home Assistant setup complete." 10 70
 }
 
@@ -2163,15 +2294,14 @@ run_headless_setup(){
         echo "[INFO] Home Assistant requested via factory config. Enabling..." >> "$MAIN_LOG_FILE"
         # Inject HA into docker-compose BEFORE deploy
         # Default port 8123, no Zigbee (can't select dongle headlessly reliably without more complex logic)
-        inject_home_assistant_service "${HA_PORT:-8123}" ""
+        inject_home_assistant_service "${HA_PORT:-8123}" "/dev/ttyUSB0"
     fi
     
     # 5. Deploy Stack (Now includes HA if requested)
     deploy_docker_stack >> "$MAIN_LOG_FILE" 2>&1
     
-    # 6. Configure Pangolin/Newt and App-Specific Settings
-    # This handles Nextcloud settings AND HA Proxy settings
-    setup_pangolin_newt_headless >> "$MAIN_LOG_FILE" 2>&1
+    # Configure Tunnels (Pangolin or Cloudflare based on env)
+    update_tunnel_services >> "$MAIN_LOG_FILE" 2>&1
     
     # 7. Finish
     touch "$REPO_DIR/.setup_complete"
@@ -2182,19 +2312,10 @@ run_headless_setup(){
 # --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
 if [ $# -gt 0 ]; then
     case "$1" in
-        --backup)
-            backup
-            exit $?
-            ;;
-        --restore)
-            shift
-            restore "$@"
-            exit $?
-            ;;
-        --headless)
-            run_headless_setup
-            exit $?
-            ;;
+        --backup) backup; exit $? ;;
+        --restore) shift; restore "$@"; exit $? ;;
+        --headless) run_headless_setup; exit $? ;;
+        --update-tunnels) update_tunnel_services; exit $? ;; # New Flag
     esac
 fi
 
