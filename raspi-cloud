@@ -2288,7 +2288,7 @@ run_headless_setup(){
     gather_config_from_env >> "$MAIN_LOG_FILE" 2>&1
     generate_env_file >> "$MAIN_LOG_FILE" 2>&1
 
-    # 4. Check for Home Assistant Request (Headless Requirement #2)
+    # 4. Check for Home Assistant Request
     # provision.sh sets HA_ENABLED=true if domain is provided
     if [[ "${HA_ENABLED:-false}" == "true" ]]; then
         echo "[INFO] Home Assistant requested via factory config. Enabling..." >> "$MAIN_LOG_FILE"
@@ -2297,7 +2297,7 @@ run_headless_setup(){
         inject_home_assistant_service "${HA_PORT:-8123}" "/dev/ttyUSB0"
     fi
     
-    # 5. Deploy Stack (Now includes HA if requested)
+    # 5. Deploy Stack
     deploy_docker_stack >> "$MAIN_LOG_FILE" 2>&1
     
     # Configure Tunnels (Pangolin or Cloudflare based on env)

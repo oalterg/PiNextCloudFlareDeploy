@@ -1,0 +1,12 @@
+[Unit]
+Description=Raspi Cloud Appliance Manager
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=$APP_DIR
+ExecStart=/usr/bin/python3 $APP_DIR/app.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

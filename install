@@ -1,5 +1,5 @@
 #!/bin/bash
-# install — idempotent and robust bootstrapper for raspi-cloud
+# install — Bootstrapper
 
 set -Eeuo pipefail
 
@@ -7,75 +7,29 @@ set -Eeuo pipefail
 REPO_DIR="/opt/raspi-nextcloud-setup"
 BIN_DIR="/usr/local/sbin"
 LOG_DIR="/var/log/raspi-nextcloud"
-LOG_FILE="$LOG_DIR/bootstrap.log"
-LOCK_FILE="/var/run/raspi-nextcloud-install.lock"
+# Use a specific branch/tag for stability, or 'main' for latest
+REPO_URL="https://github.com/oalterg/pinextcloudflaredeploy/archive/refs/heads/main.tar.gz"
 
-# GitHub Raw Base URL (Replace 'main' with specific tag/branch for stability in production)
-BASE_URL="https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main"
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then echo "Run as root."; exit 1; fi
 
-# --- Pre-flight Checks ---
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-   echo "This script must be run as root. Please use 'sudo'." >&2
-   exit 1
-fi
+echo "=== Bootstrapper Started ==="
+mkdir -p "$LOG_DIR" "$REPO_DIR"
 
-# --- Logging and Locking ---
-mkdir -p "$LOG_DIR"
-exec > >(tee -a "$LOG_FILE") 2>&1
+# 1. Install Unpacking Dependencies
+apt-get update -qq
+apt-get install -y curl tar gzip
 
-exec 200>"$LOCK_FILE"
-flock -n 200 || { echo "Another installation is already running. Aborting."; exit 1; }
+# 2. Download and Extract Repository
+echo "Downloading repository..."
+# --strip-components=1 removes the root folder (e.g., repo-main/) from the tarball
+curl -L "$REPO_URL" | tar -xz --strip-components=1 -C "$REPO_DIR"
 
-echo "=== Bootstrapper Started: $(date) ==="
+# 3. Setup Permissions
+chmod +x "$REPO_DIR/provision.sh"
+chmod +x "$REPO_DIR/raspi-cloud"
 
-# --- Dependency Installation ---
-echo "[1/3] Ensuring core dependencies are installed..."
-if ! command -v apt-get >/dev/null; then
-    echo "This script requires a Debian-based OS (using apt-get). Aborting." >&2
-    exit 1
-fi
+# 4. Symlink Binary
+ln -sf "$REPO_DIR/raspi-cloud" "$BIN_DIR/raspi-cloud"
 
-# Quietly update and install curl/dialog if missing
-echo "[1/3] Updating package lists..."
-apt-get update -qq -y
-echo "[1/3] Installing dependencies..."
-apt-get install -qq -y ca-certificates curl dialog
-
-# --- Script Management ---
-echo "[2/3] Setting up repository at $REPO_DIR..."
-mkdir -p "$REPO_DIR"
-
-# Download raspi-cloud (The TUI/Manager)
-echo "      Downloading raspi-cloud..."
-if curl -fsSL "$BASE_URL/raspi-cloud" -o "$REPO_DIR/raspi-cloud"; then
-    chmod +x "$REPO_DIR/raspi-cloud"
-    # Symlink to /usr/local/sbin for global path access
-    ln -sf "$REPO_DIR/raspi-cloud" "$BIN_DIR/raspi-cloud"
-    echo "      raspi-cloud installed to $REPO_DIR and linked to $BIN_DIR."
-else
-    echo "Error: Failed to download raspi-cloud." >&2
-    exit 1
-fi
-
-# Download provision.sh (The Factory/Provisioning script)
-echo "      Downloading provision.sh..."
-if curl -fsSL "$BASE_URL/provision.sh" -o "$REPO_DIR/provision.sh"; then
-    chmod +x "$REPO_DIR/provision.sh"
-    echo "      provision.sh installed to $REPO_DIR."
-else
-    echo "Error: Failed to download provision.sh." >&2
-    exit 1
-fi
-
-# --- Handoff ---
-# Note: In a factory setting, provision.sh is called explicitly. 
-# In a user setting, we might run raspi-cloud directly.
-echo "[3/3] Installation complete."
-echo "      Run 'raspi-cloud' to start the TUI."
-echo "      Run '$REPO_DIR/provision.sh' for factory provisioning."
-
-# If we are running interactively, verify raspi-cloud works
-if [ -t 1 ]; then
-    echo "      Handing off to the main TUI script..."
-    exec raspi-cloud
-fi
+echo "Installation complete."
+echo "Run '$REPO_DIR/provision.sh' to configure the device."

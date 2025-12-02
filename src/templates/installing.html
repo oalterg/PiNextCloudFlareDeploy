@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Installing...</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+</head>
+
+<body>
+    <h1>System Installation in Progress</h1>
+    <p>Please do not unplug. This may take 15-20 minutes.</p>
+    <pre id="logs"
+        style="background:#222; color:#0f0; padding:10px; height:300px; overflow:auto; font-size: 12px;"></pre>
+    <script>
+        setInterval(() => {
+            fetch('/api/logs/setup').then(r => r.text()).then(t => {
+                const logDiv = document.getElementById('logs');
+                logDiv.innerText = t;
+                logDiv.scrollTop = logDiv.scrollHeight;
+                if (t.includes("Installation complete")) location.reload();
+            });
+        }, 2000);
+    </script>
+</body>
+
+</html>

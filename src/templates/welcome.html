@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Device Setup</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+    <style>
+        body {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .card {
+            background: #252525;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: left;
+            margin-top: 20px;
+        }
+
+        button {
+            background-color: #2ecc71;
+            color: black;
+            font-size: 1.2em;
+            padding: 15px 30px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Welcome to Your Private Cloud</h1>
+    <p>Your device is ready to be provisioned.</p>
+
+    <div class="card">
+        <h3>Configuration Detected</h3>
+        <ul>
+            <li><strong>Device ID:</strong> {{ config.NEWT_ID }}</li>
+            <li><strong>Nextcloud Domain:</strong> {{ config.NC_DOMAIN }}</li>
+            {% if config.HA_DOMAIN %}
+            <li><strong>Home Assistant:</strong> {{ config.HA_DOMAIN }}</li>
+            {% endif %}
+            <li><strong>Tunnel Endpoint:</strong> {{ config.PANGOLIN_ENDPOINT }}</li>
+        </ul>
+    </div>
+
+    <button onclick="startSetup()" id="btn">Initialize Device Now</button>
+    <p id="msg" style="color: #aaa; margin-top: 10px;"></p>
+
+    <script>
+        function startSetup() {
+            if (!confirm("Start automated installation? This will install Docker, Nextcloud, and Tunnel services.")) return;
+
+            document.getElementById('btn').disabled = true;
+            document.getElementById('btn').innerText = "Starting...";
+            document.getElementById('msg').innerText = "Initiating background processes. The page will reload shortly...";
+
+            fetch('/start_setup', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'started') {
+                        setTimeout(() => window.location.reload(), 5000);
+                    } else {
+                        alert("Error: " + data.error);
+                        document.getElementById('btn').disabled = false;
+                    }
+                })
+                .catch(e => alert("Connection failed"));
+        }
+    </script>
+</body>
+
+</html>
