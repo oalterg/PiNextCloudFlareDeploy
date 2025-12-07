@@ -35,9 +35,17 @@ mkdir -p "$APP_DIR/templates"
 cp "$REPO_DIR/src/app.py" "$APP_DIR/"
 cp -r "$REPO_DIR/src/templates/"* "$APP_DIR/templates/"
 
-# --- 4. Install Service ---
+# --- 4. Install Docker Compose Configuration ---
+echo "Deploying Docker Compose Configuration..."
+cp "$REPO_DIR/config/docker-compose.yml" "$REPO_DIR/"
+
+# --- 5. Install Service ---
 echo "Configuring Systemd Service..."
+# Copy the service file
 cp "$REPO_DIR/config/appliance-manager.service" /etc/systemd/system/
+
+sed -i "s|\$APP_DIR|$APP_DIR|g" /etc/systemd/system/appliance-manager.service
+
 systemctl daemon-reload
 systemctl enable --now appliance-manager.service
 

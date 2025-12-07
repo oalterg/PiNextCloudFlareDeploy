@@ -427,10 +427,22 @@
                 <button type="submit">Save Tunnel</button>
             </form>
 
-            <hr>
+<hr>
             <button style="background-color: #e74c3c;" onclick="revertToFactory()">Revert to Factory (Pangolin)</button>
             {% endif %}
         </div>
+        
+        {% if ha_domain %}
+        <div class="card">
+            <h3>Home Assistant Hardware</h3>
+            <p>Select a Zigbee/Z-Wave dongle to pass through to Home Assistant.</p>
+            <label>Serial Device:</label>
+            <select id="zigbee-selector">
+                <option value="none">None (Disable)</option>
+            </select>
+            <button onclick="saveZigbeeConfig()" style="margin-top: 10px;">Save Device Config</button>
+        </div>
+        {% endif %}
     </div>
 
     <script>
@@ -456,7 +468,7 @@
             fetchStatus();
         }
 
-        function openTab(id) {
+function openTab(id) {
             document.querySelectorAll('.tab-content').forEach(d => d.classList.remove('active'));
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.getElementById(id).classList.add('active');
@@ -470,6 +482,9 @@
             }
             if (id === 'logs') {
                 pollLogs();
+            }
+            if (id === 'config') {
+                loadSerialDevices();
             }
         }
 
@@ -548,6 +563,29 @@
             if (confirm("Disable Cloudflare and revert to Factory Pangolin settings?")) {
                 triggerAction('/api/tunnel/revert', 'Revert to Factory', {});
                 setTimeout(() => location.reload(), 3000);
+            }
+        }
+
+        async function loadSerialDevices() {
+            try {
+                const res = await fetch('/api/hardware/serial');
+                const devices = await res.json();
+                const sel = document.getElementById('zigbee-selector');
+                // Keep 'None' option
+                sel.innerHTML = '<option value="none">None (Disable)</option>';
+                devices.forEach(d => {
+                    const opt = document.createElement('option');
+                    opt.value = d;
+                    opt.innerText = d;
+                    sel.appendChild(opt);
+                });
+            } catch (e) {}
+        }
+
+        async function saveZigbeeConfig() {
+            const dev = document.getElementById('zigbee-selector').value;
+            if (confirm("Update Home Assistant hardware config? This will restart the Home Assistant service.")) {
+                triggerAction('/api/hardware/zigbee', 'Zigbee Config', { device: dev });
             }
         }
 

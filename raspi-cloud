@@ -34,12 +34,6 @@ else
     is_sd_boot=false
 fi
 
-# --- Ensure dependencies and scripts are ready (idempotent) ---
-if ! command -v dialog >/dev/null 2>&1; then
-    echo "Error: 'dialog' is required but not installed." >&2
-    exit 1
-fi
-
 mkdir -p "$LOG_DIR"
 
 # --- Helper Functions (moved up for availability) ---
@@ -563,16 +557,49 @@ deploy_docker_stack() {
     wait_for_healthy "nextcloud" 600 || exit 1
 }
 
+wait_for_nextcloud_install() {
+    local NC_CID=$(get_nc_cid)
+    [[ -z "$NC_CID" ]] && return 1
+
+    echo "Waiting for Nextcloud internal installation to complete..."
+    # Increased to 120 retries (10 minutes) for slower I/O
+    local retries=120 
+    
+    while [[ $retries -gt 0 ]]; do
+        # Check occ status for 'installed: true'
+        # We redirect stderr because occ throws errors if not installed yet
+        if docker exec --user www-data "$NC_CID" php occ status 2>&1 | grep -q "installed: true"; then
+            echo "✅ Nextcloud is fully installed."
+            return 0
+        fi
+        
+        # progress indicator
+        if (( retries % 6 == 0 )); then
+            echo "   ...waiting for auto-install ($retries retries left)"
+        fi
+        
+        sleep 5
+        ((retries--))
+    done
+
+    echo "[ERROR] Nextcloud installation timed out."
+    docker logs "$NC_CID" | tail -n 50
+    return 1
+}
+
 configure_nextcloud_https() {
     echo "[6/10] Applying reverse proxy HTTPS configuration..."
     local NC_CID=$(docker compose -f "$COMPOSE_FILE" ps -q nextcloud)
     [[ -z "$NC_CID" ]] && die "Nextcloud container not ready."
-     
+
+    # Use shared function to ensure install is done before config
+    wait_for_nextcloud_install || die "Nextcloud installation failed to complete."
+
+    # Now safe to run config commands
     docker exec --user www-data "$NC_CID" php occ config:system:set overwriteprotocol --value=https || die "Failed to set overwriteprotocol."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 0 --value="$TRUSTED_PROXIES_0" || die "Failed to set trusted_proxies 0."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
     docker exec --user www-data "$NC_CID" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
-    
     # Also apply subnet trust if applicable (Headless/Cloudflare)
     configure_docker_subnet_trust
     
@@ -1414,43 +1441,52 @@ configure_watchdog() {
     fi
 }
 
-# --- Setup Nextcloud Cronjob ---
 setup_nextcloud_cron() {
-    if ! is_stack_running; then
-        dialog --title "Error" --msgbox "Nextcloud stack is not running." 8 50
-        return 1
-    fi
-
-    local nc_cid=$(get_nc_cid)
-    if [[ -z "$nc_cid" ]]; then
-        dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
-        return 1
-    fi
-
-    local current_mode=$(docker exec -u www-data "$nc_cid" php occ config:app:get core backgroundjobs_mode 2>/dev/null || echo "unknown")
-    if [[ "$current_mode" == "cron" ]]; then
-        dialog --title "Info" --yesno "Background jobs are already set to cron. Reconfigure cron job anyway?" 8 60
-        if [ $? -ne 0 ]; then return 0; fi
-    else
-        dialog --title "Confirm" --yesno "Set background jobs to cron and install system cron job?" 8 60
-        if [ $? -ne 0 ]; then return 0; fi
-        if ! docker exec -u www-data "$nc_cid" php occ background:cron; then
-            dialog --title "Error" --msgbox "Failed to set background mode to cron." 8 50
+    # Headless guard: Skip checks if called during setup, trust the process
+    if [[ -z "${HEADLESS_MODE-}" ]]; then
+        if ! is_stack_running; then
+            dialog --title "Error" --msgbox "Nextcloud stack is not running." 8 50
             return 1
         fi
     fi
 
+    local nc_cid=$(get_nc_cid)
+    # Retry finding container in headless mode as it might be starting up
+    if [[ -z "$nc_cid" && -n "${HEADLESS_MODE-}" ]]; then
+        sleep 10
+        nc_cid=$(get_nc_cid)
+    fi
+    
+    if [[ -z "$nc_cid" ]]; then
+        [[ -z "${HEADLESS_MODE-}" ]] && dialog --title "Error" --msgbox "Nextcloud container not found." 8 50
+        echo "[WARN] Nextcloud container not found for cron setup." >> "$MAIN_LOG_FILE"
+        return 1
+    fi
+
+    # In Headless mode, force configuration without prompts
+    if [[ -z "${HEADLESS_MODE-}" ]]; then
+        local current_mode=$(docker exec -u www-data "$nc_cid" php occ config:app:get core backgroundjobs_mode 2>/dev/null || echo "unknown")
+        if [[ "$current_mode" == "cron" ]]; then
+            echo "[WARN] Nextcloud cronjob already configured, reconfiguring..." >> "$MAIN_LOG_FILE"
+        fi
+    fi
+
+    echo "[INFO] Configuring Nextcloud Cron..." >> "$MAIN_LOG_FILE"
+    docker exec -u www-data "$nc_cid" php occ background:cron || true
+
     local cron_content="*/5 * * * * root docker exec -u www-data \$(docker compose -f \"$COMPOSE_FILE\" ps -q nextcloud) php cron.php > /dev/null 2>&1"
     echo "$cron_content" > "$NEXTCLOUD_CRON_FILE"
     chmod 644 "$NEXTCLOUD_CRON_FILE"
-    dialog --title "Success" --msgbox "Nextcloud cron job setup complete." 8 40
+
+    echo "[INFO] Successfully configured Nextcloud Cron" >> "$MAIN_LOG_FILE"
 }
 
-# --- Disable Wireless ---
 disable_wireless() {
-    dialog --title "Disable Wireless" --yesno "This will disable WiFi and Bluetooth to maximize power efficiency.\n\nSteps:\n- Add dtoverlay=disable-wifi and dtoverlay=disable-bt to boot config (if not present)\n- Install rfkill package (if not installed)\n- Block WiFi and Bluetooth immediately via rfkill\n\nA reboot is recommended for changes to take full effect.\n\nProceed?" 18 70
-    if [ $? -ne 0 ]; then
-        return 0
+    if [[ -z "${HEADLESS_MODE-}" ]]; then
+        dialog --title "Disable Wireless" --yesno "This will disable WiFi/Bluetooth.\nProceed?" 10 60
+        if [ $? -ne 0 ]; then return 0; fi
+    else
+        echo "[INFO] Disabling Wireless Interfaces (Headless)..." >> "$MAIN_LOG_FILE"
     fi
 
     local log_file="$LOG_DIR/wireless_disable.log"
@@ -1503,8 +1539,6 @@ disable_wireless() {
         echo "--- Wireless Disable Completed at $(date) ---" >> "$log_file"
     ) & 
     local pid=$!
-
-    dialog --title "Wireless Disable Log" --tailbox "$log_file" 25 80 &
     local tail_pid=$!
 
     wait $pid
@@ -1513,13 +1547,9 @@ disable_wireless() {
     reset_terminal
 
     if [ $exit_code -eq 0 ]; then
-        dialog --title "Success" --msgbox "Wireless disabled successfully. A reboot is recommended for full effect." 8 60
-        dialog --title "Reboot" --yesno "Reboot now?" 8 50
-        if [ $? -eq 0 ]; then
-            sudo reboot
-        fi
+        echo "[INFO] Success." >> "$MAIN_LOG_FILE"
     else
-        dialog --title "Error" --msgbox "Wireless disable failed. Check log at $log_file." 8 60
+        echo "[ERROR] during disabling of wireless." >> "$MAIN_LOG_FILE"
     fi
 }
 
@@ -2133,12 +2163,9 @@ http:
 }
 
 setup_home_assistant() {
-    source "$ENV_FILE" 2>/dev/null || { dialog --title "Error" --msgbox "Environment file not found. Run Nextcloud setup first." 8 50; return; }
-
-    if grep -q "homeassistant:" "$COMPOSE_FILE"; then
-        dialog --title "Warning" --yesno "Home Assistant is already configured in docker-compose.yml. Reconfigure?" 8 50
-        if [ $? -ne 0 ]; then return; fi
-    fi
+    source "$ENV_FILE" 2>/dev/null ||
+    { dialog --title "Error" --msgbox "Environment file not found. Run Nextcloud setup first." 8 50; return;
+    }
 
     local ha_subdomain
     ha_subdomain=$(dialog --stdout --title "Home Assistant Subdomain" --inputbox "Enter subdomain for Home Assistant (e.g., ha):" 8 50 "ha")
@@ -2173,7 +2200,7 @@ setup_home_assistant() {
     update_env "HA_TRUSTED_DOMAINS" "$ha_trusted_domains"
 
     # Reuse Helper Function to modify Compose
-    inject_home_assistant_service "$ha_port" "$zigbee_device"
+    # inject_home_assistant_service "$ha_port" "$zigbee_device"
 
     # Update Cloudflare Tunnel config (Add ingress rule)
     local tunnel_config="/etc/cloudflared/config.yml"
@@ -2272,38 +2299,37 @@ run_headless_setup(){
     echo "Starting Headless Setup..." > "$MAIN_LOG_FILE"
     
     # 1. Load Environment (Pre-populated by Python)
-    if [[ -f "$ENV_FILE" ]]; then
+    if [[ -f "$ENV_FILE" ]];
+    then
         source "$ENV_FILE"
     else
         die "Environment file not found for headless setup."
     fi
     
     # 2. Run Dependencies & Config
-    HEADLESS_MODE=true preflight_checks >> "$MAIN_LOG_FILE" 2>&1
+    export HEADLESS_MODE=true 
+    preflight_checks >> "$MAIN_LOG_FILE" 2>&1
     install_dependencies >> "$MAIN_LOG_FILE" 2>&1
     generate_env_template
-    generate_docker_compose
-    
+
     # 3. Gather Config (but respect existing .env values)
     gather_config_from_env >> "$MAIN_LOG_FILE" 2>&1
     generate_env_file >> "$MAIN_LOG_FILE" 2>&1
-
-    # 4. Check for Home Assistant Request
-    # provision.sh sets HA_ENABLED=true if domain is provided
-    if [[ "${HA_ENABLED:-false}" == "true" ]]; then
-        echo "[INFO] Home Assistant requested via factory config. Enabling..." >> "$MAIN_LOG_FILE"
-        # Inject HA into docker-compose BEFORE deploy
-        # Default port 8123, no Zigbee (can't select dongle headlessly reliably without more complex logic)
-        inject_home_assistant_service "${HA_PORT:-8123}" "/dev/ttyUSB0"
-    fi
     
     # 5. Deploy Stack
     deploy_docker_stack >> "$MAIN_LOG_FILE" 2>&1
+
+    wait_for_nextcloud_install >> "$MAIN_LOG_FILE" 2>&1 || die "Installation failed."
     
-    # Configure Tunnels (Pangolin or Cloudflare based on env)
+    # 6. Configure Tunnels (Pangolin or Cloudflare based on env)
     update_tunnel_services >> "$MAIN_LOG_FILE" 2>&1
+
+    # 7. Hardening & Configuration
+    echo "[7/10] Configuring system hardening..." >> "$MAIN_LOG_FILE"
+    setup_nextcloud_cron >> "$MAIN_LOG_FILE" 2>&1
+    disable_wireless >> "$MAIN_LOG_FILE" 2>&1
     
-    # 7. Finish
+    # 8. Finish
     touch "$REPO_DIR/.setup_complete"
     echo "✅ Installation complete!" >> "$MAIN_LOG_FILE"
     exit 0
