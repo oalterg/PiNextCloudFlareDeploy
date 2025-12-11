@@ -681,16 +681,36 @@ restore() {
     else
         read -rp "Type 'OVERWRITE' to proceed: " CONFIRM
     fi
-    [[ "${CONFIRM^^}" == "OVERWRITE" ]] || { echo "Restore aborted by user."; exit 0; }
+    [[ "${CONFIRM^^}" == "OVERWRITE" ]] ||
+    { echo "Restore aborted by user."; exit 0; }
+
+    # --- Pre-Flight Integrity Check (Hardening) ---
+    echo "[0/6] Verifying backup integrity..."
+    if ! gzip -t "$BACKUP_FILE"; then
+        echo "[ERROR] Backup file is corrupt (gzip integrity check failed)."
+        exit 1
+    fi
+    
+    # Check structure without extracting full archive
+    if ! tar -tf "$BACKUP_FILE" | grep -q "db/nextcloud.sql"; then
+        echo "[ERROR] Backup archive is invalid (missing database dump)."
+        exit 1
+    fi
 
     # --- Main Restore Logic ---
-    echo "[1/6] Stopping and removing Nextcloud container..."
+    echo "[1/6] Stopping Nextcloud..."
+    # Enable maintenance mode first as a safety signal
+    docker exec -u www-data "$(get_nc_cid)" php occ maintenance:mode --on 2>/dev/null || true
     docker compose -f "$REPO_DIR/docker-compose.yml" rm -sf nextcloud
 
     echo "[2/6] Extracting backup to temporary location..."
     tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
-    [[ -d "$TMP_DIR/data" && -f "$TMP_DIR/db/nextcloud.sql" && -d "$TMP_DIR/config" ]] || \
-      { echo "Backup archive is malformed (missing data/, db/, or config/ dirs)."; exit 1; }
+    
+    # Double check extraction success
+    if [[ ! -d "$TMP_DIR/data" || ! -f "$TMP_DIR/db/nextcloud.sql" || ! -d "$TMP_DIR/config" ]]; then
+         echo "[ERROR] Backup archive extraction failed or structure is malformed."
+         exit 1
+    fi
 
     echo "[3/6] Restoring data and config directories..."
     mkdir -p "$NEXTCLOUD_DATA_DIR"
