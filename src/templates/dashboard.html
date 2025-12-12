@@ -214,11 +214,18 @@
                 <button onclick="toggleMaintenance('off')">Disable Maint. Mode</button>
                 <hr>
                 <h3>Updates</h3>
+                <div style="margin-bottom: 10px;">
+                    <label style="font-size: 0.9em; color: #aaa;">Channel:</label>
+                    <select id="update-channel" onchange="resetUpdateUI()" style="padding: 5px; background: #333; color: #fff; border: 1px solid #555;">
+                        <option value="stable">Stable (Releases)</option>
+                        <option value="beta">Beta (Main Branch)</option>
+                    </select>
+                </div>
                 <button onclick="triggerAction('/api/upgrade', 'System Upgrade')">System OS Upgrade</button>
                 <div style="margin-top: 10px;">
                     <button id="btn-check-update" onclick="checkManagerUpdate()">Check App Update</button>
                     <button id="btn-do-update" onclick="doManagerUpdate()"
-                        style="display:none; background-color: #2ecc71; color: black;">Update Manager Now</button>
+                        style="display:none; background-color: #2ecc71; color: black;">Update Now</button>
                     <span id="update-msg" style="font-size: 0.8em; margin-left: 10px;"></span>
                 </div>
             </div>
@@ -778,28 +785,39 @@ function openTab(id) {
             setTimeout(fetchStatus, 1000);
         }
 
+        let pendingUpdateTarget = "";
+
+        function resetUpdateUI() {
+            document.getElementById('update-msg').innerText = "";
+            document.getElementById('btn-do-update').style.display = "none";
+        }
+
         async function checkManagerUpdate() {
             const btn = document.getElementById('btn-check-update');
             const msg = document.getElementById('update-msg');
             const doBtn = document.getElementById('btn-do-update');
-
+            const channel = document.getElementById('update-channel').value;
+ 
             btn.disabled = true;
             btn.innerText = "Checking...";
             msg.innerText = "";
             doBtn.style.display = "none";
-
+ 
             try {
-                const res = await fetch('/api/manager/check_update');
-                const data = await res.json();
-
-                if (data.available) {
-                    msg.innerText = data.message;
-                    msg.style.color = "#2ecc71";
-                    doBtn.style.display = "inline-block";
-                } else {
-                    msg.innerText = data.message;
-                    msg.style.color = "#ccc";
-                }
+               const res = await fetch(`/api/manager/check_update?channel=${channel}`);
+               const data = await res.json();
+               
+               pendingUpdateTarget = data.target_ref;
+                
+               if (data.available) {
+                   msg.innerText = data.message;
+                   msg.style.color = "#2ecc71";
+                   doBtn.style.display = "inline-block";
+                   doBtn.innerText = `Install ${data.target_ref}`;
+               } else {
+                   msg.innerText = data.message;
+                   msg.style.color = "#ccc";
+               }
             } catch (e) {
                 msg.innerText = "Check failed.";
                 msg.style.color = "#e74c3c";
@@ -808,18 +826,26 @@ function openTab(id) {
                 btn.innerText = "Check App Update";
             }
         }
-
-        async function doManagerUpdate() {
-            if (!confirm("Update Device Manager? The interface will restart.")) return;
-            const res = await fetch('/api/manager/update', { method: 'POST' });
+ 
+         async function doManagerUpdate() {
+            const channel = document.getElementById('update-channel').value;
+            if (!confirm(`Update Device Manager to ${channel} ${pendingUpdateTarget}? The interface will restart.`)) return;
+            
+            const res = await fetch('/api/manager/update', { 
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ channel: channel, target_ref: pendingUpdateTarget })
+            });
             const data = await res.json();
             if (data.status === 'started') {
-                alert("Update started. The page will reload in 15 seconds.");
-                setTimeout(() => location.reload(), 15000);
-            } else {
-                alert("Update failed: " + data.error);
-            }
+            alert("Update started. The page will reload in 15 seconds.");
+            document.getElementById('btn-do-update').disabled = true;
+            document.getElementById('btn-do-update').innerText = "Updating...";
+            setTimeout(() => location.reload(), 20000);
+        } else {
+            alert("Update failed to start: " + (data.error || "Unknown error"));
         }
+    }
 
         async function pollTask() {
             const res = await fetch('/api/task_status');

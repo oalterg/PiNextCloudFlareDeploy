@@ -13,7 +13,7 @@ if [ "$#" -ne 5 ]; then echo "Usage: $0 <ID> <SECRET> <NC_DOM> <HA_DOM> <PAN_EP>
 # --- 1. System Dependencies ---
 echo "Installing Application Dependencies..."
 apt-get update -qq
-apt-get install -y python3-flask python3-dotenv python3-pip jq moreutils pwgen git parted
+apt-get install -y python3-flask python3-dotenv python3-requests python3-pip jq moreutils pwgen git parted
 
 # --- 2. Write Factory Config ---
 echo "Writing factory configuration..."
@@ -34,6 +34,12 @@ mkdir -p "$APP_DIR/templates"
 # Copy from the REPO_DIR (setup by the install script) to the APP_DIR (running service)
 cp "$REPO_DIR/src/app.py" "$APP_DIR/"
 cp -r "$REPO_DIR/src/templates/"* "$APP_DIR/templates/"
+
+# --- 3.5 Install Python Requirements ---
+if [ -f "$REPO_DIR/requirements.txt" ]; then
+    echo "Installing Python requirements..."
+    pip3 install -r "$REPO_DIR/requirements.txt" --break-system-packages
+fi
 
 # --- 4. Install Docker Compose Configuration ---
 echo "Deploying Docker Compose Configuration..."

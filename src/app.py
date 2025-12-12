@@ -9,6 +9,7 @@ import json
 import hashlib
 import logging
 import shlex
+import requests
 from flask import Flask, render_template, jsonify, request
 
 app = Flask(__name__)
@@ -25,9 +26,9 @@ BACKUP_DIR = "/mnt/backup"
 RASPI_CLOUD_BIN = "/usr/local/sbin/raspi-cloud"
 CRON_FILE = "/etc/cron.d/nextcloud-backup"
 PROVISION_SCRIPT = f"{REPO_DIR}/provision.sh"
-UPDATE_URL = (
-    "https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/provision.sh"
-)
+VERSION_FILE = f"{REPO_DIR}/version.json"
+UPDATE_SCRIPT = f"{REPO_DIR}/scripts/update.sh"
+REPO_API_URL = "https://api.github.com/repos/oalterg/PiNextCloudFlareDeploy"
 
 LOG_FILES = {
     "setup": f"{LOG_DIR}/main_setup.log",
@@ -41,6 +42,15 @@ current_task_status = {"status": "idle", "message": "", "log_type": "setup"}
 
 
 # --- Helpers ---
+def get_local_version():
+    if os.path.exists(VERSION_FILE):
+        try:
+            with open(VERSION_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"channel": "unknown", "ref": "unknown", "updated_at": "unknown"}
+
 def run_background_task(task_name, command, log_type):
     global current_task_status
     with task_lock:
@@ -815,20 +825,51 @@ def trigger_upgrade():
 
 @app.route("/api/manager/check_update", methods=["GET"])
 def check_manager_update():
+    channel = request.args.get("channel", "stable") # 'stable' or 'beta'
+    local_ver = get_local_version()
+    
     try:
-        temp_file = "/tmp/provision.sh.new"
-        subprocess.check_call(f"curl -fsSL {UPDATE_URL} -o {temp_file}", shell=True)
+        remote_ref = ""
+        message = ""
+        update_available = False
 
-        if not os.path.exists(PROVISION_SCRIPT):
-            return jsonify({"available": True, "message": "Current script missing"})
+        if channel == "stable":
+            # Check Latest Release
+            resp = requests.get(f"{REPO_API_URL}/releases/latest", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                remote_ref = data.get("tag_name", "")
+                # Compare tags (Simple string comparison, semantic versioning library is better but heavy)
+                if remote_ref != local_ver.get("ref"):
+                    update_available = True
+                    message = f"New Release Available: {remote_ref}"
+                else:
+                    message = f"Up to date ({remote_ref})"
+            else:
+                 # Fallback if no releases exist yet
+                 message = "No releases found."
 
-        current_hash = calculate_sha256(PROVISION_SCRIPT)
-        new_hash = calculate_sha256(temp_file)
+        else: # Beta / Dev
+            # Check Main Branch Commit
+            resp = requests.get(f"{REPO_API_URL}/commits/main", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                remote_ref = data.get("sha", "")[:7] # Short SHA
+                if remote_ref != local_ver.get("ref"):
+                    update_available = True
+                    message = f"New Beta Commit: {remote_ref}"
+                else:
+                    message = f"Beta up to date ({remote_ref})"
+            else:
+                message = "Failed to fetch beta info."
 
-        if current_hash != new_hash:
-            return jsonify({"available": True, "message": "New version available"})
-        else:
-            return jsonify({"available": False, "message": "Manager is up to date"})
+        return jsonify({
+            "available": update_available,
+            "message": message,
+            "current_ref": local_ver.get("ref"),
+            "target_ref": remote_ref,
+            "channel": channel
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -839,42 +880,30 @@ def do_manager_update():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
 
-    if not os.path.exists(FACTORY_CONFIG):
-        return (
-            jsonify({"error": "Factory config missing, cannot re-provision safely"}),
-            500,
-        )
+    data = request.json
+    channel = data.get("channel", "stable")
+    target_ref = data.get("target_ref", "main")
 
-    # Retrieve existing factory config via Python to safely pass to the new script.
-    # We avoid relying on shell 'source' which can fail to export variables to child processes.
-    config = get_factory_config()
+    # Ensure update script is executable
+    if not os.path.exists(UPDATE_SCRIPT):
+         # Fallback: Try to chmod if it exists, or error out
+         # In a broken state, one might curl the script here first
+         return jsonify({"error": "Update script missing. Re-install required."}), 500
 
-    # Prepare arguments using shlex.quote to prevent shell injection/corruption
-    args = [
-        config.get("NEWT_ID", ""),
-        config.get("NEWT_SECRET", ""),
-        config.get("NC_DOMAIN", ""),
-        config.get("HA_DOMAIN", ""),
-        config.get("PANGOLIN_ENDPOINT", ""),
-    ]
-    safe_args = " ".join([shlex.quote(a) for a in args])
+    subprocess.run(["chmod", "+x", UPDATE_SCRIPT])
 
     cmd = (
-        f"echo 'Updating Device Manager...' > {LOG_FILES['update']}; "
-        f"curl -fsSL {UPDATE_URL} -o {PROVISION_SCRIPT} >> {LOG_FILES['update']} 2>&1; "
-        f"chmod +x {PROVISION_SCRIPT}; "
-        f"bash {PROVISION_SCRIPT} {safe_args} >> {LOG_FILES['update']} 2>&1; "
-        "systemctl restart appliance-manager"
+        f"echo 'Starting Manager Update ({channel})...' > {LOG_FILES['update']}; "
+        f"{UPDATE_SCRIPT} {channel} {target_ref} >> {LOG_FILES['update']} 2>&1"
     )
 
-    # We fire and forget this specific thread because the restart will kill the app
+    # Fire and forget thread, as the service will restart
     threading.Thread(target=lambda: subprocess.run(cmd, shell=True)).start()
-    return jsonify(
-        {
-            "status": "started",
-            "message": "Manager updating. Service will restart momentarily.",
-        }
-    )
+    
+    return jsonify({
+        "status": "started", 
+        "message": f"Updating to {channel} {target_ref}. Interface will restart."
+    })
 
 
 if __name__ == "__main__":
