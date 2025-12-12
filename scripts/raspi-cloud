@@ -2227,13 +2227,25 @@ run_headless_setup(){
     exit 0
 }
 
+update_manager() {
+    local script="/opt/raspi-nextcloud-setup/scripts/update.sh"
+    if [ -x "$script" ]; then
+        echo "Running robust update script..."
+        "$script" stable main
+    else
+        echo "Update script not found. Please reinstall."
+        exit 1
+    fi
+}
+
 # --- Argument Parsing for Non-Interactive Modes (e.g., cron) ---
 if [ $# -gt 0 ]; then
     case "$1" in
         --backup) backup; exit $? ;;
         --restore) shift; restore "$@"; exit $? ;;
         --headless) run_headless_setup; exit $? ;;
-        --update-tunnels) update_tunnel_services; exit $? ;; # New Flag
+        --update-tunnels) update_tunnel_services; exit $? ;;
+        --update-manager) update_manager; exit $? ;;
     esac
 fi
 

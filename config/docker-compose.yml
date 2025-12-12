@@ -79,6 +79,41 @@ services:
       timeout: 10s
       retries: 5
 
+  newt:
+    profiles:
+      - pangolin
+    image: fosrl/newt:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - PANGOLIN_ENDPOINT=${PANGOLIN_ENDPOINT}
+      - NEWT_ID=${NEWT_ID}
+      - NEWT_SECRET=${NEWT_SECRET}
+  
+  cloudflared-nc:
+    profiles:
+      - cloudflare-nc
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CF_TOKEN_NC}
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+  
+  cloudflared-ha:
+    profiles:
+      - cloudflare-ha
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CF_TOKEN_HA}
+    depends_on:
+      - homeassistant
+
 volumes:
   nextcloud_html:
   db_data:

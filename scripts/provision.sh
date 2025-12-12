@@ -41,6 +41,9 @@ if [ -f "$REPO_DIR/requirements.txt" ]; then
     pip3 install -r "$REPO_DIR/requirements.txt" --break-system-packages
 fi
 
+# Ensure scripts are executable
+chmod +x "$REPO_DIR/scripts/"*.sh
+
 # --- 4. Install Docker Compose Configuration ---
 echo "Deploying Docker Compose Configuration..."
 cp "$REPO_DIR/config/docker-compose.yml" "$REPO_DIR/"

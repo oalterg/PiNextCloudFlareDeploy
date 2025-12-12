@@ -25,10 +25,13 @@ LOG_DIR = "/var/log/raspi-nextcloud"
 BACKUP_DIR = "/mnt/backup"
 RASPI_CLOUD_BIN = "/usr/local/sbin/raspi-cloud"
 CRON_FILE = "/etc/cron.d/nextcloud-backup"
-PROVISION_SCRIPT = f"{REPO_DIR}/provision.sh"
+PROVISION_SCRIPT = f"{REPO_DIR}/scripts/provision.sh"
 VERSION_FILE = f"{REPO_DIR}/version.json"
-UPDATE_SCRIPT = f"{REPO_DIR}/scripts/update.sh"
 REPO_API_URL = "https://api.github.com/repos/oalterg/PiNextCloudFlareDeploy"
+SCRIPT_UPDATE = f"{REPO_DIR}/scripts/update.sh"
+SCRIPT_BACKUP = f"{REPO_DIR}/scripts/backup.sh"
+SCRIPT_RESTORE = f"{REPO_DIR}/scripts/restore.sh"
+SCRIPT_DEPLOY = f"{REPO_DIR}/scripts/deploy.sh"
 
 LOG_FILES = {
     "setup": f"{LOG_DIR}/main_setup.log",
@@ -194,7 +197,7 @@ def start_setup():
         update_env_var("PANGOLIN_ENDPOINT", factory["PANGOLIN_ENDPOINT"])
 
     # 4. Trigger raspi-cloud in headless mode
-    cmd = f"{RASPI_CLOUD_BIN} --headless >> {LOG_FILES['setup']} 2>&1"
+    cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Initial Setup", cmd, "setup")
     ).start()
@@ -564,7 +567,7 @@ def backup_config():
 
     # Update Cron File
     # Cron format: min hour dom month dow
-    cron_line = f"{minute} {hour} {day_month} * {day_week} root {RASPI_CLOUD_BIN} --backup >> {LOG_FILES['backup']} 2>&1\n"
+    cron_line = f"{minute} {hour} {day_month} * {day_week} root bash {SCRIPT_BACKUP} >> {LOG_FILES['backup']} 2>&1\n"
     try:
         # Ensure permissions are restricted
         with open(CRON_FILE, "w") as f:
@@ -595,7 +598,7 @@ def trigger_backup():
         )
         task_name = "Data-Only Backup"
     else:
-        cmd = f"{RASPI_CLOUD_BIN} --backup >> {LOG_FILES['backup']} 2>&1"
+        cmd = f"bash {SCRIPT_BACKUP} >> {LOG_FILES['backup']} 2>&1"
         task_name = "Full System Backup"
 
     threading.Thread(
@@ -638,7 +641,7 @@ def trigger_restore():
         )
         task_name = "Data Restore"
     else:
-        cmd = f"{RASPI_CLOUD_BIN} --restore {full_path} --no-prompt >> {LOG_FILES['restore']} 2>&1"
+        cmd = f"bash {SCRIPT_RESTORE} {full_path} --no-prompt >> {LOG_FILES['restore']} 2>&1"
         task_name = "Full Restore"
 
     threading.Thread(
@@ -671,7 +674,7 @@ def update_tunnel():
         update_env_var("NEWT_SECRET", data.get("secret"))
 
     # Trigger raspi-cloud to update stack logic
-    cmd = f"{RASPI_CLOUD_BIN} --update-tunnels >> {LOG_FILES['setup']} 2>&1"
+    cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Update Tunnel (Pangolin)", cmd, "setup")
     ).start()
@@ -703,7 +706,7 @@ def update_tunnel_cloudflare():
     # raspi-cloud prioritize CF tokens if present.
     # This allows a cleaner "Revert" later.
 
-    cmd = f"{RASPI_CLOUD_BIN} --update-tunnels >> {LOG_FILES['setup']} 2>&1"
+    cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Update Tunnel (Cloudflare)", cmd, "setup")
     ).start()
@@ -728,7 +731,7 @@ def revert_tunnel_provider():
     update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", factory.get("NC_DOMAIN", ""))
     update_env_var("HA_TRUSTED_DOMAINS", factory.get("HA_DOMAIN", ""))
 
-    cmd = f"{RASPI_CLOUD_BIN} --update-tunnels >> {LOG_FILES['setup']} 2>&1"
+    cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Revert to Factory Settings", cmd, "setup")
     ).start()
@@ -885,16 +888,16 @@ def do_manager_update():
     target_ref = data.get("target_ref", "main")
 
     # Ensure update script is executable
-    if not os.path.exists(UPDATE_SCRIPT):
+    if not os.path.exists(SCRIPT_UPDATE):
          # Fallback: Try to chmod if it exists, or error out
          # In a broken state, one might curl the script here first
          return jsonify({"error": "Update script missing. Re-install required."}), 500
 
-    subprocess.run(["chmod", "+x", UPDATE_SCRIPT])
+    subprocess.run(["chmod", "+x", SCRIPT_UPDATE])
 
     cmd = (
         f"echo 'Starting Manager Update ({channel})...' > {LOG_FILES['update']}; "
-        f"{UPDATE_SCRIPT} {channel} {target_ref} >> {LOG_FILES['update']} 2>&1"
+        f"{SCRIPT_UPDATE} {channel} {target_ref} >> {LOG_FILES['update']} 2>&1"
     )
 
     # Fire and forget thread, as the service will restart

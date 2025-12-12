@@ -25,11 +25,11 @@ echo "Downloading repository..."
 curl -L "$REPO_URL" | tar -xz --strip-components=1 -C "$REPO_DIR"
 
 # 3. Setup Permissions
-chmod +x "$REPO_DIR/provision.sh"
-chmod +x "$REPO_DIR/raspi-cloud"
+chmod +x "$REPO_DIR/scripts/provision.sh"
+chmod +x "$REPO_DIR/scripts/raspi-cloud"
 
 # 4. Symlink Binary
-ln -sf "$REPO_DIR/raspi-cloud" "$BIN_DIR/raspi-cloud"
+ln -sf "$REPO_DIR/scripts/raspi-cloud" "$BIN_DIR/raspi-cloud"
 
 echo "Installation complete."
-echo "Run '$REPO_DIR/provision.sh' to configure the device."
+echo "Run '$REPO_DIR/scripts/provision.sh' to configure the device."

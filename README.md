@@ -16,7 +16,7 @@ Install the Web Manager service. Replace placeholders with your Pangolin/Newt cr
 
 ```bash
 # Usage: provision.sh <NEWT_ID> <NEWT_SECRET> <NC_DOMAIN> <HA_DOMAIN> <PANGOLIN_ENDPOINT>
-sudo /opt/raspi-nextcloud-setup/provision.sh "id" "secret" "cloud.example.com" "ha.example.com" "https://pangolin.endpoint"
+sudo /opt/raspi-nextcloud-setup/scripts/provision.sh "id" "secret" "cloud.example.com" "ha.example.com" "https://pangolin.endpoint"
 ```
 
 ### Usage
