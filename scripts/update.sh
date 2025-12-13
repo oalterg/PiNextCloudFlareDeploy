@@ -118,5 +118,3 @@ EOF
 
 log_info "Restarting Manager Service..."
 systemctl restart appliance-manager
-
-log_info "[SUCCESS] Update Complete."
