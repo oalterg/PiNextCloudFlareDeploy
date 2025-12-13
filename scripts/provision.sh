@@ -23,7 +23,6 @@ NEWT_SECRET=${2}
 NC_DOMAIN=${3}
 HA_DOMAIN=${4}
 PANGOLIN_ENDPOINT=${5}
-HA_ENABLED=$([[ -n "${4}" ]] && echo "true" || echo "false")
 EOF
 chmod 600 "$BOOT_CONFIG"
 

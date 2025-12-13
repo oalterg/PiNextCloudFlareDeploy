@@ -32,6 +32,7 @@ SCRIPT_UPDATE = f"{REPO_DIR}/scripts/update.sh"
 SCRIPT_BACKUP = f"{REPO_DIR}/scripts/backup.sh"
 SCRIPT_RESTORE = f"{REPO_DIR}/scripts/restore.sh"
 SCRIPT_DEPLOY = f"{REPO_DIR}/scripts/deploy.sh"
+SCRIPT_REDEPLOY = f"{REPO_DIR}/scripts/redeploy_tunnels.sh"
 
 LOG_FILES = {
     "setup": f"{LOG_DIR}/main_setup.log",
@@ -188,7 +189,6 @@ def start_setup():
         update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", factory["NC_DOMAIN"])
     if "HA_DOMAIN" in factory:
         update_env_var("HA_TRUSTED_DOMAINS", factory["HA_DOMAIN"])
-        update_env_var("HA_ENABLED", "true") 
     if "NEWT_ID" in factory:
         update_env_var("NEWT_ID", factory["NEWT_ID"])
     if "NEWT_SECRET" in factory:
@@ -673,8 +673,9 @@ def update_tunnel():
         update_env_var("NEWT_ID", data.get("id"))
         update_env_var("NEWT_SECRET", data.get("secret"))
 
-    # Trigger raspi-cloud to update stack logic
-    cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
+    # Trigger deploy script to update stack logic
+    subprocess.run(["chmod", "+x", SCRIPT_REDEPLOY])
+    cmd = f"bash {SCRIPT_REDEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Update Tunnel (Pangolin)", cmd, "setup")
     ).start()
@@ -703,10 +704,11 @@ def update_tunnel_cloudflare():
         update_env_var("CF_TOKEN_HA", token)
 
     # NOTE: We do not explicitly unset PANGOLIN vars here because
-    # raspi-cloud prioritize CF tokens if present.
+    # deploy.sh prioritizes CF tokens if present.
     # This allows a cleaner "Revert" later.
 
-    cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
+    subprocess.run(["chmod", "+x", SCRIPT_REDEPLOY])
+    cmd = f"bash {SCRIPT_REDEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Update Tunnel (Cloudflare)", cmd, "setup")
     ).start()
@@ -731,7 +733,8 @@ def revert_tunnel_provider():
     update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", factory.get("NC_DOMAIN", ""))
     update_env_var("HA_TRUSTED_DOMAINS", factory.get("HA_DOMAIN", ""))
 
-    cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
+    subprocess.run(["chmod", "+x", SCRIPT_REDEPLOY])
+    cmd = f"bash {SCRIPT_REDEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Revert to Factory Settings", cmd, "setup")
     ).start()
