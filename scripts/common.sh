@@ -56,7 +56,6 @@ get_tunnel_profiles() {
 
     if [[ -n "$cf_nc_token" ]] || [[ -n "$cf_ha_token" ]]; then
         # --- Cloudflare Mode ---
-        # Only entered if Pangolin is NOT fully configured
         if [[ -n "$cf_nc_token" ]]; then
             profiles="${profiles} --profile cloudflare-nc"
         fi

@@ -10,6 +10,19 @@ if [ -t 1 ]; then :; else exec >> "$SETUP_LOG_FILE" 2>&1; fi
 log_info "=== Starting Deployment/Update: $(date) ==="
 load_env
 
+# --- 0. Install Dependencies ---
+log_info "Installing dependencies"
+apt-get install -y ca-certificates gnupg lsb-release cron jq moreutils gpg rsync initramfs-tools
+# Docker setup (idempotent)
+if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+    apt-get update -y
+fi
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable --now docker
+
 # --- 1. Docker Stack Deployment ---
 log_info "Deploying Docker stack, this can take while..."
 # Ensure docker is running (if just installed)
