@@ -23,31 +23,41 @@ log_info "Channel: ${1:-stable} | Target: ${2:-main}"
 CHANNEL="${1:-stable}"
 TARGET_REF="${2:-main}"
 
+# 0. Self-Update Check (Hardening)
+# Fetch the target update.sh and common.sh, reload if either changed
+log_info "Checking for update script changes..."
+
+SELF_TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$SELF_TMP_DIR"' EXIT  # Ensure cleanup on exit
+
+if [ "$CHANNEL" == "stable" ]; then
+    BASE_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$TARGET_REF/scripts"
+else
+    BASE_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/scripts"
+fi
+
+# Hardened curl: timeout, retries, fail on error
+curl -L -f -s --max-time 30 --retry 3 --retry-delay 5 "$BASE_URL/update.sh" -o "$SELF_TMP_DIR/update.sh" || { log_error "Failed to fetch new update script"; exit 1; }
+curl -L -f -s --max-time 30 --retry 3 --retry-delay 5 "$BASE_URL/common.sh" -o "$SELF_TMP_DIR/common.sh" || { log_error "Failed to fetch new common script"; exit 1; }
+
+chmod +x "$SELF_TMP_DIR/update.sh"
+
+CURRENT_UPDATE="$SCRIPT_DIR/update.sh"
+CURRENT_COMMON="$SCRIPT_DIR/common.sh"
+
+if ! cmp -s "$CURRENT_UPDATE" "$SELF_TMP_DIR/update.sh" || ! cmp -s "$CURRENT_COMMON" "$SELF_TMP_DIR/common.sh" ; then
+    log_info "Changes detected in update.sh or common.sh. Reloading with new versions..."
+    exec "$SELF_TMP_DIR/update.sh" "$CHANNEL" "$TARGET_REF"
+fi
+
+log_info "Update script and common up-to-date. Proceeding..."
+
 load_env
 
-# 0. Self-Update Check (Hardening)
-# Fetch the target update.sh and reload if changed
 # 1. Prepare Environment
-mkdir -p "/tmp"  # Ensure tmp exists
+mkdir -p "/tmp" # Ensure tmp exists
 TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
-
-log_info "Checking for update script changes..."
-NEW_UPDATE="$TEMP_DIR/new_update.sh"
-if [ "$CHANNEL" == "stable" ]; then
-    RAW_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$TARGET_REF/scripts/update.sh"
-else
-    RAW_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/scripts/update.sh"
-fi
-curl -L -f -s "$RAW_URL" -o "$NEW_UPDATE" || { log_error "Failed to fetch new update script"; exit 1; }
-chmod +x "$NEW_UPDATE"
-
-CURRENT_SCRIPT="${BASH_SOURCE[0]}"
-if ! cmp -s "$CURRENT_SCRIPT" "$NEW_UPDATE"; then
-    log_info "New update script detected. Reloading..."
-    exec "$NEW_UPDATE" "$CHANNEL" "$TARGET_REF"
-fi
-log_info "Update script up-to-date. Proceeding..."
+trap 'rm -rf "$TEMP_DIR" "$SELF_TMP_DIR"' EXIT  # Double-trap for safety
 
 # 2. Download Artifact
 if [ "$CHANNEL" == "stable" ]; then
@@ -57,12 +67,14 @@ else
 fi
 
 log_info "Downloading from $URL..."
-curl -L -f -s "$URL" -o "$TEMP_DIR/update.tar.gz" || { log_error "Download failed"; exit 1; }
+curl -L -f -s --max-time 60 --retry 3 --retry-delay 5 "$URL" -o "$TEMP_DIR/update.tar.gz" || { log_error "Download failed"; exit 1; }
+
+# Todo: Add checksum verification
 
 # 3. Extract
 log_info "Extracting..."
 mkdir -p "$TEMP_DIR/extract"
-tar -xzf "$TEMP_DIR/update.tar.gz" --strip-components=1 -C "$TEMP_DIR/extract"
+tar -xzf "$TEMP_DIR/update.tar.gz" --strip-components=1 -C "$TEMP_DIR/extract" || { log_error "Extraction failed"; exit 1; }
 
 # 4. Backup Critical Configs (Preserve State)
 log_info "Preserving configuration..."
@@ -74,38 +86,38 @@ cp "$INSTALL_DIR/factory_config.txt" "$TEMP_DIR/extract/factory_config.txt" 2>/d
 log_info "Applying file updates..."
 # rsync ensures we get new files, delete removed files, but exclude our preserved configs from being overwritten if they were missing in source
 rsync -a --delete \
-    --exclude='.env' \
-    --exclude='.setup_complete' \
-    --exclude='docker-compose.yml' \
-    --exclude='docker-compose.override.yml' \
-    --exclude='.git' \
-    --exclude='version.json' \
-    "$TEMP_DIR/extract/" "$INSTALL_DIR/"
+--exclude='.env' \
+--exclude='.setup_complete' \
+--exclude='docker-compose.yml' \
+--exclude='docker-compose.override.yml' \
+--exclude='.git' \
+--exclude='version.json' \
+"$TEMP_DIR/extract/" "$INSTALL_DIR/" || { log_error "Rsync failed"; exit 1; }
 
 # 6. Deploy Web Manager Files
 log_info "Deploying Web App..."
 mkdir -p "$APP_DIR/templates"
-cp "$INSTALL_DIR/src/app.py" "$APP_DIR/"
-cp -r "$INSTALL_DIR/src/templates/"* "$APP_DIR/templates/"
+cp "$INSTALL_DIR/src/app.py" "$APP_DIR/" || { log_error "Failed to copy app.py"; exit 1; }
+cp -r "$INSTALL_DIR/src/templates/"* "$APP_DIR/templates/" || { log_error "Failed to copy templates"; exit 1; }
 
 # 7. Update Binaries
 chmod +x "$INSTALL_DIR/scripts/raspi-cloud"
-ln -sf "$INSTALL_DIR/scripts/raspi-cloud" "/usr/local/sbin/raspi-cloud"
+ln -sf "$INSTALL_DIR/scripts/raspi-cloud" "/usr/local/sbin/raspi-cloud" || { log_error "Failed to link raspi-cloud"; exit 1; }
 
 # 8. Dependency Management
 log_info "Updating Python dependencies..."
 if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-    pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages
+    pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages || { log_error "Pip install failed"; exit 1; }
 fi
 
 # 9. Docker Stack Update
 log_info "Updating Docker Stack..."
 cd "${INSTALL_DIR}" || die "Failed to cd to ${INSTALL_DIR}"
 # Pull latest images defined in compose
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull 
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull || { log_error "Docker pull failed"; exit 1; }
 # Restart containers (recreates them if image changed or compose file changed)
 profiles=$(get_tunnel_profiles)
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans || { log_error "Docker up failed"; exit 1; }
 
 # 10. Write Version File
 cat > "$INSTALL_DIR/version.json" <<EOF
@@ -117,4 +129,4 @@ cat > "$INSTALL_DIR/version.json" <<EOF
 EOF
 
 log_info "Restarting Manager Service..."
-systemctl restart appliance-manager
+systemctl restart appliance-manager || { log_error "Service restart failed"; exit 1; }
