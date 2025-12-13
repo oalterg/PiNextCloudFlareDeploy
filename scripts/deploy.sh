@@ -95,6 +95,7 @@ fi
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
 profiles=$(get_tunnel_profiles)
+log_info "Tunnel Profile: $profiles"
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans
 
 wait_for_healthy "db" 120 || die "DB failed to start."

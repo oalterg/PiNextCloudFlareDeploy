@@ -25,10 +25,29 @@ TARGET_REF="${2:-main}"
 
 load_env
 
+# 0. Self-Update Check (Hardening)
+# Fetch the target update.sh and reload if changed
 # 1. Prepare Environment
-mkdir -p "$BACKUP_DIR"
+mkdir -p "/tmp"  # Ensure tmp exists
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
+
+log_info "Checking for update script changes..."
+NEW_UPDATE="$TEMP_DIR/new_update.sh"
+if [ "$CHANNEL" == "stable" ]; then
+    RAW_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$TARGET_REF/scripts/update.sh"
+else
+    RAW_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/scripts/update.sh"
+fi
+curl -L -f -s "$RAW_URL" -o "$NEW_UPDATE" || { log_error "Failed to fetch new update script"; exit 1; }
+chmod +x "$NEW_UPDATE"
+
+CURRENT_SCRIPT="${BASH_SOURCE[0]}"
+if ! cmp -s "$CURRENT_SCRIPT" "$NEW_UPDATE"; then
+    log_info "New update script detected. Reloading..."
+    exec "$NEW_UPDATE" "$CHANNEL" "$TARGET_REF"
+fi
+log_info "Update script up-to-date. Proceeding..."
 
 # 2. Download Artifact
 if [ "$CHANNEL" == "stable" ]; then
@@ -38,7 +57,7 @@ else
 fi
 
 log_info "Downloading from $URL..."
-curl -L -f -s "$URL" -o "$TEMP_DIR/update.tar.gz" || { echo "[ERROR] Download failed"; exit 1; }
+curl -L -f -s "$URL" -o "$TEMP_DIR/update.tar.gz" || { log_error "Download failed"; exit 1; }
 
 # 3. Extract
 log_info "Extracting..."
@@ -47,7 +66,7 @@ tar -xzf "$TEMP_DIR/update.tar.gz" --strip-components=1 -C "$TEMP_DIR/extract"
 
 # 4. Backup Critical Configs (Preserve State)
 log_info "Preserving configuration..."
-cp "$INSTALL_DIR/.env" "$TEMP_DIR/extract/.env" 2>/dev/null || echo "[WARN] .env not found, skipping preservation"
+cp "$INSTALL_DIR/.env" "$TEMP_DIR/extract/.env" 2>/dev/null || log_warn ".env not found, skipping preservation"
 cp "$INSTALL_DIR/docker-compose.override.yml" "$TEMP_DIR/extract/docker-compose.override.yml" 2>/dev/null || true
 cp "$INSTALL_DIR/factory_config.txt" "$TEMP_DIR/extract/factory_config.txt" 2>/dev/null || true
 
@@ -97,7 +116,7 @@ cat > "$INSTALL_DIR/version.json" <<EOF
 }
 EOF
 
-echo "[INFO] Restarting Manager Service..."
+log_info "Restarting Manager Service..."
 systemctl restart appliance-manager
 
-echo "[SUCCESS] Update Complete."
+log_info "[SUCCESS] Update Complete."

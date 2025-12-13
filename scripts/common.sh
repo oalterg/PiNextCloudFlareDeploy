@@ -66,7 +66,7 @@ get_tunnel_profiles() {
         fi
     fi
 
-    # Robustness: Trim leading space if any
+    # Trim leading space if any
     profiles="${profiles#" "}"
 
     echo "${profiles}"
