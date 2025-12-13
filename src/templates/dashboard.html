@@ -754,8 +754,11 @@ function openTab(id) {
         async function confirmRestore() {
             const file = document.getElementById('backup-list').value;
             if (!file) return;
-            if (confirm("DANGER: Restore " + file + "? This will overwrite data.")) {
+            const input = prompt("DANGER: This will WIPE ALL DATA and restore " + file + ".\n\nType 'RESTORE' (case-sensitive) to confirm:");
+            if (input === "RESTORE") {
                 triggerAction('/api/restore', 'Restore', { filename: file });
+            } else if (input !== null) {
+                alert("Incorrect confirmation keyword. Restore cancelled.");
             }
         }
 
