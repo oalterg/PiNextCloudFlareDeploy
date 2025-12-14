@@ -214,33 +214,58 @@ def mount_drive():
     if not drive_path or "mmcblk" in drive_path:
         return jsonify({"error": "Invalid drive"}), 400
 
-    # Robustness: Get UUID and FSType to ensure it is mountable
+    # 1. Determine the actual device/partition path to use
+    target_path = drive_path
+    
+    # Check if this is a whole disk device (e.g., /dev/sda)
+    # If it is a whole disk, append '1' to check the first partition (e.g., /dev/sda1)
+    # This is a common convention, though 'p1' for NVMe/MMC can also occur.
+    # The lsblk output in list_drives provides only whole disk paths, so we check for common partition suffixes.
+    if not drive_path.endswith(('0','1','2','3','4','5','6','7','8','9')) and not drive_path.endswith('p'):
+        # Try appending '1'
+        target_path = drive_path + '1'
+        
+        # Verify if the partition actually exists
+        if not os.path.exists(target_path):
+             # For some systems (e.g., NVMe/MMC), the partition might be /dev/nvme0n1p1.
+             # We rely on the user selecting the whole disk, so if /dev/sdX1 doesn't exist, we fallback
+             # to trying the original whole-disk path, as it *might* have been formatted without partitions.
+             target_path = drive_path
+             
+    # 2. Get UUID and FSType from the target path
     try:
-        uuid = (
-            subprocess.check_output(f"blkid -o value -s UUID {drive_path}", shell=True)
-            .decode()
-            .strip()
-        )
-        fstype = (
-            subprocess.check_output(f"blkid -o value -s TYPE {drive_path}", shell=True)
-            .decode()
-            .strip()
-        )
+        # Check UUID/FSType of the identified partition/device
+        uuid_cmd = f"blkid -o value -s UUID {shlex.quote(target_path)}"
+        fstype_cmd = f"blkid -o value -s TYPE {shlex.quote(target_path)}"
+
+        uuid = subprocess.check_output(uuid_cmd, shell=True).decode().strip()
+        fstype = subprocess.check_output(fstype_cmd, shell=True).decode().strip()
 
         if not uuid:
-            return jsonify({"error": "No UUID found. Format drive first."}), 400
+            # Fallback to the original whole-disk path if the partition check failed
+            if target_path != drive_path:
+                uuid = subprocess.check_output(f"blkid -o value -s UUID {shlex.quote(drive_path)}", shell=True).decode().strip()
+                fstype = subprocess.check_output(f"blkid -o value -s TYPE {shlex.quote(drive_path)}", shell=True).decode().strip()
+                if uuid:
+                     target_path = drive_path # Use the whole disk path if it has a UUID
+            
+        if not uuid:
+            # If still no UUID, it means the disk or its first partition is unformatted.
+            return jsonify({"error": "No UUID found. Drive is likely unformatted or partitioned incorrectly."}), 400
+
         if fstype not in ["ext4", "ext3", "xfs"]:
             return jsonify({"error": f"Unsupported filesystem ({fstype})"}), 400
     except:
-        return jsonify({"error": "Could not read drive info"}), 500
+        return jsonify({"error": "Could not read drive info (blkid failed)"}), 500
 
-    # Idempotence: Update fstab safely
+    # 3. Use the discovered UUID and FSType to update fstab
+    # We use target_path for unmounting but UUID for fstab entry.
     cmd = (
-        f"umount {drive_path} || true; "
+        f"umount {shlex.quote(target_path)} || true; "
         f"mkdir -p {BACKUP_DIR}; "
         # Remove any existing entry for the backup dir to avoid conflicts
         f"sed -i '\|{BACKUP_DIR}|d' /etc/fstab; "
-        # Add new entry
+        # Add new entry using the validated UUID
         f'echo "UUID={uuid} {BACKUP_DIR} {fstype} defaults,nofail 0 2" >> /etc/fstab; '
         f"mount -a"
     )
