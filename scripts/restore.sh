@@ -41,13 +41,22 @@ fi
 # --- Integrity Check ---
 log_info "Verifying backup integrity..."
 if ! gzip -t "$BACKUP_FILE"; then die "Corrupt backup file."; fi
-#if ! tar -tf "$BACKUP_FILE" | grep -q "db/nextcloud.sql"; then die "Invalid backup structure."; fi TODO: fix
 
 # --- Restore Logic ---
-TMP_DIR=$(mktemp -d -t nextcloud-restore-XXXXXX)
+TMP_DIR=$(mktemp -d -p /home/admin)
 trap 'rm -rf "$TMP_DIR"; log_info "Cleanup done."' EXIT
+if [ ! -d "$TMP_DIR" ]; then
+    die "Failed to create temporary directory on disk."
+fi
 
-log_info "Extracting backup to temporary location..."
+log_info "Checking for sufficient disk space first"
+REQUIRED_SPACE=$(du -sb "$BACKUP_FILE" | cut -f1)
+AVAILABLE_SPACE=$(df -B1 "$TMP_DIR" | tail -1 | awk '{print $4}')
+if [ "$REQUIRED_SPACE" -gt "$AVAILABLE_SPACE" ]; then
+    die "Insufficient space in $TMP_DIR for extraction (need ${REQUIRED_SPACE} bytes, have ${AVAILABLE_SPACE})."
+fi
+
+log_info "Extracting backup to temporary location $TMP_DIR..."
 tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
 
 # --- Smart Structure Detection ---
@@ -80,11 +89,10 @@ log_info "Restoring Nextcloud Config..."
 NC_HTML_VOLUME=$(docker volume ls -q -f name=raspi-nextcloud-setup_nextcloud_html)
 docker run --rm -v "${NC_HTML_VOLUME}:/volume" -v "$TMP_DIR/config:/backup:ro" alpine \
   sh -c "rm -rf /volume/config/* && cp -a /backup/. /volume/config/" || die "Error restoring Nextcloud config.php"
-
  
-echo "Resetting and restoring Nextcloud database..."
+log_info "Resetting and restoring Nextcloud database..."
 docker compose -f "$REPO_DIR/docker-compose.yml" up -d db
-echo "[*] Waiting for DB container to be healthy..."
+log_info "Waiting for DB container to be healthy..."
 wait_for_healthy "db" 120 || die "NC Database container failed to get healthy in time."
 DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
 NETWORK_NAME=$(docker inspect "$DB_CID" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
@@ -119,3 +127,4 @@ log_info "Triggering Nextcloud data scan for all users"
 docker exec -u www-data "$(get_nc_cid)" php occ files:scan --all || log_error "Nextcloud file scan failed."
 
 log_info "=== Restore Complete From: $BACKUP_FILE ==="
+rm -rf "$TMP_DIR"
