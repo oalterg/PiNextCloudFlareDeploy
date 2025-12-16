@@ -86,7 +86,8 @@ log_info "Detected Source: $NC_CONFIG_PATH"
 log_info "Detected DB Dump: $DB_DUMP_PATH"
 
 log_info "Stopping Nextcloud..."
-set_maintenance_mode "--on" || log_error "Could not enable Nextcloud maintenance mode."
+# Attempt to enable maintenance mode, but proceed if container is already down
+set_maintenance_mode "--on" || true
 # Stop only the Nextcloud service
 docker compose -f "$COMPOSE_FILE" rm -sf nextcloud || die "Docker could not stop Nextcloud service."
 
@@ -94,7 +95,18 @@ log_info "Restoring Nextcloud Data..."
 rsync -a --delete "$TMP_DIR/data/" "$NEXTCLOUD_DATA_DIR/" || die "NC Data RSync failed."
 
 log_info "Restoring Nextcloud Config..."
-NC_HTML_VOLUME=$(docker volume ls -q -f name=raspi-nextcloud-setup_nextcloud_html)
+# Hardening: Dynamically find the volume name used by the specific container instance
+# This handles cases where the folder name (project name) differs from default.
+NC_CID_OLD=$(docker compose -f "$COMPOSE_FILE" ps -a -q nextcloud | head -n1)
+if [[ -n "$NC_CID_OLD" ]]; then
+    NC_HTML_VOLUME=$(docker inspect "$NC_CID_OLD" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+else
+    # Fallback if container doesn't exist yet (rare)
+    NC_HTML_VOLUME=$(docker volume ls -q | grep "nextcloud_html" | head -n1)
+fi
+
+if [[ -z "$NC_HTML_VOLUME" ]]; then die "Could not locate Nextcloud HTML volume."; fi
+
 docker run --rm -v "${NC_HTML_VOLUME}:/volume" -v "$TMP_DIR/config:/backup:ro" alpine \
   sh -c "rm -rf /volume/config/* && cp -a /backup/. /volume/config/" || die "Error restoring Nextcloud config.php"
 
@@ -128,7 +140,6 @@ else
 
     # Update the 'nextcloud_user' password in the MySQL server itself
     log_info "Syncing Nextcloud DB user password (nextcloud_user) in MySQL server..."
-    # Update/create MySQL user with extracted password
     docker run --rm \
       --network "$NETWORK_NAME" \
       -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
@@ -152,13 +163,23 @@ fi
 
 
 log_info "Restarting Docker Stack..."
-# Since .env is updated and DB user is synced, Nextcloud should start successfully.
 profiles=$(get_tunnel_profiles)
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans || log_error "Failure restarting docker stack."
 
 # Wait for healthy services
 wait_for_healthy "db" 120 || log_warn "Nextcloud DB taking longer to start."
 wait_for_healthy "nextcloud" 180 || log_warn "Nextcloud taking longer to start."
+
+# Re-apply Proxy/Tunnel Configuration ---
+# The restored config.php contains OLD trusted_domains/proxies from the backup time.
+# We must overwrite them with the CURRENT environment settings immediately.
+log_info "Updating restored config with current Tunnel and Proxy settings..."
+
+# Safety: Ensure defaults exist if missing in .env to prevent 'set -u' crash
+export TRUSTED_PROXIES_0="${TRUSTED_PROXIES_0:-127.0.0.1}"
+export TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-172.16.0.0/12}"
+
+configure_nc_ha_proxy_settings || log_warn "Failed to apply proxy settings. External access might be broken."
 
 log_info "Disabling maintenance mode"
 set_maintenance_mode "--off"
