@@ -114,10 +114,10 @@ fi
 log_info "Updating Docker Stack..."
 cd "${INSTALL_DIR}" || die "Failed to cd to ${INSTALL_DIR}"
 # Pull latest images defined in compose
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull || { log_error "Docker pull failed"; exit 1; }
+docker compose --env-file "$ENV_FILE" $(get_compose_args) pull || { log_error "Docker pull failed"; exit 1; }
 # Restart containers (recreates them if image changed or compose file changed)
 profiles=$(get_tunnel_profiles)
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans || { log_error "Docker up failed"; exit 1; }
+docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --remove-orphans || { log_error "Docker up failed"; exit 1; }
 
 # 10. Write Version File
 cat > "$INSTALL_DIR/version.json" <<EOF

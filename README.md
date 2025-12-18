@@ -1,6 +1,15 @@
 # Automated RPi Tunneled NextCloud and Home Assistant  Deployment
 
-Automated deployment of internet accessible Nextcloud and Home Assistant for Raspberry Pi 4/5 (Bookworm) via a Flask-based Web UI. Supports Pangolin and Cloudflare tunnels.
+Deploy and manage your own, fully private, internet-accessible Raspberry Pi cloud server in under 10 minutes, without requiring static IP, port-forwarding, or dynamic DNS.
+
+Automates deployment of Nextcloud and Home Assistant via a Flask-based Web UI. Supports Pangolin and Cloudflare tunnels.
+
+
+### 0\. Prerequisites
+
+ 0. RaspberryPi 5 with LAN internet access (headless) with fresh 64bit Raspberry Pi OS Lite install and ssh access
+ 1. Pangolin or Cloudflared registered Domain
+ 2. Tunnel (with keys) created from Pangolin or Cloudflare dashboard
 
 ### 1\. Bootstrap
 

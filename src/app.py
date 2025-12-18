@@ -794,43 +794,80 @@ def list_serial_devices():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/hardware/zigbee", methods=["POST"])
-def configure_zigbee():
-    if current_task_status["status"] == "running":
-        return jsonify({"error": "Task running"}), 409
+@app.route("/api/manager/zigbee", methods=["GET", "POST"])
+def manage_zigbee():
+    """
+    GET: Returns the currently configured Zigbee device from the override file.
+    POST: Updates the override file and restarts Home Assistant in the background.
+    """
+    override_path = os.path.join(REPO_DIR, "docker-compose.override.yml")
+    
+    # --- GET: Persistence Check ---
+    if request.method == "GET":
+        current_device = "none"
+        if os.path.exists(override_path):
+            try:
+                with open(override_path, "r") as f:
+                    content = f.read()
+                    # Look for common serial device patterns in the mapped volume
+                    if "/dev/ttyUSB0" in content: current_device = "/dev/ttyUSB0"
+                    elif "/dev/ttyACM0" in content: current_device = "/dev/ttyACM0"
+                    elif "/dev/ttyAMA0" in content: current_device = "/dev/ttyAMA0"
+            except Exception as e:
+                logging.error(f"Failed to read override file: {e}")
+        return jsonify({"current": current_device})
 
-    device_path = request.json.get("device")
-    override_file = f"{REPO_DIR}/docker-compose.override.yml"
+    # --- POST: Configuration Update ---
+    data = request.json
+    device = data.get("device")
+    valid_devices = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyAMA0", "none"]
+
+    if device not in valid_devices:
+        return jsonify({"error": "Invalid device path"}), 400
 
     try:
-        if not device_path or device_path == "none":
-            if os.path.exists(override_file):
-                os.remove(override_file)
-            msg = "Zigbee device removed."
+        if device == "none":
+            if os.path.exists(override_path):
+                os.remove(override_path)
+            message = "Zigbee device removed."
         else:
-            # Create a robust override file
-            content = f"""services:
+            # Generate the override YAML. 
+            # This ensures HA gets the device even if the main compose doesn't have it.
+            yaml_content = f"""
+services:
   homeassistant:
     devices:
-      - "{device_path}:{device_path}"
+      - {device}:{device}
 """
-            with open(override_file, "w") as f:
-                f.write(content)
-            msg = f"Zigbee device {device_path} configured."
+            with open(override_path, "w") as f:
+                f.write(yaml_content.strip())
+            message = f"Zigbee device set to {device}."
 
-        # Restart HA to apply
-        cmd = f"docker compose -f {COMPOSE_FILE} -f {override_file} up -d homeassistant"
-        # If the override file doesn't exist (removed), we just use the main file
-        if not os.path.exists(override_file):
-            cmd = f"docker compose -f {COMPOSE_FILE} up -d homeassistant"
+        # Robust Restart Logic:
+        # We must tell Docker to use both files if the override exists, 
+        # otherwise it won't see the new mapping during the restart.
+        def restart_ha():
+            compose_cmd = ["docker", "compose", "-f", COMPOSE_FILE]
+            if os.path.exists(override_path):
+                compose_cmd.extend(["-f", override_path])
+            
+            # Use 'up -d' instead of 'restart' because 'up' recreates 
+            # the container if the hardware mapping (config) changed.
+            compose_cmd.extend(["up", "-d", "homeassistant"])
+            
+            logging.info(f"Executing: {' '.join(compose_cmd)}")
+            subprocess.run(compose_cmd, check=False)
 
-        threading.Thread(
-            target=run_background_task, args=("Configure Zigbee", cmd, "setup")
-        ).start()
+        # Fire and forget to keep the UI responsive
+        threading.Thread(target=restart_ha, daemon=True).start()
 
-        return jsonify({"status": "started", "message": msg})
+        return jsonify({
+            "status": "success",
+            "message": f"{message} Home Assistant is restarting..."
+        })
 
     except Exception as e:
+        logging.error(f"Zigbee update error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/upgrade", methods=["POST"])

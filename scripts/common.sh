@@ -5,6 +5,7 @@ export REPO_DIR="/opt/raspi-nextcloud-setup"
 export LOG_DIR="/var/log/raspi-nextcloud"
 export ENV_FILE="$REPO_DIR/.env"
 export COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
+export OVERRIDE_FILE="$REPO_DIR/docker-compose.override.yml"
 export BACKUP_MOUNTDIR="/mnt/backup"
 
 # Ensure log directory exists
@@ -28,12 +29,21 @@ load_env() {
 }
 
 # --- Docker Helpers ---
+# Helper to get all active compose files
+get_compose_args() {
+    local args="-f $COMPOSE_FILE"
+    if [[ -f "$OVERRIDE_FILE" ]]; then
+        args="$args -f $OVERRIDE_FILE"
+    fi
+    echo "$args"
+}
+
 get_nc_cid() {
-    docker compose -f "$COMPOSE_FILE" ps -q nextcloud 2>/dev/null || true
+    docker compose $(get_compose_args) ps -q nextcloud 2>/dev/null || true
 }
 
 get_ha_cid() {
-    docker compose -f "$COMPOSE_FILE" ps -q homeassistant 2>/dev/null || true
+    docker compose $(get_compose_args) ps -q homeassistant 2>/dev/null || true
 }
 
 is_stack_running() {
@@ -85,7 +95,7 @@ wait_for_healthy() {
     # Retry finding container ID
     local retries=10
     while [[ $retries -gt 0 ]]; do
-        container_id=$(docker compose -f "$COMPOSE_FILE" ps -q "$service_name" 2>/dev/null)
+        container_id=$(docker compose $(get_compose_args) ps -q "$service_name" 2>/dev/null)
         if [[ -n "$container_id" ]]; then break; fi
         sleep 2
         ((retries--))

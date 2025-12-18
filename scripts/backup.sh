@@ -66,7 +66,7 @@ log_info "[1/6] Checking for sufficient disk space..."
 # Check DB connectivity for size estimation
 wait_for_healthy "db" 60 || die "Database is not healthy, cannot perform backup."
 # ensures valid configuration before querying Docker for database ID
-DB_CID=$(get_tunnel_profiles >/dev/null; docker compose -f "$COMPOSE_FILE" ps -q db)
+DB_CID=$(get_tunnel_profiles >/dev/null; docker compose $(get_compose_args) ps -q db)
 
 ESTIMATED_DATA_KB=$(du -sk "$NEXTCLOUD_DATA_DIR" | awk '{print $1}')
 # Dynamically estimate DB size

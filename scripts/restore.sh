@@ -89,7 +89,7 @@ log_info "Stopping Nextcloud..."
 # Attempt to enable maintenance mode, but proceed if container is already down
 set_maintenance_mode "--on" || true
 # Stop only the Nextcloud service
-docker compose -f "$COMPOSE_FILE" rm -sf nextcloud || die "Docker could not stop Nextcloud service."
+docker compose $(get_compose_args) rm -sf nextcloud || die "Docker could not stop Nextcloud service."
 
 log_info "Restoring Nextcloud Data..."
 rsync -a --delete "$TMP_DIR/data/" "$NEXTCLOUD_DATA_DIR/" || die "NC Data RSync failed."
@@ -97,7 +97,7 @@ rsync -a --delete "$TMP_DIR/data/" "$NEXTCLOUD_DATA_DIR/" || die "NC Data RSync 
 log_info "Restoring Nextcloud Config..."
 # Hardening: Dynamically find the volume name used by the specific container instance
 # This handles cases where the folder name (project name) differs from default.
-NC_CID_OLD=$(docker compose -f "$COMPOSE_FILE" ps -a -q nextcloud | head -n1)
+NC_CID_OLD=$(docker compose $(get_compose_args) ps -a -q nextcloud | head -n1)
 if [[ -n "$NC_CID_OLD" ]]; then
     NC_HTML_VOLUME=$(docker inspect "$NC_CID_OLD" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
 else
@@ -164,7 +164,7 @@ fi
 
 log_info "Restarting Docker Stack..."
 profiles=$(get_tunnel_profiles)
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans || log_error "Failure restarting docker stack."
+docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --remove-orphans || log_error "Failure restarting docker stack."
 
 # Wait for healthy services
 wait_for_healthy "db" 120 || log_warn "Nextcloud DB taking longer to start."
@@ -188,11 +188,11 @@ log_info "Post-restore hardening: Fixing permissions..."
 chown -R 33:33 "$NEXTCLOUD_DATA_DIR" || log_warn "Failed to chown data dir."
 
 log_info "Running upgrade if needed..."
-docker compose -f "$COMPOSE_FILE" exec -u www-data nextcloud php occ upgrade || log_warn "Upgrade failed—check Nextcloud logs."
+docker compose $(get_compose_args) exec -u www-data nextcloud php occ upgrade || log_warn "Upgrade failed—check Nextcloud logs."
 
 log_info "Running repairs..."
-docker compose -f "$COMPOSE_FILE" exec -u www-data nextcloud php occ maintenance:repair || log_warn "Repair failed."
-docker compose -f "$COMPOSE_FILE" exec -u www-data nextcloud php occ db:add-missing-indices || log_warn "Index add failed."
+docker compose $(get_compose_args) exec -u www-data nextcloud php occ maintenance:repair || log_warn "Repair failed."
+docker compose $(get_compose_args) exec -u www-data nextcloud php occ db:add-missing-indices || log_warn "Index add failed."
 
 log_info "Triggering Nextcloud data scan for all users"
 docker exec -u www-data "$(get_nc_cid)" php occ files:scan --all || log_error "Nextcloud file scan failed."

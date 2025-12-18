@@ -444,38 +444,56 @@
             <h3>Home Assistant Hardware</h3>
             <p>Select a Zigbee/Z-Wave dongle to pass through to Home Assistant.</p>
             <label>Serial Device:</label>
-            <select id="zigbee-selector">
-                <option value="none">None (Disable)</option>
+            <select id="zigbee-device">
+                <option value="none">None</option>
+                <option value="/dev/ttyUSB0">Sonoff Zigbee 3.0 (USB0)</option>
+                <option value="/dev/ttyACM0">Zigbee Dongle (ACM0)</option>
             </select>
-            <button onclick="saveZigbeeConfig()" style="margin-top: 10px;">Save Device Config</button>
-        </div>
+            <button onclick="updateZigbee()">Save & Restart HA</button>        </div>
         {% endif %}
     </div>
 
     <script>
         let currentLogSource = 'setup';
 
-        function init() {
-            // Populate Hours
+        async function init() {
+            // 1. Populate Hours (UI Setup)
             const hourSel = document.getElementById('bk-hour');
-            for (let i = 0; i < 24; i++) {
-                let opt = document.createElement('option');
-                opt.value = i;
-                opt.innerText = i.toString().padStart(2, '0') + ':00';
-                hourSel.appendChild(opt);
+            if (hourSel) {
+                for (let i = 0; i < 24; i++) {
+                    let opt = document.createElement('option');
+                    opt.value = i;
+                    opt.innerText = i.toString().padStart(2, '0') + ':00';
+                    hourSel.appendChild(opt);
+                }
             }
-
+        
+            // 2. Fetch Initial Data immediately (before intervals)
+            // We 'await' these so the page isn't blank on load
+            try {
+                await fetchZigbeeStatus();
+                await fetchStatus(); 
+                await pollTask();
+                // If you have pollServices(), call it here too:
+                // await pollServices(); 
+            } catch (err) {
+                console.error("Initial fetch failed:", err);
+            }
+        
+            // 3. Start Polling Intervals
             setInterval(fetchStatus, 5000);
             setInterval(pollTask, 2000);
+            
             // Poll logs only if on logs tab
             setInterval(() => {
-                if (document.getElementById('logs').classList.contains('active')) pollLogs();
+                const logsTab = document.getElementById('logs');
+                if (logsTab && logsTab.classList.contains('active')) {
+                    pollLogs();
+                }
             }, 3000);
-
-            fetchStatus();
         }
 
-function openTab(id) {
+        function openTab(id) {
             document.querySelectorAll('.tab-content').forEach(d => d.classList.remove('active'));
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.getElementById(id).classList.add('active');
@@ -830,7 +848,7 @@ function openTab(id) {
             }
         }
  
-         async function doManagerUpdate() {
+        async function doManagerUpdate() {
             const channel = document.getElementById('update-channel').value;
             if (!confirm(`Update Device Manager to ${channel} ${pendingUpdateTarget}? The interface will restart.`)) return;
             
@@ -849,6 +867,34 @@ function openTab(id) {
             alert("Update failed to start: " + (data.error || "Unknown error"));
         }
     }
+
+        async function fetchZigbeeStatus() {
+            try {
+                const res = await fetch('/api/manager/zigbee');
+                const data = await res.json();
+                if (data.current) {
+                    document.getElementById('zigbee-device').value = data.current;
+                }
+            } catch (e) {
+                console.error("Failed to fetch zigbee status", e);
+            }
+        }
+
+        async function updateZigbee() {
+            const dev = document.getElementById('zigbee-device').value;
+            const btn = document.querySelector('button[onclick="updateZigbee()"]');
+            btn.disabled = true;
+            
+            const res = await fetch('/api/manager/zigbee', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ device: dev })
+            });
+            
+            const data = await res.json();
+            alert(data.message || data.status);
+            btn.disabled = false;
+        }
 
         async function pollTask() {
             const res = await fetch('/api/task_status');

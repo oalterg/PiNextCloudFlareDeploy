@@ -16,15 +16,15 @@ load_env
 # Docker compose 'up' with profiles ignores services not in the active profile,
 # so we must manually ensure the old ones are dead.
 log_info "Stopping any existing tunnel services..."
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" stop newt cloudflared-nc cloudflared-ha 2>/dev/null || true
+docker compose --env-file "$ENV_FILE" $(get_compose_args) stop newt cloudflared-nc cloudflared-ha 2>/dev/null || true
 
 # 2. Identify and Pull New Profile
 profiles=$(get_tunnel_profiles)
 log_info "Active Tunnel Profile: ${profiles:-None}"
 
 if [[ -n "$profiles" ]]; then
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} pull
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans
+    docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} pull
+    docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --remove-orphans
 else
     log_info "No tunnel configured. Skipping tunnel startup."
 fi
@@ -39,7 +39,7 @@ configure_nc_ha_proxy_settings
 # Nextcloud reads config.php on every request, so strict restart isn't always needed, 
 # but we restart to be safe and ensure clean state.
 log_info "Restarting core services to apply changes..."
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" restart homeassistant nextcloud
+docker compose --env-file "$ENV_FILE" $(get_compose_args) restart homeassistant nextcloud
 
 # 5. Verification
 # Wait for HA to actually come back up to confirm success

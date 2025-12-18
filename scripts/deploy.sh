@@ -32,10 +32,10 @@ if ! systemctl is-active --quiet docker; then
     sleep 5
 fi
 
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+docker compose --env-file "$ENV_FILE" $(get_compose_args) pull
 profiles=$(get_tunnel_profiles)
 log_info "Tunnel Profile: $profiles"
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ${profiles} up -d --remove-orphans
+docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --remove-orphans
 
 wait_for_healthy "db" 120 || die "DB failed to start."
 wait_for_healthy "nextcloud" 400 || die "Nextcloud failed to start."
@@ -59,7 +59,7 @@ done
 [[ $TIMEOUT -le 0 ]] && die "Nextcloud installation timed out."
 
 configure_nc_ha_proxy_settings || die "Proxy configuration failed."
-docker compose -f "$COMPOSE_FILE" restart nextcloud homeassistant
+docker compose $(get_compose_args) restart nextcloud homeassistant
 wait_for_healthy "nextcloud" 120 || die "Nextcloud failed to get healthy after proxy config" 
 wait_for_healthy "homeassistant" 120 || die "Homeassistant failed to get healthy after proxy config" 
 
