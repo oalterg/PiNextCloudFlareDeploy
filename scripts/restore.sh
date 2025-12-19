@@ -125,10 +125,10 @@ else
     sed -i "s/^MYSQL_PASSWORD=.*/MYSQL_PASSWORD=$DB_PASS/" "$ENV_FILE" || log_warn "Failed to update .env MYSQL_PASSWORD."
 
     log_info "Resetting and restoring Nextcloud database..."
-    docker compose -f "$REPO_DIR/docker-compose.yml" up -d db
+    docker compose -f "$INSTALL_DIR/docker-compose.yml" up -d db
     log_info "Waiting for DB container to be healthy..."
     wait_for_healthy "db" 120 || die "NC Database container failed to get healthy in time."
-    DB_CID="$(docker compose -f "$REPO_DIR/docker-compose.yml" ps -q db)"
+    DB_CID="$(docker compose -f "$INSTALL_DIR/docker-compose.yml" ps -q db)"
     NETWORK_NAME=$(docker inspect "$DB_CID" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
  
     # Drop and recreate database to ensure idempotent restore

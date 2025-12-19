@@ -4,16 +4,16 @@
 set -Eeuo pipefail
 
 # --- Configuration ---
-REPO_DIR="/opt/raspi-nextcloud-setup"
+INSTALL_DIR="/opt/homebrain"
 BIN_DIR="/usr/local/sbin"
-LOG_DIR="/var/log/raspi-nextcloud"
+LOG_DIR="/var/log/homebrain"
 # Use a specific branch/tag for stability, or 'main' for latest
-REPO_URL="https://github.com/oalterg/pinextcloudflaredeploy/archive/refs/heads/main.tar.gz"
+REPO_URL="https://github.com/oalterg/homebrain/archive/refs/heads/main.tar.gz"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then echo "Run as root."; exit 1; fi
 
 echo "=== Bootstrapper Started ==="
-mkdir -p "$LOG_DIR" "$REPO_DIR"
+mkdir -p "$LOG_DIR" "$INSTALL_DIR"
 
 # 1. Install Unpacking Dependencies
 apt-get update -qq
@@ -22,14 +22,14 @@ apt-get install -y curl tar gzip
 # 2. Download and Extract Repository
 echo "Downloading repository..."
 # --strip-components=1 removes the root folder (e.g., repo-main/) from the tarball
-curl -L "$REPO_URL" | tar -xz --strip-components=1 -C "$REPO_DIR"
+curl -L "$REPO_URL" | tar -xz --strip-components=1 -C "$INSTALL_DIR"
 
 # 3. Setup Permissions
-chmod +x "$REPO_DIR/scripts/provision.sh"
-chmod +x "$REPO_DIR/scripts/raspi-cloud"
+chmod +x "$INSTALL_DIR/scripts/provision.sh"
+chmod +x "$INSTALL_DIR/scripts/raspi-cloud"
 
 # 4. Symlink Binary
-ln -sf "$REPO_DIR/scripts/raspi-cloud" "$BIN_DIR/raspi-cloud"
+ln -sf "$INSTALL_DIR/scripts/raspi-cloud" "$BIN_DIR/raspi-cloud"
 
 echo "Installation complete."
-echo "Run '$REPO_DIR/scripts/provision.sh' to configure the device."
+echo "Run '$INSTALL_DIR/scripts/provision.sh' to configure the device."

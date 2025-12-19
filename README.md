@@ -1,4 +1,4 @@
-# Automated RPi Tunneled NextCloud and Home Assistant  Deployment
+# HomeBrain: Automated RPi Tunneled NextCloud and Home Assistant Deployment
 
 Deploy and manage your own, fully private, internet-accessible Raspberry Pi cloud server in under 10 minutes, without requiring static IP, port-forwarding, or dynamic DNS.
 
@@ -16,16 +16,16 @@ Automates deployment of Nextcloud and Home Assistant via a Flask-based Web UI. S
 Download scripts and install core dependencies:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oalterg/pinextcloudflaredeploy/main/install | sudo bash
+curl -fsSL https://raw.githubusercontent.com/oalterg/homebrain/main/install | sudo bash
 ```
 
 ### 2\. Tunnel Provisioning
 
-Install the Web Manager service. Replace placeholders with your Pangolin/Newt credentials:
+Install the HomeBrain Manager service. Replace placeholders with your Pangolin/Newt credentials:
 
 ```bash
 # Usage: provision.sh <NEWT_ID> <NEWT_SECRET> <NC_DOMAIN> <HA_DOMAIN> <PANGOLIN_ENDPOINT>
-sudo /opt/raspi-nextcloud-setup/scripts/provision.sh "id" "secret" "cloud.example.com" "ha.example.com" "https://pangolin.endpoint"
+sudo /opt/homebrain/scripts/provision.sh "id" "secret" "cloud.example.com" "ha.example.com" "https://pangolin.endpoint"
 ```
 
 ### Usage

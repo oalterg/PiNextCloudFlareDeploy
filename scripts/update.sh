@@ -6,11 +6,9 @@ source "$SCRIPT_DIR/common.sh"
 
 # --- Configuration ---
 REPO_OWNER="oalterg"
-REPO_NAME="PiNextCloudFlareDeploy"
-INSTALL_DIR="/opt/raspi-nextcloud-setup"
-APP_DIR="/opt/appliance-manager"
-BACKUP_DIR="/var/backups/raspi-manager"
-LOG_FILE="/var/log/raspi-nextcloud/manager_update.log"
+REPO_NAME="HomeBrain"
+INSTALL_DIR="/opt/homebrain"
+LOG_FILE="/var/log/homebrain/manager_update.log"
 ENV_FILE="$INSTALL_DIR/.env"
 
 if [ -t 1 ]; then :; else exec >> "$LOG_FILE" 2>&1; fi
@@ -94,12 +92,6 @@ rsync -a --delete \
 --exclude='version.json' \
 "$TEMP_DIR/extract/" "$INSTALL_DIR/" || { log_error "Rsync failed"; exit 1; }
 
-# 6. Deploy Web Manager Files
-log_info "Deploying Web App..."
-mkdir -p "$APP_DIR/templates"
-cp "$INSTALL_DIR/src/app.py" "$APP_DIR/" || { log_error "Failed to copy app.py"; exit 1; }
-cp -r "$INSTALL_DIR/src/templates/"* "$APP_DIR/templates/" || { log_error "Failed to copy templates"; exit 1; }
-
 # 7. Update Binaries
 chmod +x "$INSTALL_DIR/scripts/raspi-cloud"
 ln -sf "$INSTALL_DIR/scripts/raspi-cloud" "/usr/local/sbin/raspi-cloud" || { log_error "Failed to link raspi-cloud"; exit 1; }
@@ -129,4 +121,4 @@ cat > "$INSTALL_DIR/version.json" <<EOF
 EOF
 
 log_info "Restarting Manager Service..."
-systemctl restart appliance-manager || { log_error "Service restart failed"; exit 1; }
+systemctl restart homebrain-manager || { log_error "Service restart failed"; exit 1; }

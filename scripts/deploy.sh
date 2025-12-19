@@ -76,4 +76,4 @@ rfkill block wifi || true
 rfkill block bluetooth || true
 
 log_info "=== Deployment Complete ==="
-touch "$REPO_DIR/.setup_complete"
+touch "$INSTALL_DIR/.setup_complete"

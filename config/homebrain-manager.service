@@ -1,0 +1,12 @@
+[Unit]
+Description=HomeBrain Manager
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=$SERVICE_DIR
+ExecStart=/usr/bin/python3 $SERVICE_DIR/app.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

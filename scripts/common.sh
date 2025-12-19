@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # --- Global Configuration ---
-export REPO_DIR="/opt/raspi-nextcloud-setup"
-export LOG_DIR="/var/log/raspi-nextcloud"
-export ENV_FILE="$REPO_DIR/.env"
-export COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
-export OVERRIDE_FILE="$REPO_DIR/docker-compose.override.yml"
+export INSTALL_DIR="/opt/homebrain"
+export LOG_DIR="/var/log/homebrain"
+export ENV_FILE="$INSTALL_DIR/.env"
+export COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+export OVERRIDE_FILE="$INSTALL_DIR/docker-compose.override.yml"
 export BACKUP_MOUNTDIR="/mnt/backup"
 
 # Ensure log directory exists

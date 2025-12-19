@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # --- Configuration ---
-APP_DIR="/opt/appliance-manager"
-REPO_DIR="/opt/raspi-nextcloud-setup"
+# distinct APP_DIR removed; we run directly from the repo structure
+INSTALL_DIR="/opt/homebrain"
+SERVICE_DIR="$INSTALL_DIR/src"
 BOOT_CONFIG="/boot/firmware/factory_config.txt"
+LOG_DIR="/var/log/homebrain"
 
 # --- Input Validation ---
 if [[ $EUID -ne 0 ]]; then echo "Run as root."; exit 1; fi
@@ -26,35 +28,42 @@ PANGOLIN_ENDPOINT=${5}
 EOF
 chmod 600 "$BOOT_CONFIG"
 
-# --- 3. Deploy Application Files ---
-echo "Deploying Web Manager..."
-mkdir -p "$APP_DIR/templates"
+# --- 3. Setup Python Environment ---
+echo "Provisioning HomeBrain Manager..."
 
-# Copy from the REPO_DIR (setup by the install script) to the APP_DIR (running service)
-cp "$REPO_DIR/src/app.py" "$APP_DIR/"
-cp -r "$REPO_DIR/src/templates/"* "$APP_DIR/templates/"
-
-# --- 3.5 Install Python Requirements ---
-if [ -f "$REPO_DIR/requirements.txt" ]; then
+# Install Requirements directly from the service directory
+if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     echo "Installing Python requirements..."
-    pip3 install -r "$REPO_DIR/requirements.txt" --break-system-packages
+    pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages
 fi
 
 # Ensure scripts are executable
-chmod +x "$REPO_DIR/scripts/"*.sh
+chmod +x "$INSTALL_DIR/scripts/"*.sh
 
 # --- 4. Install Docker Compose Configuration ---
 echo "Deploying Docker Compose Configuration..."
-cp "$REPO_DIR/config/docker-compose.yml" "$REPO_DIR/"
+cp "$INSTALL_DIR/config/docker-compose.yml" "$INSTALL_DIR/"
 
 # --- 5. Install Service ---
 echo "Configuring Systemd Service..."
+
 # Copy the service file
-cp "$REPO_DIR/config/appliance-manager.service" /etc/systemd/system/
+SERVICE_FILE="$INSTALL_DIR/config/homebrain-manager.service"
 
-sed -i "s|\$APP_DIR|$APP_DIR|g" /etc/systemd/system/appliance-manager.service
+if [ -f "$SERVICE_FILE" ]; then
+    cp "$SERVICE_FILE" /etc/systemd/system/
+    
+    # Patch the WorkingDirectory in the systemd file to point to src directory
+    sed -i "s|WorkingDirectory=.*|WorkingDirectory=$SERVICE_DIR|g" /etc/systemd/system/homebrain-manager.service
+    
+    # Patch the ExecStart to point to the app.py location
+    sed -i "s|ExecStart=.*|ExecStart=/usr/bin/python3 $SERVICE_DIR/app.py|g" /etc/systemd/system/homebrain-manager.service
 
-systemctl daemon-reload
-systemctl enable --now appliance-manager.service
+    systemctl daemon-reload
+    systemctl enable --now homebrain-manager.service
+else
+    echo "ERROR: Service file not found at $SERVICE_FILE"
+    exit 1
+fi
 
-echo "Provisioning Complete. Web UI available on port 80."
+echo "HomeBrain Provisioning Complete. Web UI available on port 80."

@@ -2,7 +2,7 @@
 <html>
 
 <head>
-    <title>Device Dashboard</title>
+    <title>HomeBrain Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/dark.css">
     <style>
@@ -163,7 +163,7 @@
 
 <body>
     <div class="header">
-        <h1>Device Manager</h1>
+        <h1>HomeBrain Manager</h1>
         <div style="text-align:right">
             <div id="global-status">System Active</div>
             <div class="provider-mode">Tunnel: {{ tunnel.mode.upper() }}</div>
@@ -850,7 +850,7 @@
  
         async function doManagerUpdate() {
             const channel = document.getElementById('update-channel').value;
-            if (!confirm(`Update Device Manager to ${channel} ${pendingUpdateTarget}? The interface will restart.`)) return;
+            if (!confirm(`Update HomeBrain Manager to ${channel} ${pendingUpdateTarget}? The interface will restart.`)) return;
             
             const res = await fetch('/api/manager/update', { 
                 method: 'POST',
