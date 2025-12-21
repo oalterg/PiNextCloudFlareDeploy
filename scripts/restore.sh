@@ -204,6 +204,13 @@ export TRUSTED_PROXIES_1="${TRUSTED_PROXIES_1:-172.16.0.0/12}"
 
 configure_nc_ha_proxy_settings || log_warn "Failed to apply proxy settings. External access might be broken."
 
+# Restart to apply proxy settings (Safe restart)
+# We do not restart DB here, only the frontends
+log_info "Restarting NC & HA frontends to apply proxy settings."
+docker compose $(get_compose_args) restart nextcloud homeassistant
+wait_for_healthy "nextcloud" 120 || log_error "Nextcloud failed to get healthy after proxy config" 
+wait_for_healthy "homeassistant" 120 || log_error "Homeassistant failed to get healthy after proxy config" 
+
 log_info "Disabling maintenance mode"
 set_maintenance_mode "--off"
 
