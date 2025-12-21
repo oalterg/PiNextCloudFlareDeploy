@@ -322,8 +322,8 @@
                 <hr>
                 <h4>Trigger Manual Backup</h4>
                 <select id="backup-strategy">
-                    <option value="full">Full System (Recommended)</option>
-                    <option value="data_only">Nextcloud Data Only (Faster)</option>
+                    <option value="full">Full System (Nextcloud + HA + DB)</option>
+                    <option value="data_only">Files Only (Nextcloud + HA, No DB)</option>
                 </select>
                 <button onclick="runBackup()">Run Backup Now</button>
             </div>

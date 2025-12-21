@@ -5,7 +5,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/common.sh"
 RESTORE_LOG_FILE="$LOG_DIR/restore.log"
 
-# Log only if not running interactively (e.g., via a system service)
+# Log only if not running interactively
 if [ -t 1 ]; then :; else exec >> "$RESTORE_LOG_FILE" 2>&1; fi
 
 load_env
@@ -21,21 +21,17 @@ fi
 
 if [[ -z "$BACKUP_FILE" ]]; then
     # Auto-select latest
-    BACKUP_FILE="$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -name 'nextcloud_backup_*.tar.gz' -print0 | xargs -0 ls -t | head -n1)"
+    BACKUP_FILE="$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -name '*backup*.tar.gz' -print0 | xargs -0 ls -t | head -n1)"
 fi
 
-# Hardening: Check for path traversal characters in the selected file name
-if [[ "$BACKUP_FILE" != *"nextcloud_backup_"* ]]; then
-    die "Invalid or untrusted backup file path detected: $BACKUP_FILE"
+if [[ -z "$BACKUP_FILE" || ! -f "$BACKUP_FILE" ]]; then
+    die "Backup file not found or invalid selection: ${BACKUP_FILE:-None}"
 fi
 
-if [[ ! -f "$BACKUP_FILE" ]]; then
-    die "Backup file not found: $BACKUP_FILE"
-fi
-
-# Interactive confirmation for manual CLI runs
+# Interactive confirmation
 if [[ "$ARG_FLAG" != "--no-prompt" ]]; then
-    echo "⚠️  WARNING: RESTORE PROCESS INITIATED ⚠️"
+    echo "⚠️ WARNING: RESTORE PROCESS INITIATED ⚠️"
+    echo "Restoring: $BACKUP_FILE"
     echo "This will WIPE ALL DATA in: ${NEXTCLOUD_DATA_DIR:-/home/admin/nextcloud}"
     read -p "Type 'wipe' to confirm: " confirm
     if [[ "$confirm" != "wipe" ]]; then
@@ -52,11 +48,11 @@ if ! gzip -t "$BACKUP_FILE"; then die "Corrupt backup file."; fi
 TMP_DIR=$(mktemp -d -p /home/admin)
 trap 'rm -rf "$TMP_DIR"; log_info "Cleanup done."' EXIT
 if [ ! -d "$TMP_DIR" ]; then
-    die "Failed to create temporary directory on disk."
+    die "Failed to create temporary directory."
 fi
 
 log_info "Checking for sufficient disk space first"
-REQUIRED_SPACE=$(du -sb "$BACKUP_FILE" | cut -f1)
+REQUIRED_SPACE=$(gzip -l "$BACKUP_FILE" | awk 'NR==2 {print int($2 * 1.1)}' || echo $(( $(du -sb "$BACKUP_FILE" | cut -f1) * 5 )))
 AVAILABLE_SPACE=$(df -B1 "$TMP_DIR" | tail -1 | awk '{print $4}')
 if [ "$REQUIRED_SPACE" -gt "$AVAILABLE_SPACE" ]; then
     die "Insufficient space in $TMP_DIR for extraction (need ${REQUIRED_SPACE} bytes, have ${AVAILABLE_SPACE})."
@@ -65,110 +61,137 @@ fi
 log_info "Extracting backup to temporary location $TMP_DIR..."
 tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
 
-# --- Smart Structure Detection ---
-# Finds files even if they are nested deep or at root
+# --- Smart Detection ---
 log_info "Analyzing backup structure..."
 
-# 1. Locate Nextcloud Root via config.php
-# Limit find to a reasonable depth
-NC_CONFIG_PATH=$(find "$TMP_DIR" -maxdepth 5 -name "config.php" | head -n 1)
-if [[ -z "$NC_CONFIG_PATH" ]]; then
-    die "Invalid backup structure: 'config.php' not found."
+HAS_NC_DATA=false
+HAS_NC_DB=false
+HAS_NC_CONFIG=false
+HAS_HA_CONFIG=false
+
+# Check for legacy (root/data) or new (nc_data) folder structures
+if [[ -d "$TMP_DIR/nc_data" ]] || [[ -d "$TMP_DIR/data" ]]; then HAS_NC_DATA=true; fi
+if [[ -d "$TMP_DIR/nc_db" ]] || [[ -f "$TMP_DIR/db/nextcloud.sql" ]]; then HAS_NC_DB=true; fi
+if [[ -d "$TMP_DIR/nc_config" ]] || [[ -d "$TMP_DIR/config" ]]; then HAS_NC_CONFIG=true; fi
+if [[ -d "$TMP_DIR/ha_config" ]]; then HAS_HA_CONFIG=true; fi
+
+log_info "Backup Contents: NC_DATA=$HAS_NC_DATA, NC_DB=$HAS_NC_DB, NC_CONFIG=$HAS_NC_CONFIG, HA=$HAS_HA_CONFIG"
+
+if [ "$HAS_NC_DATA" = false ] && [ "$HAS_HA_CONFIG" = false ]; then
+    die "Invalid backup: No Data or HA config found."
 fi
 
-# 2. Locate SQL Dump
-DB_DUMP_PATH=$(find "$TMP_DIR" -maxdepth 5 -name "*.sql" | head -n 1)
-if [[ -z "$DB_DUMP_PATH" ]]; then
-    die "Invalid backup structure: SQL dump (*.sql) not found."
-fi
-
-log_info "Detected Source: $NC_CONFIG_PATH"
-log_info "Detected DB Dump: $DB_DUMP_PATH"
-
-log_info "Stopping Nextcloud..."
+# --- Stop Stack ---
+log_info "Stopping services..."
 # Attempt to enable maintenance mode, but proceed if container is already down
 set_maintenance_mode "--on" || true
-# Stop only the Nextcloud service
-docker compose $(get_compose_args) rm -sf nextcloud || die "Docker could not stop Nextcloud service."
+# Stop Nextcloud and Homeassistant service
+docker compose $(get_compose_args) stop nextcloud homeassistant
 
-log_info "Restoring Nextcloud Data..."
-rsync -a --delete "$TMP_DIR/data/" "$NEXTCLOUD_DATA_DIR/" || die "NC Data RSync failed."
+# --- 1. Restore Nextcloud Data ---
+if [ "$HAS_NC_DATA" = true ]; then
+    log_info "Restoring Nextcloud Data..."
+    SRC="$TMP_DIR/nc_data"; [[ ! -d "$SRC" ]] && SRC="$TMP_DIR/data"
 
-log_info "Restoring Nextcloud Config..."
-# Hardening: Dynamically find the volume name used by the specific container instance
-# This handles cases where the folder name (project name) differs from default.
-NC_CID_OLD=$(docker compose $(get_compose_args) ps -a -q nextcloud | head -n1)
-if [[ -n "$NC_CID_OLD" ]]; then
-    NC_HTML_VOLUME=$(docker inspect "$NC_CID_OLD" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
-else
-    # Fallback if container doesn't exist yet (rare)
-    NC_HTML_VOLUME=$(docker volume ls -q | grep "nextcloud_html" | head -n1)
+    rsync -a --delete "$SRC/" "$NEXTCLOUD_DATA_DIR/" || die "NC Data RSync failed."
+    chown -R 33:33 "$NEXTCLOUD_DATA_DIR"
 fi
 
-if [[ -z "$NC_HTML_VOLUME" ]]; then die "Could not locate Nextcloud HTML volume."; fi
-
-docker run --rm -v "${NC_HTML_VOLUME}:/volume" -v "$TMP_DIR/config:/backup:ro" alpine \
-  sh -c "rm -rf /volume/config/* && cp -a /backup/. /volume/config/" || die "Error restoring Nextcloud config.php"
-
-# Extract password and sync database user BEFORE restart ---
-log_info "Extracting restored DB password and syncing database user..."
-# Use an alpine container to safely read the config file from the restored volume
-DB_PASS=$(docker run --rm -v "${NC_HTML_VOLUME}:/volume:ro" alpine sh -c "
-    grep dbpassword /volume/config/config.php | sed \"s/.* => '//; s/',.*//\"
-")
-
-if [[ -z "$DB_PASS" ]]; then
-    log_warn "No dbpassword found in config.php. Skipping password sync. This may lead to startup failure."
-else
-    log_info "Updating .env file with restored DB password."
-    # Update .env to match for consistency (idempotent sed)
-    sed -i "s/^MYSQL_PASSWORD=.*/MYSQL_PASSWORD=$DB_PASS/" "$ENV_FILE" || log_warn "Failed to update .env MYSQL_PASSWORD."
-
-    log_info "Resetting and restoring Nextcloud database..."
-    docker compose -f "$INSTALL_DIR/docker-compose.yml" up -d db
-    log_info "Waiting for DB container to be healthy..."
-    wait_for_healthy "db" 120 || die "NC Database container failed to get healthy in time."
-    DB_CID="$(docker compose -f "$INSTALL_DIR/docker-compose.yml" ps -q db)"
-    NETWORK_NAME=$(docker inspect "$DB_CID" --format='{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
- 
-    # Drop and recreate database to ensure idempotent restore
-    docker run --rm \
-      --network "$NETWORK_NAME" \
-      -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
-      mysql:8 \
-      sh -c "mysql -h db -u root -e \"DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;\"" || die "Error dropping and recreating NC database."
-
-    # Update the 'nextcloud_user' password in the MySQL server itself
-    log_info "Syncing Nextcloud DB user password (nextcloud_user) in MySQL server..."
-    docker run --rm \
-      --network "$NETWORK_NAME" \
-      -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
-      mysql:8 \
-      sh -c "mysql -h db -u root -e \"
-        CREATE USER IF NOT EXISTS 'nextcloud_user'@'%' IDENTIFIED BY '$DB_PASS';
-        ALTER USER 'nextcloud_user'@'%' IDENTIFIED BY '$DB_PASS';
-        GRANT ALL PRIVILEGES ON $MYSQL_DATABASE.* TO 'nextcloud_user'@'%';
-        FLUSH PRIVILEGES;\"" || log_warn "Failed to sync DB user password — Nextcloud startup will likely fail."
-
-    # Import dump using mysql:8 client container
-    # Ensure the .sql path is correctly volume-mounted
-    DB_DUMP_FILE_NAME=$(basename "$DB_DUMP_PATH")
-    docker run --rm \
-      --network "$NETWORK_NAME" \
-      -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
-      -v "$(dirname "$DB_DUMP_PATH"):/restore_dir:ro" \
-      mysql:8 \
-      sh -c "mysql -h db -u root $MYSQL_DATABASE < /restore_dir/$DB_DUMP_FILE_NAME" || die "NC Database import failed."
+# --- 2. Restore Home Assistant Config ---
+if [ "$HAS_HA_CONFIG" = true ]; then
+    log_info "Restoring Home Assistant Config..."
+    # Ensure volume exists by creating the container (no start)
+    docker compose $(get_compose_args) up --no-start homeassistant
+    HA_CID=$(get_ha_cid)
+    if [[ -z "$HA_CID" ]]; then die "Home Assistant container ID not found. Check if the service exists."; fi
+    # Use helper to copy data INTO the named volume
+    # This ensures files inside the volume are owned by root (default for HA docker)
+    docker run --rm --volumes-from "$HA_CID" \
+    -v "$TMP_DIR/ha_config":/restore_src:ro \
+    alpine sh -c "rm -rf /config/* && cp -a /restore_src/. /config/" || die "HA restore failed."
 fi
 
+# --- 3. Restore Nextcloud Config ---
+if [ "$HAS_NC_CONFIG" = true ]; then
+    log_info "Restoring Nextcloud Config..."
+    SRC="$TMP_DIR/nc_config"; [[ ! -d "$SRC" ]] && SRC="$TMP_DIR/config"
+    # Dynamically find the volume name used by the specific container instance
+    # This handles cases where the folder name (project name) differs from default.
+    NC_CID_OLD=$(docker compose $(get_compose_args) ps -a -q nextcloud | head -n1)
+    
+    if [[ -n "$NC_CID_OLD" ]]; then
+        NC_VOL=$(docker inspect "$NC_CID_OLD" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+    else
+        # Fallback if container doesn't exist yet (rare)
+        NC_VOL=$(docker volume ls -q | grep "nextcloud_html" | head -n1)
+    fi
+    if [[ -z "$NC_VOL" ]]; then die "Could not locate Nextcloud volume."; fi
+    
+    docker run --rm -v "${NC_VOL}:/volume" -v "$SRC:/restore_src:ro" alpine \
+        sh -c "rm -rf /volume/config/* && cp -a /restore_src/. /volume/config/" || die "Error restoring Nextcloud config.php"
+fi
 
+# --- Consolidated DB Password Handling (After Config Restore, Before DB Restore) ---
+if [ "$HAS_NC_CONFIG" = true ]; then
+    log_info "Extracting restored DB credentials and syncing..."
+    # Extract from the restored volume using PHP for safe parsing (final state)
+    DB_USER=$(docker run --rm -v "${NC_VOL}:/volume:ro" php:8-cli php -r '
+        @include "/volume/config/config.php"; echo $CONFIG["dbuser"] ?? "";
+    ') || DB_USER="$MYSQL_USER"  # Fallback to env if extraction fails
+    DB_PASS=$(docker run --rm -v "${NC_VOL}:/volume:ro" php:8-cli php -r '
+        @include "/volume/config/config.php"; echo $CONFIG["dbpassword"] ?? "";
+    ')
+
+    if [[ -z "$DB_PASS" ]]; then
+        log_warn "No dbpassword found in config.php. Skipping password sync. This may lead to startup failure."
+    else
+        # Update .env with restored password
+        log_info "Updating .env file with restored DB password."
+        
+        sed -i "s/^MYSQL_PASSWORD=.*/MYSQL_PASSWORD=$DB_PASS/" "$ENV_FILE" || log_warn "Failed to update .env MYSQL_PASSWORD."
+        # Sync DB user credentials (always, even if no DB restore)
+        log_info "Syncing Database User Credentials..."
+        # Start DB if not already (for sync)
+        docker compose $(get_compose_args) up -d db
+        wait_for_healthy "db" 60 || die "DB failed to start."
+        DB_CID=$(get_nc_db_cid)
+        docker run --rm \
+          --network container:"$DB_CID" \
+          -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+          mysql:8 \
+          mysql -h 127.0.0.1 -u root -e "ALTER USER '$DB_USER'@'%' IDENTIFIED BY '$DB_PASS'; FLUSH PRIVILEGES;" || log_warn "Failed to sync DB password. Nextcloud may be unhealthy."
+    fi
+fi
+
+# --- 4. Restore Database ---
+if [ "$HAS_NC_DB" = true ]; then
+    log_info "Restoring Nextcloud Database..."
+    # DB should already be up from password sync or start here
+    docker compose $(get_compose_args) up -d db
+    wait_for_healthy "db" 60 || die "DB failed to start."
+    DB_CID=$(get_nc_db_cid)
+    
+    # 4a. Import SQL
+    SQL_FILE=$(find "$TMP_DIR" -name "*.sql" | head -n 1)
+    if [[ -f "$SQL_FILE" ]]; then
+        log_info "Importing SQL Dump..."
+        docker run --rm \
+          --network container:"$DB_CID" \
+          -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" \
+          -v "$(dirname "$SQL_FILE"):/restore_dir:ro" \
+          mysql:8 \
+          sh -c "mysql -h 127.0.0.1 -u root -e 'DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;' && mysql -h 127.0.0.1 -u root $MYSQL_DATABASE < /restore_dir/$(basename "$SQL_FILE")" || die "DB Import failed."
+    fi
+fi
+# --- Restart ---
 log_info "Restarting Docker Stack..."
 profiles=$(get_tunnel_profiles)
 docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --remove-orphans || log_error "Failure restarting docker stack."
 
-# Wait for healthy services
-wait_for_healthy "db" 120 || log_warn "Nextcloud DB taking longer to start."
 wait_for_healthy "nextcloud" 180 || log_warn "Nextcloud taking longer to start."
+if [ "$HAS_HA_CONFIG" = true ]; then
+wait_for_healthy "homeassistant" 120 || log_warn "HomeAssistant taking longer to start."
+fi
 
 # Re-apply Proxy/Tunnel Configuration ---
 # The restored config.php contains OLD trusted_domains/proxies from the backup time.
@@ -184,18 +207,19 @@ configure_nc_ha_proxy_settings || log_warn "Failed to apply proxy settings. Exte
 log_info "Disabling maintenance mode"
 set_maintenance_mode "--off"
 
-log_info "Post-restore hardening: Fixing permissions..."
-chown -R 33:33 "$NEXTCLOUD_DATA_DIR" || log_warn "Failed to chown data dir."
-
-log_info "Running upgrade if needed..."
-docker compose $(get_compose_args) exec -u www-data nextcloud php occ upgrade || log_warn "Upgrade failed—check Nextcloud logs."
-
-log_info "Running repairs..."
-docker compose $(get_compose_args) exec -u www-data nextcloud php occ maintenance:repair || log_warn "Repair failed."
-docker compose $(get_compose_args) exec -u www-data nextcloud php occ db:add-missing-indices || log_warn "Index add failed."
-
-log_info "Triggering Nextcloud data scan for all users"
-docker exec -u www-data "$(get_nc_cid)" php occ files:scan --all || log_error "Nextcloud file scan failed."
+# Trigger Repairs/Scan
+if [ "$HAS_NC_DATA" = true ]; then
+    log_info "Running post-restore upgrade if needed..."
+    docker compose $(get_compose_args) exec -u www-data nextcloud php occ upgrade || log_warn "Upgrade failed—check Nextcloud logs."
+    
+    log_info "Running post-restore repairs..."
+    
+    docker compose $(get_compose_args) exec -u www-data nextcloud php occ maintenance:repair || log_warn "Repair failed."
+    docker compose $(get_compose_args) exec -u www-data nextcloud php occ db:add-missing-indices || log_warn "Index add failed."
+    
+    log_info "Triggering Nextcloud data scan for all users"
+    docker exec -u www-data "$(get_nc_cid)" php occ files:scan --all || log_error "Nextcloud file scan failed."
+fi
 
 log_info "=== Restore Complete From: $BACKUP_FILE ==="
 rm -rf "$TMP_DIR"

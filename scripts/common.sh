@@ -39,15 +39,23 @@ get_compose_args() {
 }
 
 get_nc_cid() {
-    docker compose $(get_compose_args) ps -q nextcloud 2>/dev/null || true
+    docker compose $(get_compose_args) ps -a -q nextcloud 2>/dev/null || true
 }
 
 get_ha_cid() {
-    docker compose $(get_compose_args) ps -q homeassistant 2>/dev/null || true
+    docker compose $(get_compose_args) ps -a -q homeassistant 2>/dev/null || true
+}
+
+get_nc_db_cid() {
+    docker compose $(get_compose_args) ps -a -q db 2>/dev/null || true
 }
 
 is_stack_running() {
-    [[ -n "$(get_nc_cid)" ]]
+    local nc_cid=$(get_nc_cid)
+    local ha_cid=$(get_ha_cid)
+    # Returns true only if both Nextcloud and Home Assistant container IDs are found and are running
+    [[ -n "$nc_cid" ]] && [[ $(docker inspect -f '{{.State.Running}}' "$nc_cid" 2>/dev/null) == "true" ]] && \
+    [[ -n "$ha_cid" ]] && [[ $(docker inspect -f '{{.State.Running}}' "$ha_cid" 2>/dev/null) == "true" ]]
 }
 
 # --- Tunnel Profiles Helper ---
@@ -125,7 +133,7 @@ set_maintenance_mode() {
     
     if [[ -z "$nc_cid" ]]; then return 1; fi
     
-    log_info "Setting maintenance mode: $mode"
+    log_info "Setting Nextcloud maintenance mode: $mode"
     docker exec -u www-data "$nc_cid" php occ maintenance:mode "$mode" || true
 }
 
@@ -191,9 +199,9 @@ configure_nc_ha_proxy_settings() {
         docker exec --user www-data "$nc_cid" php occ config:system:set trusted_proxies 1 --value="$TRUSTED_PROXIES_1" || die "Failed to set trusted_proxies 1."
         docker exec --user www-data "$nc_cid" php occ config:system:set trusted_domains 1 --value="$NEXTCLOUD_TRUSTED_DOMAINS" || die "Failed to set trusted_domains 1."
         # Use index 10 to avoid conflict with existing static ones
-        docker exec -u www-data "$nc_cid" php occ config:system:set trusted_proxies 10 --value="$subnet" || die "Failed to set trusted_proxies 10."
+        docker exec --user www-data "$nc_cid" php occ config:system:set trusted_proxies 10 --value="$subnet" || die "Failed to set trusted_proxies 10."
         # Also ensure localhost is trusted
-        docker exec -u www-data "$nc_cid" php occ config:system:set trusted_proxies 11 --value="127.0.0.1" || die "Failed to set trusted_proxies 11."
+        docker exec --user www-data "$nc_cid" php occ config:system:set trusted_proxies 11 --value="127.0.0.1" || die "Failed to set trusted_proxies 11."
     fi
 
     # 2. Update Home Assistant Trusted Proxies

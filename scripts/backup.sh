@@ -6,8 +6,22 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/common.sh"
 
 # --- Configuration ---
-LOCK_FILE="/var/run/nextcloud-backup.lock"
+LOCK_FILE="/var/run/homebrain-backup.lock"
 BACKUP_LOG_FILE="$LOG_DIR/backup.log"
+STRATEGY="full"
+
+# Parse Args
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --strategy)
+      STRATEGY="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 
 # Redirect output to log file if not running interactively
 if [ -t 1 ]; then
@@ -21,9 +35,6 @@ load_env
 # --- Validation ---
 : "${BACKUP_RETENTION:?BACKUP_RETENTION not set}"
 : "${NEXTCLOUD_DATA_DIR:?NEXTCLOUD_DATA_DIR not set}"
-: "${MYSQL_USER:?}"
-: "${MYSQL_PASSWORD:?}"
-: "${MYSQL_DATABASE:?}"
 
 # --- Locking ---
 exec 200>"$LOCK_FILE"
@@ -36,7 +47,15 @@ STAGING_BASE="$BACKUP_MOUNTDIR"
 
 # TRAP to ensure cleanup and maintenance mode is turned off on exit/error
 cleanup() {
+    log_info "Cleaning up..."
     set_maintenance_mode "--off"
+    # Attempt to restart services if we crashed mid-backup
+    if ! is_stack_running; then
+        # Ensure HA is up if we stopped it
+        local ha_cid=$(get_ha_cid)
+        if [[ -n "$ha_cid" ]]; then docker start "$ha_cid" || true; fi
+    fi
+    
     # Remove staging directory safely
     if [[ -n "${STAGING_DIR:-}" && -d "$STAGING_DIR" ]]; then
         rm -rf "$STAGING_DIR"
@@ -48,7 +67,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # --- Main Logic ---
-log_info "=== Starting Backup: $(date) ==="
+log_info "=== Starting Backup [Strategy: $STRATEGY]: $(date) ==="
 
 # 1. Mount Check
 if ! mountpoint -q "$BACKUP_MOUNTDIR"; then
@@ -61,7 +80,14 @@ if [ ! -w "$BACKUP_MOUNTDIR" ]; then
     die "Backup mount point is read-only or inaccessible."
 fi
 
-# 2. Disk Space Check
+# 2. Check Service Health (Required to identify volumes)
+HA_CID=$(get_ha_cid)
+NC_CID=$(get_nc_cid)
+DB_CID=$(get_nc_db_cid)
+
+if [[ -z "$HA_CID" ]]; then log_warn "Home Assistant container not found. Skipping HA backup."; fi
+
+# 3. Disk Space Check
 log_info "[1/6] Checking for sufficient disk space..."
 # Check DB connectivity for size estimation
 wait_for_healthy "db" 60 || die "Database is not healthy, cannot perform backup."
@@ -83,65 +109,89 @@ if [ "$AVAILABLE_KB" -lt "$ESTIMATED_PEAK_KB" ]; then
     die "Insufficient disk space. Available: $((AVAILABLE_KB / 1024)) MB, Needed (peak): $((ESTIMATED_PEAK_KB / 1024)) MB. Aborting."
 fi
 
-# 3. Prepare Staging
+# 4. Prepare Staging
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
+SUFFIX=""
+if [[ "$STRATEGY" == "data_only" ]]; then SUFFIX="_data_only"; fi
 STAGING_DIR=$(mktemp -d -p "$STAGING_BASE" staging_XXXXXX)
-ARCHIVE_PATH="$BACKUP_MOUNTDIR/nextcloud_backup_${DATE}.tar.gz"
+ARCHIVE_PATH="$BACKUP_MOUNTDIR/homebrain_backup${SUFFIX}_${DATE}.tar.gz"
 
-mkdir -p "$STAGING_DIR/data" "$STAGING_DIR/db" "$STAGING_DIR/config"
+mkdir -p "$STAGING_DIR/nc_data" "$STAGING_DIR/nc_db" "$STAGING_DIR/nc_config" "$STAGING_DIR/ha_config"
 
-# 4. Enable Maintenance Mode
-log_info "Enabling NC maintenance mode."
+# 5. Stop Services / Enable Maintenance Mode
+log_info "Preparing services..."
 set_maintenance_mode "--on"
 
-# 5. Database Dump
-log_info "Dumping database..."
-if [[ -z "$DB_CID" ]]; then die "Database container not found."; fi
-
-# Health check first
-docker run --rm \
-    --network container:"$DB_CID" \
-    -e MYSQL_PWD="$MYSQL_PASSWORD" \
-    mysql:8 \
-    mysqladmin -h 127.0.0.1 -u "$MYSQL_USER" ping >/dev/null || die "Database is not responding."
-
-# Then dump (clean output)
-docker run --rm \
-    --network container:"$DB_CID" \
-    -e MYSQL_PWD="$MYSQL_PASSWORD" \
-    mysql:8 \
-    mysqldump --column-statistics=0 -h 127.0.0.1 -u "$MYSQL_USER" "$MYSQL_DATABASE" \
-    > "$STAGING_DIR/db/nextcloud.sql" || die "Database dump failed."
-
-# Verify dump is not empty
-if [ ! -s "$STAGING_DIR/db/nextcloud.sql" ]; then
-    die "Database dump created but file is empty. Backup aborted."
+# STOP Home Assistant to ensure SQLite DB consistency
+if [[ -n "$HA_CID" ]]; then
+    log_info "Stopping Home Assistant..."
+    docker stop "$HA_CID"
 fi
 
-# 6. File Sync
-log_info "Syncing data..."
-# Use rsync to preserve permissions and attributes
-rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/data/" || die "Rsync failed."
+# 6. Database Dump (Full Only)
+if [[ "$STRATEGY" == "full" && -n "$DB_CID" ]]; then
+    log_info "Dumping Nextcloud Database..."
+    
+    if [[ -z "$DB_CID" ]]; then die "Database container not found."; fi
 
-# 7. Config Sync
-log_info "Syncing config..."
-NC_CID=$(get_nc_cid)
-if [[ -z "$NC_CID" ]]; then die "Nextcloud container not found."; fi
+    # Health check first
+    docker run --rm \
+        --network container:"$DB_CID" \
+        -e MYSQL_PWD="$MYSQL_PASSWORD" \
+        mysql:8 \
+        mysqladmin -h 127.0.0.1 -u "$MYSQL_USER" ping >/dev/null || die "Database is not responding."
 
-NC_HTML_VOLUME=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
-docker run --rm -v "${NC_HTML_VOLUME}:/volume:ro" -v "$STAGING_DIR/config":/backup alpine \
-    sh -c "cp -a /volume/config/. /backup/" || die "Config backup failed."
+# Then dump (clean output)
+    docker run --rm \
+        --network container:"$DB_CID" \
+        -e MYSQL_PWD="$MYSQL_PASSWORD" \
+        mysql:8 \
+        mysqldump --column-statistics=0 -h 127.0.0.1 -u "$MYSQL_USER" "$MYSQL_DATABASE" \
+        > "$STAGING_DIR/nc_db/nextcloud.sql" || die "Database dump failed."
 
-# 8. Compress
+    # Verify dump is not empty
+    if [ ! -s "$STAGING_DIR/nc_db/nextcloud.sql" ]; then
+        die "Database dump created but file is empty. Backup aborted."
+    fi
+fi
+
+# 7. Nextcloud Data (Rsync host path)
+log_info "Syncing Nextcloud Data..."
+rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/nc_data/" || die "NC Data Sync failed."
+
+# 8. Nextcloud Config (Helper Container - Full Only)
+if [[ "$STRATEGY" == "full" && -n "$NC_CID" ]]; then
+    log_info "Syncing Nextcloud Config..."
+    if [[ -z "$NC_CID" ]]; then die "Nextcloud container not found."; fi
+
+    NC_VOL=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+    docker run --rm -v "${NC_VOL}:/volume:ro" -v "$STAGING_DIR/nc_config":/backup alpine \
+        sh -c "cp -a /volume/config/. /backup/" || die "NC Config backup failed."
+fi
+
+# 9. Home Assistant Config (Helper Container - All Strategies)
+if [[ -n "$HA_CID" ]]; then
+    log_info "Syncing Home Assistant Config..."
+    # We use --volumes-from because HA uses a named volume, not a bind mount.
+    # Note: HA_CID is stopped, but we can still mount its volumes using the ID.
+    docker run --rm --volumes-from "$HA_CID" \
+        -v "$STAGING_DIR/ha_config":/backup \
+        alpine sh -c "cp -a /config/. /backup/" || die "HA Config backup failed."
+fi
+
+# 10. Restart Services
+log_info "Resuming services..."
+if [[ -n "$HA_CID" ]]; then docker start "$HA_CID"; fi
+set_maintenance_mode "--off"
+
+# 11. Compress
 log_info "Compressing archive..."
-tar -C "$STAGING_DIR" -czf "$ARCHIVE_PATH" data db config || die "Compression failed."
-# Force write to disk
+tar -C "$STAGING_DIR" -czf "$ARCHIVE_PATH" . || die "Compression failed."
 sync
 
-# 9. Retention Policy
-log_info "Applying retention policy (Keep: $BACKUP_RETENTION)..."
-# List files by time, skip the newest N, delete the rest
-ls -tp "$BACKUP_MOUNTDIR"/nextcloud_backup_*.tar.gz 2>/dev/null | \
+# 12. Retention
+log_info "Applying retention (Keep: $BACKUP_RETENTION)..."
+ls -tp "$BACKUP_MOUNTDIR"/homebrain_backup*.tar.gz 2>/dev/null | \
     tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm --
 
 log_info "=== Backup Complete: $ARCHIVE_PATH ==="

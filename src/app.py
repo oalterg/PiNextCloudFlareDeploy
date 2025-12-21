@@ -611,24 +611,17 @@ def trigger_backup():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
 
+    # 'full' = Database + NC Data + NC Config + HA Config
+    # 'data_only' = NC Data + HA Config (No Database, No NC Config)
     strategy = request.json.get("strategy", "full")
 
-    if strategy == "data_only":
-        data_dir = get_env_config().get("NEXTCLOUD_DATA_DIR", "/home/admin/nextcloud")
-        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"{BACKUP_DIR}/nc_data_only_{timestamp}.tar.gz"
-        cmd = (
-            f"echo 'Starting Data-Only Backup...' >> {LOG_FILES['backup']}; "
-            f"tar -czf {filename} -C {data_dir} . >> {LOG_FILES['backup']} 2>&1; "
-            f"echo 'Data-Only Backup Complete: {filename}' >> {LOG_FILES['backup']}"
-        )
-        task_name = "Data-Only Backup"
-    else:
-        cmd = f"bash {SCRIPT_BACKUP} >> {LOG_FILES['backup']} 2>&1"
-        task_name = "Full System Backup"
-
+    # We delegate strictly to the bash script to ensure locking and consistent logic
+    cmd = f"bash {SCRIPT_BACKUP} --strategy {strategy} >> {LOG_FILES['backup']} 2>&1"
+    
+    label = "Full System Backup" if strategy == "full" else "Data-Only Backup"
+    
     threading.Thread(
-        target=run_background_task, args=(task_name, cmd, "backup")
+        target=run_background_task, args=(label, cmd, "backup")
     ).start()
     return jsonify({"status": "started"})
 
@@ -642,6 +635,7 @@ def list_backups():
                 path = os.path.join(BACKUP_DIR, f)
                 try:
                     size = os.path.getsize(path) / (1024 * 1024)
+                    # Infer type from filename injected by backup.sh
                     btype = "Data Only" if "data_only" in f else "Full System"
                     backups.append({"name": f, "size": f"{size:.2f} MB", "type": btype})
                 except:
@@ -656,19 +650,14 @@ def trigger_restore():
         return jsonify({"error": "Task running"}), 409
 
     filename = request.json.get("filename")
+    if not filename or "/" in filename:
+        return jsonify({"error": "Invalid filename"}), 400
+        
     full_path = os.path.join(BACKUP_DIR, filename)
 
-    if "data_only" in filename:
-        data_dir = get_env_config().get("NEXTCLOUD_DATA_DIR", "/home/admin/nextcloud")
-        cmd = (
-            f"echo 'Restoring Data Only...' >> {LOG_FILES['restore']}; "
-            f"tar -xzf {full_path} -C {data_dir} >> {LOG_FILES['restore']} 2>&1; "
-            f"docker compose -f {COMPOSE_FILE} exec -u www-data nextcloud php occ files:scan --all >> {LOG_FILES['restore']} 2>&1"
-        )
-        task_name = "Data Restore"
-    else:
-        cmd = f"bash {SCRIPT_RESTORE} {full_path} --no-prompt >> {LOG_FILES['restore']} 2>&1"
-        task_name = "Full Restore"
+    # restore.sh handles auto-detection of content (HA vs NC vs DB)
+    cmd = f"bash {SCRIPT_RESTORE} {full_path} --no-prompt >> {LOG_FILES['restore']} 2>&1"
+    task_name = "System Restore"
 
     threading.Thread(
         target=run_background_task, args=(task_name, cmd, "restore")
