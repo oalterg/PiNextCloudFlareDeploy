@@ -323,17 +323,21 @@ def system_status():
     services = {
         "nextcloud": "stopped",
         "db": "stopped",
-        "homeassistant": "missing",
+        "homeassistant": "stopped",
         "tunnel": "stopped",
     }
     try:
         # Docker Services Check
-        # We need to check for either newt OR cloudflared-*
-        out = subprocess.check_output(
-            f"docker compose -f {COMPOSE_FILE} ps --format '{{{{.Service}}}}:{{{{.State}}}}:{{{{.Health}}}}'",
-            shell=True,
-        ).decode()
+        # Get profiles dynamically from common.sh for consistency
+        profiles = subprocess.check_output(f"bash -c 'source {INSTALL_DIR}/scripts/common.sh; load_env; get_tunnel_profiles'", shell=True).decode().strip()
 
+        compose_cmd = f"docker compose -f {COMPOSE_FILE} --env-file {ENV_FILE}"
+        override_path = f"{INSTALL_DIR}/docker-compose.override.yml"
+        if os.path.exists(override_path):
+            compose_cmd += f" -f {override_path}"
+        compose_cmd += f" {profiles} ps --format '{{{{.Service}}}}:{{{{.State}}}}:{{{{.Health}}}}'"
+
+        out = subprocess.check_output(compose_cmd, shell=True).decode()
         tunnel_status = "stopped"
 
         for line in out.splitlines():
@@ -373,9 +377,26 @@ def system_status():
 
         # System Resources Stats (CPU/RAM/Root Disk)
         try:
-            # Load Avg (1 min)
-            load1, _, _ = os.getloadavg()
-            services["cpu_load"] = round(load1, 2)
+            # CPU load
+            def get_cpu_times():
+                with open('/proc/stat') as f:
+                    line = f.readline().strip()
+                    fields = line.split()[1:]  # user nice system idle ...
+                    return [int(x) for x in fields[:4]]  # user, nice, system, idle
+
+            times1 = get_cpu_times()
+            time.sleep(0.5)
+            times2 = get_cpu_times()
+
+            deltas = [t2 - t1 for t1, t2 in zip(times1, times2)]
+            total_delta = sum(deltas)
+            if total_delta == 0:
+                cpu_load = 0.0
+            else:
+                idle_delta = deltas[3]
+                used = total_delta - idle_delta
+                cpu_load = round(100.0 * used / total_delta, 1)
+            services["cpu_load"] = cpu_load
 
             # RAM
             # Because we used quoted EOF, $2 and $3 are preserved literally for awk here:

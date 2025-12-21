@@ -183,15 +183,11 @@
                 <h3>Services</h3>
                 <p>Nextcloud: <span id="st-nc" class="status-badge status-unknown">...</span></p>
                 <p>Database: <span id="st-db" class="status-badge status-unknown">...</span></p>
-                <p>Tunnel: <span id="st-tunnel" class="status-badge status-unknown">...</span></p>
-                {% if ha_domain %}
                 <p>Home Assistant: <span id="st-ha" class="status-badge status-unknown">...</span></p>
-                {% endif %}
+                <p>Tunnel: <span id="st-tunnel" class="status-badge status-unknown">...</span></p>
                 <div style="margin-top:15px;">
                     <a href="https://{{ nc_domain }}" target="_blank"><button>Open Nextcloud</button></a>
-                    {% if ha_domain %}
                     <a href="https://{{ ha_domain }}" target="_blank"><button>Open Home Assistant</button></a>
-                    {% endif %}
                 </div>
             </div>
 
@@ -525,7 +521,7 @@
                 if (document.getElementById('st-maint')) document.getElementById('st-maint').innerText = (data.maintenance_mode || 'unknown').toUpperCase();
 
                 // Stats
-                if (data.cpu_load !== undefined) document.getElementById('sys-cpu').innerText = data.cpu_load;
+                if (data.cpu_load !== undefined) document.getElementById('sys-cpu').innerText = data.cpu_load + "%";
                 if (data.ram_text !== undefined) document.getElementById('sys-ram').innerText = data.ram_text + " (" + data.ram_percent + "%)";
 
                 // Root Disk
