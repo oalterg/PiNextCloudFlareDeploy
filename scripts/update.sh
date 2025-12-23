@@ -74,29 +74,24 @@ log_info "Extracting..."
 mkdir -p "$TEMP_DIR/extract"
 tar -xzf "$TEMP_DIR/update.tar.gz" --strip-components=1 -C "$TEMP_DIR/extract" || { log_error "Extraction failed"; exit 1; }
 
-# 5. Atomic File Sync
+# 4. Atomic File Sync
 log_info "Applying file updates, preserving configuration..."
 # rsync ensures we get new files, delete removed files, but exclude our preserved configs from being overwritten if they were missing in source
 rsync -a --delete \
 --exclude='.env' \
 --exclude='.setup_complete' \
---exclude='config/docker-compose.override.yml' \
 --exclude='docker-compose.override.yml' \
 --exclude='.git' \
 --exclude='version.json' \
 "$TEMP_DIR/extract/" "$INSTALL_DIR/" || { log_error "Rsync failed"; exit 1; }
 
-# 7. Update Binaries
-chmod +x "$INSTALL_DIR/scripts/raspi-cloud"
-ln -sf "$INSTALL_DIR/scripts/raspi-cloud" "/usr/local/sbin/raspi-cloud" || { log_error "Failed to link raspi-cloud"; exit 1; }
-
-# 8. Dependency Management
+# 5. Dependency Management
 log_info "Updating Python dependencies..."
 if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages || { log_error "Pip install failed"; exit 1; }
 fi
 
-# 9. Docker Stack Update
+# 6. Docker Stack Update
 log_info "Updating Docker Stack..."
 cd "${INSTALL_DIR}" || die "Failed to cd to ${INSTALL_DIR}"
 # Pull latest images defined in compose
@@ -105,7 +100,7 @@ docker compose --env-file "$ENV_FILE" $(get_compose_args) pull || { log_error "D
 profiles=$(get_tunnel_profiles)
 docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --remove-orphans || { log_error "Docker up failed"; exit 1; }
 
-# 10. Write Version File
+# 7. Write Version File
 cat > "$INSTALL_DIR/version.json" <<EOF
 {
   "channel": "$CHANNEL",
