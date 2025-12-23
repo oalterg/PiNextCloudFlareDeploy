@@ -65,12 +65,14 @@ tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
 log_info "Analyzing backup structure..."
 
 HAS_NC_DATA=false
+HAS_NC_APPS=false
 HAS_NC_DB=false
 HAS_NC_CONFIG=false
 HAS_HA_CONFIG=false
 
 # Check for legacy (root/data) or new (nc_data) folder structures
 if [[ -d "$TMP_DIR/nc_data" ]] || [[ -d "$TMP_DIR/data" ]]; then HAS_NC_DATA=true; fi
+if [[ -d "$TMP_DIR/nc_apps" ]]; then HAS_NC_APPS=true; fi
 if [[ -d "$TMP_DIR/nc_db" ]] || [[ -f "$TMP_DIR/db/nextcloud.sql" ]]; then HAS_NC_DB=true; fi
 if [[ -d "$TMP_DIR/nc_config" ]] || [[ -d "$TMP_DIR/config" ]]; then HAS_NC_CONFIG=true; fi
 if [[ -d "$TMP_DIR/ha_config" ]]; then HAS_HA_CONFIG=true; fi
@@ -109,6 +111,24 @@ if [ "$HAS_HA_CONFIG" = true ]; then
     docker run --rm --volumes-from "$HA_CID" \
     -v "$TMP_DIR/ha_config":/restore_src:ro \
     alpine sh -c "rm -rf /config/* && cp -a /restore_src/. /config/" || die "HA restore failed."
+fi
+
+# --- 2.5 Restore Nextcloud Apps (If Present) ---
+if [ "$HAS_NC_APPS" = true ]; then
+    log_info "Restoring Nextcloud Custom User Apps..."
+    
+    # Use the same volume discovery logic as config
+    if [[ -n "$NC_CID_OLD" ]]; then
+        NC_VOL=$(docker inspect "$NC_CID_OLD" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+    else
+        NC_VOL=$(docker volume ls -q | grep "nextcloud_html" | head -n1)
+    fi
+    
+    if [[ -z "$NC_VOL" ]]; then die "Could not locate Nextcloud volume."; fi
+    
+    # Restore specifically to /custom_apps
+    docker run --rm -v "${NC_VOL}:/volume" -v "$TMP_DIR/nc_apps:/restore_src:ro" alpine \
+        sh -c "mkdir -p /volume/custom_apps && cp -a /restore_src/. /volume/custom_apps/" || die "Error restoring Nextcloud apps"
 fi
 
 # --- 3. Restore Nextcloud Config ---
@@ -183,6 +203,7 @@ if [ "$HAS_NC_DB" = true ]; then
           sh -c "mysql -h 127.0.0.1 -u root -e 'DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;' && mysql -h 127.0.0.1 -u root $MYSQL_DATABASE < /restore_dir/$(basename "$SQL_FILE")" || die "DB Import failed."
     fi
 fi
+
 # --- Restart ---
 log_info "Restarting Docker Stack..."
 profiles=$(get_tunnel_profiles)

@@ -74,19 +74,13 @@ log_info "Extracting..."
 mkdir -p "$TEMP_DIR/extract"
 tar -xzf "$TEMP_DIR/update.tar.gz" --strip-components=1 -C "$TEMP_DIR/extract" || { log_error "Extraction failed"; exit 1; }
 
-# 4. Backup Critical Configs (Preserve State)
-log_info "Preserving configuration..."
-cp "$INSTALL_DIR/.env" "$TEMP_DIR/extract/.env" 2>/dev/null || log_warn ".env not found, skipping preservation"
-cp "$INSTALL_DIR/docker-compose.override.yml" "$TEMP_DIR/extract/docker-compose.override.yml" 2>/dev/null || true
-cp "$INSTALL_DIR/factory_config.txt" "$TEMP_DIR/extract/factory_config.txt" 2>/dev/null || true
-
 # 5. Atomic File Sync
-log_info "Applying file updates..."
+log_info "Applying file updates, preserving configuration..."
 # rsync ensures we get new files, delete removed files, but exclude our preserved configs from being overwritten if they were missing in source
 rsync -a --delete \
 --exclude='.env' \
 --exclude='.setup_complete' \
---exclude='docker-compose.yml' \
+--exclude='config/docker-compose.override.yml' \
 --exclude='docker-compose.override.yml' \
 --exclude='.git' \
 --exclude='version.json' \

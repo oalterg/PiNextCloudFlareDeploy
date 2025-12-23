@@ -21,7 +21,8 @@ INSTALL_DIR = HOMEBRAIN_ROOT # Alias for backward compatibility if needed
 SETUP_STARTED_MARKER = f"{INSTALL_DIR}/.setup_started"
 ENV_FILE = f"{INSTALL_DIR}/.env"
 ENV_TEMPLATE = f"{INSTALL_DIR}/config/.env.template"
-COMPOSE_FILE = f"{INSTALL_DIR}/docker-compose.yml"
+COMPOSE_FILE = f"{INSTALL_DIR}/config/docker-compose.yml"
+OVERRIDE_FILE = f"{INSTALL_DIR}/config/docker-compose.override.yml"
 LOG_DIR = "/var/log/homebrain"
 BACKUP_DIR = "/mnt/backup"
 RASPI_CLOUD_BIN = "/usr/local/sbin/raspi-cloud"
@@ -330,9 +331,8 @@ def system_status():
         profiles = subprocess.check_output(f"bash -c 'source {INSTALL_DIR}/scripts/common.sh; load_env; get_tunnel_profiles'", shell=True).decode().strip()
 
         compose_cmd = f"docker compose -f {COMPOSE_FILE} --env-file {ENV_FILE}"
-        override_path = f"{INSTALL_DIR}/docker-compose.override.yml"
-        if os.path.exists(override_path):
-            compose_cmd += f" -f {override_path}"
+        if os.path.exists(OVERRIDE_FILE):
+            compose_cmd += f" -f {OVERRIDE_FILE}"
         compose_cmd += f" {profiles} ps --format '{{{{.Service}}}}:{{{{.State}}}}:{{{{.Health}}}}'"
 
         out = subprocess.check_output(compose_cmd, shell=True).decode()
@@ -809,14 +809,13 @@ def manage_zigbee():
     GET: Returns the currently configured Zigbee device from the override file.
     POST: Updates the override file and restarts Home Assistant in the background.
     """
-    override_path = os.path.join(INSTALL_DIR, "docker-compose.override.yml")
-    
+
     # --- GET: Persistence Check ---
     if request.method == "GET":
         current_device = "none"
-        if os.path.exists(override_path):
+        if os.path.exists(OVERRIDE_FILE):
             try:
-                with open(override_path, "r") as f:
+                with open(OVERRIDE_FILE, "r") as f:
                     content = f.read()
                     # Look for common serial device patterns in the mapped volume
                     if "/dev/ttyUSB0" in content: current_device = "/dev/ttyUSB0"
@@ -836,8 +835,8 @@ def manage_zigbee():
 
     try:
         if device == "none":
-            if os.path.exists(override_path):
-                os.remove(override_path)
+            if os.path.exists(OVERRIDE_FILE):
+                os.remove(OVERRIDE_FILE)
             message = "Zigbee device removed."
         else:
             # Generate the override YAML. 
@@ -848,7 +847,7 @@ services:
     devices:
       - {device}:{device}
 """
-            with open(override_path, "w") as f:
+            with open(OVERRIDE_FILE, "w") as f:
                 f.write(yaml_content.strip())
             message = f"Zigbee device set to {device}."
 
@@ -857,8 +856,8 @@ services:
         # otherwise it won't see the new mapping during the restart.
         def restart_ha():
             compose_cmd = ["docker", "compose", "-f", COMPOSE_FILE]
-            if os.path.exists(override_path):
-                compose_cmd.extend(["-f", override_path])
+            if os.path.exists(OVERRIDE_FILE):
+                compose_cmd.extend(["-f", OVERRIDE_FILE])
             
             # Use 'up -d' instead of 'restart' because 'up' recreates 
             # the container if the hardware mapping (config) changed.
@@ -884,21 +883,61 @@ def trigger_upgrade():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
 
-    # Safe System Upgrade (Standard Updates Only, no Dist-Upgrade)
+    # 1. Fetch Active Profiles (Critical for Tunnels)
+    # We reuse the bash logic to ensure consistency with deploy.sh
+    try:
+        profiles = subprocess.check_output(
+            f"bash -c 'source {shlex.quote(INSTALL_DIR)}/scripts/common.sh; load_env; get_tunnel_profiles'", 
+            shell=True
+        ).decode().strip()
+    except Exception as e:
+        logging.error(f"Failed to fetch profiles: {e}")
+        # Fail safe: don't proceed if we can't determine the profile, 
+        # otherwise we might start the stack without the tunnel.
+        return jsonify({"error": "Could not determine system profile. Upgrade aborted."}), 500
+
+    # 2. Construct Docker Arguments
+    safe_env = shlex.quote(ENV_FILE)
+    safe_compose = shlex.quote(COMPOSE_FILE)
+    safe_log = shlex.quote(LOG_FILES["setup"])
+    
+    # Handle Override File
+    compose_args = f"-f {safe_compose}"
+    if os.path.exists(OVERRIDE_FILE):
+        safe_override = shlex.quote(OVERRIDE_FILE)
+        compose_args += f" -f {safe_override}"
+
+    # 3. Build the Command Chain
+    # Note: 'profiles' variable contains flags (e.g. --profile cloudflare), so it cannot be quoted as a single string.
     cmd = (
-        "echo 'Starting System Update...' > " + LOG_FILES["setup"] + "; "
+        f"echo '=== Starting System & Stack Upgrade ===' > {safe_log}; "
+        
+        # Step A: OS Updates
+        f"echo '[1/4] Updating System Packages...' >> {safe_log}; "
         "export DEBIAN_FRONTEND=noninteractive; "
-        "apt-get update >> " + LOG_FILES["setup"] + " 2>&1; "
-        "apt-get upgrade -y >> " + LOG_FILES["setup"] + " 2>&1; "
-        "echo 'Updating Docker Containers...' >> " + LOG_FILES["setup"] + "; "
-        f"cd {INSTALL_DIR} && docker compose pull >> " + LOG_FILES["setup"] + " 2>&1 && "
-        "docker compose up -d >> " + LOG_FILES["setup"] + " 2>&1"
+        f"apt-get update >> {safe_log} 2>&1; "
+        f"apt-get upgrade -y >> {safe_log} 2>&1; "
+        f"apt-get autoremove -y >> {safe_log} 2>&1; "
+
+        # Step B: Docker Pull (Updates Images)
+        f"echo '[2/4] Pulling Docker Images...' >> {safe_log}; "
+        f"docker compose --env-file {safe_env} {compose_args} {profiles} pull >> {safe_log} 2>&1; "
+
+        # Step C: Docker Up (Recreates Containers)
+        f"echo '[3/4] Restarting Stack...' >> {safe_log}; "
+        f"docker compose --env-file {safe_env} {compose_args} {profiles} up -d --remove-orphans >> {safe_log} 2>&1; "
+        
+        # Step D: Cleanup
+        f"echo '[4/4] Cleaning up...' >> {safe_log}; "
+        f"docker image prune -f >> {safe_log} 2>&1; "
+        
+        f"echo '=== Upgrade Complete ===' >> {safe_log}"
     )
+
     threading.Thread(
         target=run_background_task, args=("System Upgrade", cmd, "setup")
     ).start()
     return jsonify({"status": "started"})
-
 
 @app.route("/api/manager/check_update", methods=["GET"])
 def check_manager_update():

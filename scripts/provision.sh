@@ -37,12 +37,8 @@ if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages
 fi
 
-# Ensure scripts are executable
+# 4. Ensure scripts are executable
 chmod +x "$INSTALL_DIR/scripts/"*.sh
-
-# --- 4. Install Docker Compose Configuration ---
-echo "Deploying Docker Compose Configuration..."
-cp "$INSTALL_DIR/config/docker-compose.yml" "$INSTALL_DIR/"
 
 # --- 5. Install Service ---
 echo "Configuring Systemd Service..."

@@ -116,7 +116,7 @@ if [[ "$STRATEGY" == "data_only" ]]; then SUFFIX="_data_only"; fi
 STAGING_DIR=$(mktemp -d -p "$STAGING_BASE" staging_XXXXXX)
 ARCHIVE_PATH="$BACKUP_MOUNTDIR/homebrain_backup${SUFFIX}_${DATE}.tar.gz"
 
-mkdir -p "$STAGING_DIR/nc_data" "$STAGING_DIR/nc_db" "$STAGING_DIR/nc_config" "$STAGING_DIR/ha_config"
+mkdir -p "$STAGING_DIR/nc_data" "$STAGING_DIR/nc_apps" "$STAGING_DIR/nc_db" "$STAGING_DIR/nc_config" "$STAGING_DIR/ha_config"
 
 # 5. Stop Services / Enable Maintenance Mode
 log_info "Preparing services..."
@@ -131,8 +131,6 @@ fi
 # 6. Database Dump (Full Only)
 if [[ "$STRATEGY" == "full" && -n "$DB_CID" ]]; then
     log_info "Dumping Nextcloud Database..."
-    
-    if [[ -z "$DB_CID" ]]; then die "Database container not found."; fi
 
     # Health check first
     docker run --rm \
@@ -155,6 +153,19 @@ if [[ "$STRATEGY" == "full" && -n "$DB_CID" ]]; then
     fi
 fi
 
+# 6.5 Nextcloud Apps (Full Only - To backup installed apps like Passwords)
+if [[ "$STRATEGY" == "full" && -n "$NC_CID" ]]; then
+    log_info "Syncing Nextcloud Custom User Apps..."
+
+    # 1. Identify the volume mounted at /var/www/html
+    NC_VOL=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
+    
+    # 2. Backup only /custom_apps
+    # We mount the whole html volume to /volume, then copy /volume/custom_apps
+    docker run --rm -v "${NC_VOL}:/volume:ro" -v "$STAGING_DIR/nc_apps":/backup alpine \
+        sh -c "if [ -d /volume/custom_apps ]; then cp -a /volume/custom_apps/. /backup/; fi" || die "NC Apps backup failed."
+fi
+
 # 7. Nextcloud Data (Rsync host path)
 log_info "Syncing Nextcloud Data..."
 rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/nc_data/" || die "NC Data Sync failed."
@@ -162,8 +173,6 @@ rsync -a --delete "$NEXTCLOUD_DATA_DIR"/ "$STAGING_DIR/nc_data/" || die "NC Data
 # 8. Nextcloud Config (Helper Container - Full Only)
 if [[ "$STRATEGY" == "full" && -n "$NC_CID" ]]; then
     log_info "Syncing Nextcloud Config..."
-    if [[ -z "$NC_CID" ]]; then die "Nextcloud container not found."; fi
-
     NC_VOL=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
     docker run --rm -v "${NC_VOL}:/volume:ro" -v "$STAGING_DIR/nc_config":/backup alpine \
         sh -c "cp -a /volume/config/. /backup/" || die "NC Config backup failed."
