@@ -27,6 +27,40 @@ fi
 apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
 systemctl enable --now docker
 
+# --- Credential Generation & Handling ---
+# 1. Load Main Domain from Factory
+PAN_DOM=$(grep 'PANGOLIN_DOMAIN' /boot/firmware/factory_config.txt | cut -d= -f2)
+
+# 2. Check/Generate Password (Idempotent)
+if grep -q "MANAGER_PASSWORD=" "$ENV_FILE" && [ -n "$(grep "MANAGER_PASSWORD=" "$ENV_FILE" | cut -d= -f2)" ]; then
+    log_info "Manager password already exists. Skipping generation."
+else
+    log_info "Generating new secure Manager Password..."
+    # Generate random password
+    NEW_PWD=$(pwgen -s 16 1)
+    
+    # Save to .env
+    update_env_var "MANAGER_PASSWORD" "$NEW_PWD"
+    
+    # Write to temporary one-time file for the UI to display
+    cat > "$INSTALL_DIR/.install_creds.json" <<EOF
+{
+  "password": "$NEW_PWD",
+  "domain": "$PAN_DOM",
+  "local_ip": "$(hostname -I | awk '{print $1}')"
+}
+EOF
+    chmod 600 "$INSTALL_DIR/.install_creds.json"
+fi
+
+# 3. Fan-out Domains (Main -> Subdomains)
+if ! grep -q "PANGOLIN_DOMAIN=" "$ENV_FILE"; then
+    update_env_var "PANGOLIN_DOMAIN" "$PAN_DOM"
+    update_env_var "MANAGER_DOMAIN" "$PAN_DOM"
+    update_env_var "NEXTCLOUD_TRUSTED_DOMAINS" "nc.$PAN_DOM"
+    update_env_var "HA_TRUSTED_DOMAINS" "ha.$PAN_DOM"
+fi
+
 # --- 1. Docker Stack Deployment ---
 log_info "Deploying Docker stack, this can take while..."
 # Ensure docker is running
@@ -100,4 +134,6 @@ rfkill block wifi || log_error "WiFi could not be disabled."
 rfkill block bluetooth || log_error "Bluetooth could not be disabled."
 
 log_info "=== Deployment Complete ==="
+# Signal specifically for the UI to pick up
+echo "Deployment Complete - Ready for Handover"
 touch "$INSTALL_DIR/.setup_complete"

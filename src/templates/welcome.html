@@ -39,12 +39,13 @@
         <h3>Configuration Detected</h3>
         <ul>
             <li><strong>Device ID:</strong> {{ config.NEWT_ID }}</li>
-            <li><strong>Nextcloud Domain:</strong> {{ config.NC_DOMAIN }}</li>
-            {% if config.HA_DOMAIN %}
-            <li><strong>Home Assistant:</strong> {{ config.HA_DOMAIN }}</li>
-            {% endif %}
+            <li><strong>Main Domain:</strong> {{ config.PANGOLIN_DOMAIN }}</li>
             <li><strong>Tunnel Endpoint:</strong> {{ config.PANGOLIN_ENDPOINT }}</li>
         </ul>
+        <p style="font-size: 0.9em; color: #888; margin-top: 15px;">
+            Your secure Admin Password will be generated and displayed<br>
+            at the end of the installation process.
+        </p>
     </div>
 
     <button onclick="startSetup()" id="btn">Initialize Device Now</button>

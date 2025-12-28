@@ -87,8 +87,59 @@ rsync -a --delete \
 
 # 5. Dependency Management
 log_info "Updating Python dependencies..."
+# Ensure pwgen is available for migration
+apt-get install -y -qq pwgen >> "$LOG_FILE" 2>&1
 if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages || { log_error "Pip install failed"; exit 1; }
+fi
+
+# 5.5 Migration: Legacy to Consolidated Configuration
+# Detect if we are migrating from a pre-Pangolin/pre-Auth version
+if ! grep -q "^PANGOLIN_DOMAIN=" "$ENV_FILE"; then
+    log_info ">>> MIGRATION: Legacy configuration detected. Attempting to migrate..."
+
+    # A. Domain Migration
+    # Try to grab legacy NC_DOMAIN from .env (preferred) or factory fallback
+    LEGACY_NC=$(grep "^NEXTCLOUD_TRUSTED_DOMAINS=" "$ENV_FILE" | cut -d= -f2 || true)
+    [ -z "$LEGACY_NC" ] && LEGACY_NC=$(grep "^NC_DOMAIN=" /boot/firmware/factory_config.txt | cut -d= -f2 || true)
+
+    if [ -n "$LEGACY_NC" ]; then
+        # Logic: Strip 'nc.' prefix to get main domain (e.g., nc.my.com -> my.com)
+        BASE_DOMAIN="${LEGACY_NC#nc.}"
+        
+        log_info "   - Derived PANGOLIN_DOMAIN='${BASE_DOMAIN}' from '${LEGACY_NC}'"
+        
+        # Apply to .env
+        update_env_var "PANGOLIN_DOMAIN" "$BASE_DOMAIN"
+        # Ensure Manager Domain is set
+        if ! grep -q "^MANAGER_DOMAIN=" "$ENV_FILE"; then
+             update_env_var "MANAGER_DOMAIN" "$BASE_DOMAIN"
+        fi
+        
+        # Persistently apply to Factory Config 
+        if ! grep -q "PANGOLIN_DOMAIN=" /boot/firmware/factory_config.txt; then
+             echo "PANGOLIN_DOMAIN=$BASE_DOMAIN" >> /boot/firmware/factory_config.txt
+        fi
+    else
+        log_warn "   - Could not automatically derive legacy domain. Manual config may be required."
+    fi
+fi
+
+# B. Password Migration (If missing, generate and SHOW USER)
+if ! grep -q "^MANAGER_PASSWORD=" "$ENV_FILE"; then
+    log_info ">>> MIGRATION: No Manager Password found."
+    NEW_MGR_PASS=$(pwgen -s 16 1)
+    
+    update_env_var "MANAGER_PASSWORD" "$NEW_MGR_PASS"
+    
+    log_info "============================================================"
+    log_info "   CRITICAL: NEW ADMIN PASSWORD GENERATED"
+    log_info "   --------------------------------------------------------"
+    log_info "   User: admin"
+    log_info "   Password: $NEW_MGR_PASS"
+    log_info "   --------------------------------------------------------"
+    log_info "   PLEASE COPY THIS PASSWORD NOW. YOU WILL NEED IT TO LOGIN."
+    log_info "============================================================"
 fi
 
 # 6. Docker Stack Update

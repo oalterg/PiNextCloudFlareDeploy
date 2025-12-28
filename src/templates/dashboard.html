@@ -357,7 +357,21 @@
                 <input type="text" id="tun-id" value="{{ tunnel.current.NEWT_ID }}">
                 <label>Secret:</label>
                 <input type="password" id="tun-sec" value="{{ tunnel.current.NEWT_SECRET }}">
-                <button type="submit">Update Connection</button>
+                
+                <hr style="border-color: #444; margin: 15px 0;">
+                <p style="font-size: 0.9em; color: #aaa; margin-bottom: 10px;">Domain Configuration</p>
+                
+                <label>Main Domain (e.g., myserver.homebrain.com):</label>
+                <input type="text" id="tun-main-domain" value="{{ main_domain }}">
+                
+                <div style="font-size: 0.8em; color: #888; margin-top: 5px; padding: 10px; background: #333; border-radius: 4px;">
+                    <strong>Derived Subdomains:</strong><br>
+                    Manager: <span id="preview-mgr">{{ main_domain }}</span><br>
+                    Nextcloud: nc.<span id="preview-nc">{{ main_domain }}</span><br>
+                    Home Assistant: ha.<span id="preview-ha">{{ main_domain }}</span>
+                </div>
+
+                <button type="submit" style="margin-top: 15px;">Update Connection</button>
             </form>
             {% if tunnel.is_custom_pangolin %}
             <hr>
@@ -382,16 +396,16 @@
                     - Nextcloud: <code>http://nextcloud:80</code><br>
                     - Home Assistant: <code>http://homeassistant:8123</code>
                     <label>Domain (e.g., mycloud.example.com):</label>
-                    <input type="text" id="cf-domain" placeholder="mycloud.example.com" required>
+                    <input type="text" id="cf-switch-domain" placeholder="mycloud.example.com" required>
                 </p>
-                <form onsubmit="updateCloudflare(event)">
+                <form onsubmit="updateCloudflare(event, 'switch')">
                     <label>Service:</label>
-                    <select id="cf-service">
+                    <select id="cf-switch-service">
                         <option value="nc">Nextcloud</option>
                         {% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}
                     </select>
                     <label>Tunnel Token:</label>
-                    <input type="text" id="cf-token" placeholder="eyJhIjoi...">
+                    <input type="text" id="cf-switch-token" placeholder="eyJhIjoi...">
                     <button type="submit">Activate Cloudflare</button>
                 </form>
             </div>
@@ -417,16 +431,16 @@
 
             <hr>
             <h4>Add/Update Tunnel</h4>
-            <form onsubmit="updateCloudflare(event)">
+            <form onsubmit="updateCloudflare(event, 'update')">
                 <label>Service:</label>
-                <select id="cf-service">
+                <select id="cf-update-service">
                     <option value="nc">Nextcloud</option>
                     {% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}
                 </select>
-                <label>Domain (e.g., mycloud.example.com):</label> <input type="text" id="cf-domain"
+                <label>Domain (e.g., mycloud.example.com):</label> <input type="text" id="cf-update-domain"
                     placeholder="mycloud.example.com" required>
                 <label>Token (from Cloudflare Dashboard):</label>
-                <input type="text" id="cf-token" placeholder="eyJhIjoi..." required>
+                <input type="text" id="cf-update-token" placeholder="eyJhIjoi..." required>
                 <button type="submit">Save Tunnel</button>
             </form>
 
@@ -547,32 +561,45 @@
             document.getElementById('cf-form-container').style.display = 'block';
         }
 
+        // Live preview for domain typing
+        document.getElementById('tun-main-domain').addEventListener('input', function(e) {
+            const val = e.target.value || '...';
+            document.getElementById('preview-mgr').innerText = val;
+            document.getElementById('preview-nc').innerText = val;
+            document.getElementById('preview-ha').innerText = val;
+        });
+
         async function updatePangolin(e) {
             e.preventDefault();
             const data = {
                 endpoint: document.getElementById('tun-ep').value,
                 id: document.getElementById('tun-id').value,
-                secret: document.getElementById('tun-sec').value
+                secret: document.getElementById('tun-sec').value,
+                main_domain: document.getElementById('tun-main-domain').value
             };
-            if (confirm("Update Pangolin settings? Connection may restart.")) {
-                triggerAction('/api/tunnel/pangolin', 'Update Tunnel', data);
+            if (confirm("Update Pangolin settings? This will update all service URLs.")) {
+                triggerAction('/api/tunnel', 'Update Tunnel', data);
                 setTimeout(() => location.reload(), 3000);
             }
         }
 
         async function revertPangolin() {
-            if (confirm("Revert Pangolin to factory defaults?")) {
-                triggerAction('/api/tunnel/pangolin', 'Revert Tunnel', { action: 'revert' });
+            if (confirm("Revert Pangolin to factory defaults (including domains)?")) {
+                triggerAction('/api/tunnel', 'Revert Tunnel', { action: 'revert' });
                 setTimeout(() => location.reload(), 3000);
             }
         }
 
-        async function updateCloudflare(e) {
+        async function updateCloudflare(e, mode) {
             e.preventDefault();
-            const token = document.getElementById('cf-token').value;
-            const service = document.getElementById('cf-service').value;
+            const prefix = mode === 'switch' ? 'cf-switch-' : 'cf-update-';
+            
+            const token = document.getElementById(prefix + 'token').value;
+            const service = document.getElementById(prefix + 'service').value;
+            const domain = document.getElementById(prefix + 'domain').value;
+
             if (!token) return alert("Token required");
-            const domain = document.getElementById('cf-domain').value; if (!domain) return alert("Domain required");
+            if (!domain) return alert("Domain required");
 
             if (confirm("Switch/Update Cloudflare Tunnel for " + service.toUpperCase() + "? This will modify your connection settings.")) {
                 triggerAction('/api/tunnel/cloudflare', 'Cloudflare Update', { domain: domain, token: token, service: service });

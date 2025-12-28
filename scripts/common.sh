@@ -28,6 +28,28 @@ load_env() {
     fi
 }
 
+# --- Configuration Helpers ---
+update_env_var() {
+    local key="$1"
+    local value="$2"
+    
+    if [[ -f "$ENV_FILE" ]]; then
+        # If key exists, replace it
+        if grep -q "^${key}=" "$ENV_FILE"; then
+            # Escape value for sed (basic safety for URLs/domains)
+            local safe_val
+            safe_val=$(printf '%s\n' "$value" | sed -e 's/[\/&]/\\&/g')
+            sed -i "s|^${key}=.*|${key}=${safe_val}|" "$ENV_FILE"
+        else
+            # If key missing, append it
+            echo "${key}=${value}" >> "$ENV_FILE"
+        fi
+    else
+        log_warn ".env file not found, creating new one."
+        echo "${key}=${value}" > "$ENV_FILE"
+    fi
+}
+
 # --- Docker Helpers ---
 # Helper to get all active compose files
 get_compose_args() {
@@ -65,7 +87,7 @@ get_tunnel_profiles() {
     local p_endpoint="${PANGOLIN_ENDPOINT:-}"; p_endpoint="${p_endpoint//[[:space:]]/}"
     local p_id="${NEWT_ID:-}"; p_id="${p_id//[[:space:]]/}"
     local p_secret="${NEWT_SECRET:-}"; p_secret="${p_secret//[[:space:]]/}"
-
+    local pan_dom="${PANGOLIN_DOMAIN:-}"; pan_dom="${pan_dom//[[:space:]]/}"
     local cf_nc_token="${CF_TOKEN_NC:-}"; cf_nc_token="${cf_nc_token//[[:space:]]/}"
     local cf_ha_token="${CF_TOKEN_HA:-}"; cf_ha_token="${cf_ha_token//[[:space:]]/}"
 

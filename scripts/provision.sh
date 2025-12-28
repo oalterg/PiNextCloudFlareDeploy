@@ -10,7 +10,7 @@ LOG_DIR="/var/log/homebrain"
 
 # --- Input Validation ---
 if [[ $EUID -ne 0 ]]; then echo "Run as root."; exit 1; fi
-if [ "$#" -ne 5 ]; then echo "Usage: $0 <ID> <SECRET> <NC_DOM> <HA_DOM> <PAN_EP>"; exit 1; fi
+if [ "$#" -ne 4 ]; then echo "Usage: $0 <ID> <SECRET> <MAIN_DOMAIN> <PAN_EP>"; exit 1; fi
 
 # --- 1. System Dependencies ---
 echo "Installing Application Dependencies..."
@@ -22,9 +22,8 @@ echo "Writing factory configuration..."
 cat > "$BOOT_CONFIG" <<EOF
 NEWT_ID=${1}
 NEWT_SECRET=${2}
-NC_DOMAIN=${3}
-HA_DOMAIN=${4}
-PANGOLIN_ENDPOINT=${5}
+PANGOLIN_DOMAIN=${3}
+PANGOLIN_ENDPOINT=${4}
 EOF
 chmod 600 "$BOOT_CONFIG"
 
@@ -62,4 +61,10 @@ else
     exit 1
 fi
 
-echo "HomeBrain Provisioning Complete. Web UI available on port 80."
+echo "HomeBrain Provisioning Complete."
+echo "======================================================="
+echo "   PROVISIONING COMPLETE"
+echo "======================================================="
+echo "   Device is ready for first boot."
+echo "   Password will be generated during deployment."
+echo "======================================================="

@@ -10,17 +10,64 @@
 <body>
     <h1>System Installation in Progress</h1>
     <p>Please do not unplug. This may take 15-20 minutes.</p>
-    <pre id="logs"
-        style="background:#222; color:#0f0; padding:10px; height:300px; overflow:auto; font-size: 12px;"></pre>
+    <div id="status-container">
+        <pre id="logs" style="background:#222; color:#0f0; padding:10px; height:300px; overflow:auto; font-size: 12px;"></pre>
+    </div>
+
     <script>
-        setInterval(() => {
+        let finished = false;
+
+        const poller = setInterval(() => {
+            if (finished) return;
+
             fetch('/api/logs/setup').then(r => r.text()).then(t => {
                 const logDiv = document.getElementById('logs');
                 logDiv.innerText = t;
                 logDiv.scrollTop = logDiv.scrollHeight;
-                if (t.includes("Installation complete")) location.reload();
+
+                // Check for the specific signal from deploy.sh
+                if (t.includes("Deployment Complete - Ready for Handover")) {
+                    finished = true;
+                    clearInterval(poller);
+                    fetchCredentials();
+                }
             });
         }, 2000);
+
+        function fetchCredentials() {
+            fetch('/api/setup/credentials')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) {
+                        document.body.innerHTML = `<h1>Installation Complete</h1><p>Please refresh to log in.</p>`;
+                    } else {
+                        showSuccess(data);
+                    }
+                })
+                .catch(e => location.reload()); // Fallback
+        }
+
+        function showSuccess(data) {
+            document.body.innerHTML = `
+                <div style="max-width: 600px; margin: 0 auto; padding: 20px; font-family: sans-serif;">
+                    <h1 style="color: #2ecc71;">Installation Successful!</h1>
+                    <p>Your Private Cloud is ready. Please save these credentials immediately.</p>
+                    
+                    <div style="background: #333; padding: 20px; border-radius: 8px; text-align: left; margin: 20px 0; border: 2px solid #f39c12;">
+                        <h3 style="margin-top:0; color: #f39c12;">ADMIN CREDENTIALS (SHOWN ONCE)</h3>
+                        <p><strong>URL (Local):</strong> http://${data.local_ip}</p>
+                        <p><strong>URL (Remote):</strong> https://${data.domain}</p>
+                        <hr style="border-color: #555;">
+                        <p style="font-size: 1.1em;"><strong>Username:</strong> admin</p>
+                        <p style="font-size: 1.4em; color: #fff; background: #000; padding: 10px; font-family: monospace;">${data.password}</p>
+                    </div>
+
+                    <p style="color: #aaa; font-size: 0.9em;">Important: This password has been generated securely on this device. It is not known to the manufacturer.</p>
+                    
+                    <button onclick="location.reload()" style="background-color: #2ecc71; color: black; font-size: 1.2em; padding: 15px 30px; border: none; cursor: pointer; border-radius: 4px;">Go to Dashboard</button>
+                </div>
+            `;
+        }
     </script>
 </body>
 

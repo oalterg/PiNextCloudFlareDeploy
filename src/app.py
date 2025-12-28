@@ -10,9 +10,59 @@ import hashlib
 import logging
 import shlex
 import requests
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, Response
 
 app = Flask(__name__)
+
+# --- Authentication ---
+def check_auth(username, password):
+    # Try .env first, fall back to factory if setup hasn't run
+    env_pass = get_env_config().get('MANAGER_PASSWORD')
+    if not env_pass:
+        env_pass = get_factory_config().get('MANAGER_PASSWORD')
+    return username == 'admin' and password == env_pass
+
+def authenticate():
+    return Response(
+        'Access Denied. Please log in with your generated Admin Password.', 401,
+        {'WWW-Authenticate': 'Basic realm="HomeBrain Manager Login"'})
+
+@app.before_request
+def auth_gate():
+    # 1. Always allow static assets
+    if request.endpoint == 'static':
+        return
+    
+    # 2. Whitelist: Allow polling logs and fetching one-time credentials
+    # This ensures the installing.html page doesn't break when the lock engages.
+    if request.path in ['/api/logs/setup', '/api/setup/credentials']:
+        return
+
+    # 3. First Time Setup (Open Access)
+    if not is_setup_complete():
+        return
+
+    # 4. Locked Mode (Require Authentication)
+    auth = request.authorization
+    if not auth or not check_auth(auth.username, auth.password):
+        return authenticate()
+
+@app.route("/api/setup/credentials")
+def get_one_time_credentials():
+    # Security: This file is created by deploy.sh and exists only briefly.
+    creds_file = f"{INSTALL_DIR}/.install_creds.json"
+    
+    if os.path.exists(creds_file):
+        try:
+            with open(creds_file, "r") as f:
+                data = json.load(f)
+            # BURN AFTER READING: Delete immediately to prevent re-reading
+            os.remove(creds_file)
+            return jsonify(data)
+        except Exception as e:
+            return jsonify({"error": "Failed to read credentials"}), 500
+    else:
+        return jsonify({"error": "Credentials not available or already claimed"}), 404
 
 # --- Configuration & Constants ---
 FACTORY_CONFIG = "/boot/firmware/factory_config.txt"
@@ -185,16 +235,22 @@ def start_setup():
     
     # Map Factory Config to Environment Variables
     factory = get_factory_config()
-    if "NC_DOMAIN" in factory:
-        update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", factory["NC_DOMAIN"])
-    if "HA_DOMAIN" in factory:
-        update_env_var("HA_TRUSTED_DOMAINS", factory["HA_DOMAIN"])
     if "NEWT_ID" in factory:
         update_env_var("NEWT_ID", factory["NEWT_ID"])
     if "NEWT_SECRET" in factory:
         update_env_var("NEWT_SECRET", factory["NEWT_SECRET"])
     if "PANGOLIN_ENDPOINT" in factory:
         update_env_var("PANGOLIN_ENDPOINT", factory["PANGOLIN_ENDPOINT"])
+    if "MANAGER_PASSWORD" in factory:
+        update_env_var("MANAGER_PASSWORD", factory["MANAGER_PASSWORD"])
+    
+    # Domain Logic: Main Domain -> Subdomains
+    if "PANGOLIN_DOMAIN" in factory:
+        main_dom = factory["PANGOLIN_DOMAIN"]
+        update_env_var("PANGOLIN_DOMAIN", main_dom)
+        update_env_var("MANAGER_DOMAIN", main_dom)
+        update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", f"nc.{main_dom}")
+        update_env_var("HA_TRUSTED_DOMAINS", f"ha.{main_dom}")
 
     # 4. Trigger deploy script in headless mode
     cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
@@ -292,17 +348,21 @@ def index():
     # If any CF token exists, we are in Cloudflare mode
     cf_mode = bool(env.get("CF_TOKEN_NC") or env.get("CF_TOKEN_HA"))
 
-    # Check if Pangolin is custom (only relevant if not in CF mode)
+    # Check if Pangolin is custom
     is_custom_pangolin = False
     if not cf_mode:
-        is_custom_pangolin = env.get("PANGOLIN_ENDPOINT") != factory.get(
-            "PANGOLIN_ENDPOINT"
+        # Check if critical tunnel params differ from factory
+        is_custom_pangolin = (
+            env.get("PANGOLIN_ENDPOINT") != factory.get("PANGOLIN_ENDPOINT") or
+            env.get("PANGOLIN_DOMAIN") != factory.get("PANGOLIN_DOMAIN")
         )
 
     return render_template(
         "dashboard.html",
+        main_domain=env.get("PANGOLIN_DOMAIN"),
         nc_domain=env.get("NEXTCLOUD_TRUSTED_DOMAINS"),
         ha_domain=env.get("HA_TRUSTED_DOMAINS"),
+        manager_domain=env.get("MANAGER_DOMAIN"),
         creds={
             "user": env.get("NEXTCLOUD_ADMIN_USER"),
             "pass": env.get("NEXTCLOUD_ADMIN_PASSWORD"),
@@ -702,10 +762,26 @@ def update_tunnel():
         update_env_var("PANGOLIN_ENDPOINT", factory.get("PANGOLIN_ENDPOINT", ""))
         update_env_var("NEWT_ID", factory.get("NEWT_ID", ""))
         update_env_var("NEWT_SECRET", factory.get("NEWT_SECRET", ""))
+        
+        # Revert Domain Logic
+        main_dom = factory.get("PANGOLIN_DOMAIN", "")
+        update_env_var("PANGOLIN_DOMAIN", main_dom)
+        update_env_var("MANAGER_DOMAIN", main_dom)
+        update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", f"nc.{main_dom}" if main_dom else "")
+        update_env_var("HA_TRUSTED_DOMAINS", f"ha.{main_dom}" if main_dom else "")
+
     else:
         update_env_var("PANGOLIN_ENDPOINT", data.get("endpoint"))
         update_env_var("NEWT_ID", data.get("id"))
         update_env_var("NEWT_SECRET", data.get("secret"))
+        
+        # Consolidate Domain Logic
+        if data.get("main_domain"):
+            main_dom = data.get("main_domain")
+            update_env_var("PANGOLIN_DOMAIN", main_dom)
+            update_env_var("MANAGER_DOMAIN", main_dom)
+            update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", f"nc.{main_dom}")
+            update_env_var("HA_TRUSTED_DOMAINS", f"ha.{main_dom}")
 
     # Trigger deploy script to update stack logic
     subprocess.run(["chmod", "+x", SCRIPT_REDEPLOY])
