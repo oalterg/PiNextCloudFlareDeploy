@@ -27,40 +27,6 @@ fi
 apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
 systemctl enable --now docker
 
-# --- Credential Generation & Handling ---
-# 1. Load Main Domain from Factory
-PAN_DOM=$(grep 'PANGOLIN_DOMAIN' /boot/firmware/factory_config.txt | cut -d= -f2)
-
-# 2. Check/Generate Password (Idempotent)
-if grep -q "MANAGER_PASSWORD=" "$ENV_FILE" && [ -n "$(grep "MANAGER_PASSWORD=" "$ENV_FILE" | cut -d= -f2)" ]; then
-    log_info "Manager password already exists. Skipping generation."
-else
-    log_info "Generating new secure Manager Password..."
-    # Generate random password
-    NEW_PWD=$(pwgen -s 16 1)
-    
-    # Save to .env
-    update_env_var "MANAGER_PASSWORD" "$NEW_PWD"
-    
-    # Write to temporary one-time file for the UI to display
-    cat > "$INSTALL_DIR/.install_creds.json" <<EOF
-{
-  "password": "$NEW_PWD",
-  "domain": "$PAN_DOM",
-  "local_ip": "$(hostname -I | awk '{print $1}')"
-}
-EOF
-    chmod 600 "$INSTALL_DIR/.install_creds.json"
-fi
-
-# 3. Fan-out Domains (Main -> Subdomains)
-if ! grep -q "PANGOLIN_DOMAIN=" "$ENV_FILE"; then
-    update_env_var "PANGOLIN_DOMAIN" "$PAN_DOM"
-    update_env_var "MANAGER_DOMAIN" "$PAN_DOM"
-    update_env_var "NEXTCLOUD_TRUSTED_DOMAINS" "nc.$PAN_DOM"
-    update_env_var "HA_TRUSTED_DOMAINS" "ha.$PAN_DOM"
-fi
-
 # --- 1. Docker Stack Deployment ---
 log_info "Deploying Docker stack, this can take while..."
 # Ensure docker is running
@@ -86,6 +52,10 @@ docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --re
 # 1d. Verification
 wait_for_healthy "nextcloud" 400 || die "Nextcloud failed to start."
 wait_for_healthy "homeassistant" 120 || die "Homeassistant failed to start." 
+
+# 1e. Create Home Assistant Admin Account
+log_info "Hardening Home Assistant Admin account..."
+create_ha_admin "$MASTER_PASSWORD" || echo "Fallback: Proceed with manual HA account creation."
 
 # --- 2. Post-Deploy Proxy Configuration ---
 log_info "Applying Nextcloud and Homeassistant Proxy Settings..."

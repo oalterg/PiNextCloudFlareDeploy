@@ -200,8 +200,14 @@ sync
 
 # 12. Retention
 log_info "Applying retention (Keep: $BACKUP_RETENTION)..."
-ls -tp "$BACKUP_MOUNTDIR"/homebrain_backup*.tar.gz 2>/dev/null | \
-    tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm --
+
+# List both old and new naming schemas, sort by time (newest first), skip first N, delete rest.
+# Uses 'ls -t' to sort by modification time regardless of name.
+# grep -E filters for both patterns.
+find "$BACKUP_MOUNTDIR" -maxdepth 1 -type f \( -name "homebrain_backup*.tar.gz" -o -name "nextcloud_backup*.tar.gz" \) -printf "%T@ %p\n" | \
+    sort -rn | \
+    awk -v keep="$BACKUP_RETENTION" 'NR > keep {print $2}' | \
+    xargs -r rm --
 
 log_info "=== Backup Complete: $ARCHIVE_PATH ==="
 # Lock file removed by trap

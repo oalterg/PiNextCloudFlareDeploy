@@ -117,14 +117,21 @@ fi
 if [ "$HAS_NC_APPS" = true ]; then
     log_info "Restoring Nextcloud Custom User Apps..."
     
-    # Use the same volume discovery logic as config
-    if [[ -n "$NC_CID_OLD" ]]; then
-        NC_VOL=$(docker inspect "$NC_CID_OLD" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
-    else
-        NC_VOL=$(docker volume ls -q | grep "nextcloud_html" | head -n1)
+    # Use existing helper and robust fallback
+    NC_CID=$(get_nc_cid)
+    NC_VOL=""
+    
+    if [[ -n "$NC_CID" ]]; then
+        # Try to extract the volume name dynamically from the container
+        NC_VOL=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}' || true)
     fi
     
-    if [[ -z "$NC_VOL" ]]; then die "Could not locate Nextcloud volume."; fi
+    # Fallback: If container doesn't exist or inspect failed, search volumes
+    if [[ -z "$NC_VOL" ]]; then
+        NC_VOL=$(docker volume ls -q | grep "nextcloud_html" | head -n1 || true)
+    fi
+    
+    if [[ -z "$NC_VOL" ]]; then die "Could not locate Nextcloud volume (nextcloud_html)."; fi
     
     # Restore specifically to /custom_apps
     docker run --rm -v "${NC_VOL}:/volume" -v "$TMP_DIR/nc_apps:/restore_src:ro" alpine \
@@ -135,17 +142,20 @@ fi
 if [ "$HAS_NC_CONFIG" = true ]; then
     log_info "Restoring Nextcloud Config..."
     SRC="$TMP_DIR/nc_config"; [[ ! -d "$SRC" ]] && SRC="$TMP_DIR/config"
-    # Dynamically find the volume name used by the specific container instance
-    # This handles cases where the folder name (project name) differs from default.
-    NC_CID_OLD=$(docker compose $(get_compose_args) ps -a -q nextcloud | head -n1)
     
-    if [[ -n "$NC_CID_OLD" ]]; then
-        NC_VOL=$(docker inspect "$NC_CID_OLD" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}')
-    else
-        # Fallback if container doesn't exist yet (rare)
-        NC_VOL=$(docker volume ls -q | grep "nextcloud_html" | head -n1)
+    # Reuse the same robust volume logic
+    NC_CID=$(get_nc_cid)
+    NC_VOL=""
+    
+    if [[ -n "$NC_CID" ]]; then
+        NC_VOL=$(docker inspect "$NC_CID" --format '{{ range .Mounts }}{{ if eq .Destination "/var/www/html" }}{{ .Name }}{{ end }}{{ end }}' || true)
     fi
-    if [[ -z "$NC_VOL" ]]; then die "Could not locate Nextcloud volume."; fi
+    
+    if [[ -z "$NC_VOL" ]]; then
+        NC_VOL=$(docker volume ls -q | grep "nextcloud_html" | head -n1 || true)
+    fi
+    
+    if [[ -z "$NC_VOL" ]]; then die "Could not locate Nextcloud volume for config restore."; fi
     
     docker run --rm -v "${NC_VOL}:/volume" -v "$SRC:/restore_src:ro" alpine \
         sh -c "rm -rf /volume/config/* && cp -a /restore_src/. /volume/config/" || die "Error restoring Nextcloud config.php"
@@ -154,10 +164,14 @@ fi
 # --- Consolidated DB Password Handling (After Config Restore, Before DB Restore) ---
 if [ "$HAS_NC_CONFIG" = true ]; then
     log_info "Extracting restored DB credentials and syncing..."
+    # Reuse NC_VOL determined in previous step. If Config was true, NC_VOL is guaranteed set.
+    # If Config was false, we skip this block anyway.
+    
     # Extract from the restored volume using PHP for safe parsing (final state)
     DB_USER=$(docker run --rm -v "${NC_VOL}:/volume:ro" php:8-cli php -r '
         @include "/volume/config/config.php"; echo $CONFIG["dbuser"] ?? "";
     ') || DB_USER="$MYSQL_USER"  # Fallback to env if extraction fails
+    
     DB_PASS=$(docker run --rm -v "${NC_VOL}:/volume:ro" php:8-cli php -r '
         @include "/volume/config/config.php"; echo $CONFIG["dbpassword"] ?? "";
     ')
@@ -202,6 +216,25 @@ if [ "$HAS_NC_DB" = true ]; then
           mysql:8 \
           sh -c "mysql -h 127.0.0.1 -u root -e 'DROP DATABASE IF EXISTS $MYSQL_DATABASE; CREATE DATABASE $MYSQL_DATABASE;' && mysql -h 127.0.0.1 -u root $MYSQL_DATABASE < /restore_dir/$(basename "$SQL_FILE")" || die "DB Import failed."
     fi
+
+    if [[ -n "${NEXTCLOUD_ADMIN_PASSWORD:-}" ]]; then
+        log_info "Synchronizing Nextcloud Admin password to match current environment..."
+        
+        # We need the container running to run 'occ'
+        docker compose --env-file "$ENV_FILE" $(get_compose_args) up -d nextcloud
+        wait_for_healthy "nextcloud" 120 || log_warn "NC failed to start for password sync."
+
+        NC_CID=$(get_nc_cid)
+        if [[ -n "$NC_CID" ]]; then
+             # Reset password using OC_PASS environment variable
+             docker exec -u www-data -e OC_PASS="$NEXTCLOUD_ADMIN_PASSWORD" "$NC_CID" \
+                php occ user:resetpassword --password-from-env admin || \
+                log_warn "Failed to sync Nextcloud password. You may need to use the password from the backup."
+        fi
+    else
+        log_warn "NEXTCLOUD_ADMIN_PASSWORD not set in .env. Retaining password from backup."
+    fi
+
 fi
 
 # --- Restart ---

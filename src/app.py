@@ -11,6 +11,7 @@ import logging
 import shlex
 import requests
 from flask import Flask, render_template, jsonify, request, Response
+import migration
 
 app = Flask(__name__)
 
@@ -85,6 +86,7 @@ SCRIPT_BACKUP = f"{INSTALL_DIR}/scripts/backup.sh"
 SCRIPT_RESTORE = f"{INSTALL_DIR}/scripts/restore.sh"
 SCRIPT_DEPLOY = f"{INSTALL_DIR}/scripts/deploy.sh"
 SCRIPT_REDEPLOY = f"{INSTALL_DIR}/scripts/redeploy_tunnels.sh"
+INSTALL_CREDS_PATH = f"{INSTALL_DIR}/install_creds.json"
 
 LOG_FILES = {
     "setup": f"{LOG_DIR}/main_setup.log",
@@ -209,14 +211,7 @@ def start_setup():
     with open(SETUP_STARTED_MARKER, "w") as f:
         f.write(str(int(time.time())))
 
-    # 2. Generate Secure Passwords (alphanumeric to avoid shell escaping issues)
-    # Using python secrets instead of pwgen for better portability/dependency management
-    alphabet = string.ascii_letters + string.digits
-    pwd_nc = ''.join(secrets.choice(alphabet) for i in range(24))
-    pwd_root = ''.join(secrets.choice(alphabet) for i in range(24))
-    pwd_db = ''.join(secrets.choice(alphabet) for i in range(24))
-
-    # 3. Bootstrap .env file
+    # 2. Bootstrap .env file
     # Do not override env if redeploying, ensure we start from the robust template
     if not os.path.exists(ENV_FILE):
         if os.path.exists(ENV_TEMPLATE):
@@ -229,10 +224,8 @@ def start_setup():
         # Set Passwords & Critical Defaults
         update_env_var("NEXTCLOUD_DATA_DIR", "/home/admin/nextcloud")
         update_env_var("NEXTCLOUD_ADMIN_USER", "admin")
-        update_env_var("NEXTCLOUD_ADMIN_PASSWORD", pwd_nc)
-        update_env_var("MYSQL_ROOT_PASSWORD", pwd_root)
-        update_env_var("MYSQL_PASSWORD", pwd_db)
-    
+
+
     # Map Factory Config to Environment Variables
     factory = get_factory_config()
     if "NEWT_ID" in factory:
@@ -241,8 +234,6 @@ def start_setup():
         update_env_var("NEWT_SECRET", factory["NEWT_SECRET"])
     if "PANGOLIN_ENDPOINT" in factory:
         update_env_var("PANGOLIN_ENDPOINT", factory["PANGOLIN_ENDPOINT"])
-    if "MANAGER_PASSWORD" in factory:
-        update_env_var("MANAGER_PASSWORD", factory["MANAGER_PASSWORD"])
     
     # Domain Logic: Main Domain -> Subdomains
     if "PANGOLIN_DOMAIN" in factory:
@@ -251,6 +242,36 @@ def start_setup():
         update_env_var("MANAGER_DOMAIN", main_dom)
         update_env_var("NEXTCLOUD_TRUSTED_DOMAINS", f"nc.{main_dom}")
         update_env_var("HA_TRUSTED_DOMAINS", f"ha.{main_dom}")
+
+    env_config = get_env_config()
+    
+    # 1. Migration Logic: Look for any existing password
+    master_pass = (env_config.get('MASTER_PASSWORD') or 
+                   env_config.get('NEXTCLOUD_ADMIN_PASSWORD') or 
+                   env_config.get('MANAGER_PASSWORD'))
+    
+    # 2. Generation (if new install)
+    if not master_pass:
+        alphabet = string.ascii_letters + string.digits
+        master_pass = ''.join(secrets.choice(alphabet) for _ in range(16))
+    
+    # 3. Write to install_creds.json for the Shell Scripts
+    creds_data = {
+        "username": "admin",
+        "password": master_pass,
+        "domain": env_config.get('PANGOLIN_DOMAIN'),
+        "generated_at": time.time()
+    }
+    with open(INSTALL_CREDS_PATH, 'w') as f:
+        json.dump(creds_data, f)
+
+    # 4. Assign master password to all services
+    update_env_var("MASTER_PASSWORD", master_pass)
+    update_env_var("MANAGER_PASSWORD", master_pass)
+    update_env_var("NEXTCLOUD_ADMIN_PASSWORD", master_pass)
+    update_env_var("MYSQL_ROOT_PASSWORD", master_pass)
+    update_env_var("MYSQL_PASSWORD", master_pass)
+    update_env_var("HA_ADMIN_PASSWORD", master_pass)  
 
     # 4. Trigger deploy script in headless mode
     cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
@@ -363,10 +384,6 @@ def index():
         nc_domain=env.get("NEXTCLOUD_TRUSTED_DOMAINS"),
         ha_domain=env.get("HA_TRUSTED_DOMAINS"),
         manager_domain=env.get("MANAGER_DOMAIN"),
-        creds={
-            "user": env.get("NEXTCLOUD_ADMIN_USER"),
-            "pass": env.get("NEXTCLOUD_ADMIN_PASSWORD"),
-        },
         tunnel={
             "factory": factory,
             "current": env,
@@ -1097,6 +1114,11 @@ def do_manager_update():
         "message": f"Updating to {channel} {target_ref}. Interface will restart."
     })
 
-
 if __name__ == "__main__":
+    try:
+        migration.run_migrations()
+    except Exception as e:
+        # Log to file so we can see it, but don't crash the web server
+        logging.error(f"CRITICAL: Migration failed: {e}")
+        
     app.run(host="0.0.0.0", port=80)

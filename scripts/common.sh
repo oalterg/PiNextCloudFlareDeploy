@@ -87,7 +87,6 @@ get_tunnel_profiles() {
     local p_endpoint="${PANGOLIN_ENDPOINT:-}"; p_endpoint="${p_endpoint//[[:space:]]/}"
     local p_id="${NEWT_ID:-}"; p_id="${p_id//[[:space:]]/}"
     local p_secret="${NEWT_SECRET:-}"; p_secret="${p_secret//[[:space:]]/}"
-    local pan_dom="${PANGOLIN_DOMAIN:-}"; pan_dom="${pan_dom//[[:space:]]/}"
     local cf_nc_token="${CF_TOKEN_NC:-}"; cf_nc_token="${cf_nc_token//[[:space:]]/}"
     local cf_ha_token="${CF_TOKEN_HA:-}"; cf_ha_token="${cf_ha_token//[[:space:]]/}"
 
@@ -230,4 +229,61 @@ configure_nc_ha_proxy_settings() {
     if [[ -n "$ha_cid" ]]; then
         configure_ha_proxy_settings "$subnet" "$ha_cid"
     fi
+}
+
+function create_ha_admin() {
+    local HA_PASSWORD="$1"
+    if [ -z "$HA_PASSWORD" ]; then
+        die "HA_PASSWORD not provided."
+    fi
+
+    log_info "Hardening Home Assistant Admin Account..."
+    local HA_URL="http://127.0.0.1:8123"
+    
+    # 1. Wait specifically for the API to be responsive (Container health != API ready)
+    local retries=30  # Wait up to 60s
+    local api_ready=false
+    
+    while [[ $retries -gt 0 ]]; do
+        # We check /API/ (returns 401 if ready but unauth, or 200 if open)
+        # We are looking for anything NOT 'Connection refused'
+        local status=$(curl -s -o /dev/null -w "%{http_code}" "$HA_URL/manifest.json")
+        if [[ "$status" != "000" ]]; then
+            api_ready=true
+            break
+        fi
+        sleep 2
+        ((retries--))
+    done
+
+    if [ "$api_ready" = false ]; then
+        log_warn "Home Assistant API did not become ready. Account creation skipped."
+        return 1
+    fi
+
+    # 2. Check if onboarding is still active
+    # If /api/onboarding returns 404 or [] or similar, it's already done.
+    local onboarding_status=$(curl -s "$HA_URL/api/onboarding")
+    
+    # If the response contains "done" or is empty list, we skip
+    if echo "$onboarding_status" | grep -q '"done":\[.*"user"'; then
+        log_info "Home Assistant is already onboarded. Skipping account creation."
+        return 0
+    fi
+
+    # 3. Create Account
+    log_info "Creating 'admin' user..."
+    curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"Admin\", \"username\": \"admin\", \"password\": \"$HA_PASSWORD\", \"client_id\": \"http://homebrain.local/\"}" \
+        "$HA_URL/api/onboarding/users" >/dev/null || log_warn "Failed to create HA user."
+        
+    # 4. Finish Onboarding (Location/etc defaults) to close the loop
+    # This prevents the 'Welcome' screen from reappearing
+    curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"language":"en", "time_zone":"UTC", "elevation":0, "unit_system":"metric", "currency":"EUR"}' \
+        "$HA_URL/api/onboarding/core_config" >/dev/null || true
+
+    log_info "Home Assistant hardening complete."
 }
