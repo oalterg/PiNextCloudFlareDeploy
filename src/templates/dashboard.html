@@ -50,6 +50,7 @@
             margin-bottom: 20px;
             border-bottom: 1px solid #333;
             padding-bottom: 10px;
+            flex-wrap: wrap; /* Handle smaller screens */
         }
 
         .tab-btn {
@@ -59,6 +60,8 @@
             cursor: pointer;
             color: #ccc;
             border-radius: 5px 5px 0 0;
+            flex-grow: 1; /* Make tabs evenly distributed */
+            text-align: center;
         }
 
         .tab-btn.active {
@@ -158,6 +161,18 @@
             font-size: 0.8em;
             color: #aaa;
         }
+        
+        /* Table Styles for FTP Users */
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            text-align: left;
+            padding: 8px;
+            border-bottom: 1px solid #444;
+        }
+        tr:nth-child(even) {background-color: #2a2a2a;}
     </style>
 </head>
 
@@ -173,7 +188,8 @@
     <div class="tabs">
         <button class="tab-btn active" onclick="openTab('status')">Status</button>
         <button class="tab-btn" onclick="openTab('backup')">Backup & Storage</button>
-        <button class="tab-btn" onclick="openTab('config')">Config & Tunnel</button>
+        <button class="tab-btn" onclick="openTab('connectivity')">Connectivity</button>
+        <button class="tab-btn" onclick="openTab('settings')">Settings</button>
         <button class="tab-btn" onclick="openTab('logs')">Logs</button>
     </div>
 
@@ -333,19 +349,17 @@
         </div>
     </div>
 
-    <div id="config" class="tab-content">
+    <div id="connectivity" class="tab-content">
         <div class="card" style="border-left: 5px solid #e74c3c;">
              <h3>Authentication</h3>
              <p>The <strong>Master Admin Password</strong> is used for HomeBrain Manager, Nextcloud, and Home Assistant.</p>
              <p style="color: #aaa; font-size: 0.9em;">If you need to reset credentials, use the command line tool <code>homebrain-cli</code> (Coming soon).</p>
         </div>
 
-        <!-- Tunnel Provider Toggle Logic -->
         <div class="card">
             <h3>Tunnel Configuration</h3>
 
             {% if tunnel.mode == 'pangolin' %}
-            <!-- Pangolin View -->
             <p>
                 Current Provider: <strong style="color: #2ecc71">Pangolin (Factory Default)</strong>
                 {% if tunnel.is_custom_pangolin %}(Customized){% endif %}
@@ -384,7 +398,6 @@
             <button onclick="showCloudflareForm()" style="background-color: #f39c12; color: #000;">Switch to
                 Cloudflare</button>
 
-            <!-- Hidden CF Form for switching -->
             <div id="cf-form-container"
                 style="display:none; margin-top:15px; background: #333; padding: 15px; border-radius: 5px;">
                 <h4>Cloudflare Setup</h4>
@@ -411,7 +424,6 @@
             </div>
 
             {% else %}
-            <!-- Cloudflare View -->
             <p>Current Provider: <strong style="color: #f39c12">Cloudflare</strong></p>
 
             <div>
@@ -444,23 +456,51 @@
                 <button type="submit">Save Tunnel</button>
             </form>
 
-<hr>
+            <hr>
             <button style="background-color: #e74c3c;" onclick="revertToFactory()">Revert to Factory (Pangolin)</button>
             {% endif %}
         </div>
+    </div>
+
+    <div id="settings" class="tab-content">
+        <div class="grid">
+            
+            <div class="card">
+                <h3>FTP Server (Camera Uploads)</h3>
+                <p>Create a dedicated FTP account that maps to a Nextcloud user's <code>/uploads</code> folder. Useful for IP Cameras.</p>
+                
+                <form onsubmit="setupFtp(event)">
+                    <label>Nextcloud Username:</label>
+                    <input type="text" id="ftp-nc-user" placeholder="e.g. admin" required>
+                    
+                    <label>FTP Username (New):</label>
+                    <input type="text" id="ftp-user" placeholder="e.g. camera1" required>
+                    
+                    <label>FTP Password:</label>
+                    <input type="password" id="ftp-pass" required>
+                    
+                    <button type="submit" style="background-color: #9b59b6; margin-top: 10px;">Setup / Update FTP User</button>
+                </form>
         
-        {% if ha_domain %}
-        <div class="card">
-            <h3>Home Assistant Hardware</h3>
-            <p>Select a Zigbee/Z-Wave dongle to pass through to Home Assistant.</p>
-            <label>Serial Device:</label>
-            <select id="zigbee-device">
-                <option value="none">None</option>
-                <option value="/dev/ttyUSB0">Sonoff Zigbee 3.0 (USB0)</option>
-                <option value="/dev/ttyACM0">Zigbee Dongle (ACM0)</option>
-            </select>
-            <button onclick="updateZigbee()">Save & Restart HA</button>        </div>
-        {% endif %}
+                <hr>
+                <h4>Active FTP Users</h4>
+                <div id="ftp-user-list">Loading...</div>
+                <button onclick="loadFtpUsers()" style="background: #444; font-size: 0.8em; margin-top: 10px;">Refresh List</button>
+            </div>
+
+            {% if ha_domain %}
+            <div class="card">
+                <h3>Home Assistant Hardware</h3>
+                <p>Select a Zigbee/Z-Wave dongle to pass through to Home Assistant.</p>
+                <label>Serial Device:</label>
+                <select id="zigbee-device">
+                    <option value="none">None</option>
+                    </select>
+                <button onclick="updateZigbee()">Save & Restart HA</button>        
+            </div>
+            {% endif %}
+
+        </div>
     </div>
 
     <script>
@@ -479,13 +519,10 @@
             }
         
             // 2. Fetch Initial Data immediately (before intervals)
-            // We 'await' these so the page isn't blank on load
             try {
                 await fetchZigbeeStatus();
                 await fetchStatus(); 
                 await pollTask();
-                // If you have pollServices(), call it here too:
-                // await pollServices(); 
             } catch (err) {
                 console.error("Initial fetch failed:", err);
             }
@@ -507,7 +544,19 @@
             document.querySelectorAll('.tab-content').forEach(d => d.classList.remove('active'));
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.getElementById(id).classList.add('active');
-            event.target.classList.add('active');
+            
+            // Find the button that triggered this function (if event exists)
+            if (event && event.target && event.target.classList.contains('tab-btn')) {
+                 event.target.classList.add('active');
+            } else {
+                 // Fallback: manually find button by onclick text matching
+                 const btns = document.querySelectorAll('.tab-btn');
+                 btns.forEach(b => {
+                     if (b.getAttribute('onclick').includes(id)) {
+                         b.classList.add('active');
+                     }
+                 });
+            }
 
             if (id === 'backup') {
                 loadDrives();
@@ -518,8 +567,9 @@
             if (id === 'logs') {
                 pollLogs();
             }
-            if (id === 'config') {
+            if (id === 'settings') {
                 loadSerialDevices();
+                loadFtpUsers();
             }
         }
 
@@ -614,27 +664,109 @@
             }
         }
 
+        // --- FTP Functions (NEW) ---
+        async function loadFtpUsers() {
+            const el = document.getElementById('ftp-user-list');
+            if(!el) return;
+            el.innerText = 'Loading...';
+            try {
+                const res = await fetch('/api/ftp/users');
+                const users = await res.json();
+                
+                if (users.length === 0) {
+                    el.innerHTML = '<em style="color:#777;">No FTP users configured.</em>';
+                    return;
+                }
+                
+                let html = '<table><thead><tr><th>FTP User</th><th>Maps To (NC)</th><th>Action</th></tr></thead><tbody>';
+                
+                users.forEach(u => {
+                    html += `<tr>
+                        <td>${u.ftp_user}</td>
+                        <td>${u.nc_user}</td>
+                        <td><button onclick="deleteFtpUser('${u.ftp_user}')" style="background:#e74c3c; padding: 2px 8px; font-size: 0.8em; margin-top:0;">Delete</button></td>
+                    </tr>`;
+                });
+                html += '</tbody></table>';
+                el.innerHTML = html;
+            } catch (e) {
+                el.innerText = 'Failed to load users.';
+            }
+        }
+
+        async function setupFtp(e) {
+            e.preventDefault();
+            const ncUser = document.getElementById('ftp-nc-user').value;
+            const ftpUser = document.getElementById('ftp-user').value;
+            const ftpPass = document.getElementById('ftp-pass').value;
+
+            if(confirm(`Create FTP user '${ftpUser}' mapped to Nextcloud user '${ncUser}'?\nThis will verify the NC user exists and install FTP services if missing.`)) {
+                 triggerAction('/api/ftp/setup', 'FTP Setup', {
+                     nc_user: ncUser,
+                     ftp_user: ftpUser,
+                     ftp_pass: ftpPass
+                 });
+                 // Clear password
+                 document.getElementById('ftp-pass').value = '';
+            }
+        }
+
+        async function deleteFtpUser(user) {
+            if(confirm(`Delete FTP user '${user}'?`)) {
+                triggerAction('/api/ftp/delete', 'Delete FTP User', { ftp_user: user });
+                setTimeout(loadFtpUsers, 3000);
+            }
+        }
+
+        // --- Zigbee Functions ---
         async function loadSerialDevices() {
             try {
                 const res = await fetch('/api/hardware/serial');
                 const devices = await res.json();
-                const sel = document.getElementById('zigbee-selector');
-                // Keep 'None' option
-                sel.innerHTML = '<option value="none">None (Disable)</option>';
-                devices.forEach(d => {
-                    const opt = document.createElement('option');
-                    opt.value = d;
-                    opt.innerText = d;
-                    sel.appendChild(opt);
-                });
+                const sel = document.getElementById('zigbee-device');
+                if(!sel) return;
+
+                // Keep 'None' option and reset
+                sel.innerHTML = '<option value="none">None</option>';
+                
+                // Add "No devices" placeholder if empty, otherwise populate
+                if (devices.length === 0) {
+                     const opt = document.createElement('option');
+                     opt.disabled = true;
+                     opt.innerText = "No USB/ACM devices found";
+                     sel.appendChild(opt);
+                } else {
+                    devices.forEach(d => {
+                        const opt = document.createElement('option');
+                        opt.value = d;
+                        opt.innerText = d;
+                        sel.appendChild(opt);
+                    });
+                }
+                
+                // Re-fetch current config to set selection
+                fetchZigbeeStatus();
             } catch (e) {}
         }
-
-        async function saveZigbeeConfig() {
-            const dev = document.getElementById('zigbee-selector').value;
-            if (confirm("Update Home Assistant hardware config? This will restart the Home Assistant service.")) {
-                triggerAction('/api/hardware/zigbee', 'Zigbee Config', { device: dev });
-            }
+        
+        async function updateZigbee() {
+            const dev = document.getElementById('zigbee-device').value;
+            const btn = document.querySelector('button[onclick="updateZigbee()"]');
+            btn.disabled = true;
+            
+            triggerAction('/api/manager/zigbee', 'Zigbee Config', { device: dev });
+            btn.disabled = false;
+        }
+        
+        async function fetchZigbeeStatus() {
+            try {
+                const res = await fetch('/api/manager/zigbee');
+                const data = await res.json();
+                const sel = document.getElementById('zigbee-device');
+                if (data.current && sel) {
+                    sel.value = data.current;
+                }
+            } catch (e) {}
         }
 
         // --- Standard Functions (Backup, Drives, Logs) ---
@@ -890,34 +1022,6 @@
             alert("Update failed to start: " + (data.error || "Unknown error"));
         }
     }
-
-        async function fetchZigbeeStatus() {
-            try {
-                const res = await fetch('/api/manager/zigbee');
-                const data = await res.json();
-                if (data.current) {
-                    document.getElementById('zigbee-device').value = data.current;
-                }
-            } catch (e) {
-                console.error("Failed to fetch zigbee status", e);
-            }
-        }
-
-        async function updateZigbee() {
-            const dev = document.getElementById('zigbee-device').value;
-            const btn = document.querySelector('button[onclick="updateZigbee()"]');
-            btn.disabled = true;
-            
-            const res = await fetch('/api/manager/zigbee', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ device: dev })
-            });
-            
-            const data = await res.json();
-            alert(data.message || data.status);
-            btn.disabled = false;
-        }
 
         async function pollTask() {
             const res = await fetch('/api/task_status');

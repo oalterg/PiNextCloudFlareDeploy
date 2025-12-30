@@ -86,6 +86,7 @@ SCRIPT_BACKUP = f"{INSTALL_DIR}/scripts/backup.sh"
 SCRIPT_RESTORE = f"{INSTALL_DIR}/scripts/restore.sh"
 SCRIPT_DEPLOY = f"{INSTALL_DIR}/scripts/deploy.sh"
 SCRIPT_REDEPLOY = f"{INSTALL_DIR}/scripts/redeploy_tunnels.sh"
+SCRIPT_UTILITIES = f"{INSTALL_DIR}/scripts/utilities.sh"
 INSTALL_CREDS_PATH = f"{INSTALL_DIR}/install_creds.json"
 
 LOG_FILES = {
@@ -1113,6 +1114,80 @@ def do_manager_update():
         "status": "started", 
         "message": f"Updating to {channel} {target_ref}. Interface will restart."
     })
+
+# --- Routes: FTP Management ---
+
+@app.route("/api/ftp/users", methods=["GET"])
+def list_ftp_users():
+    """Parses VSFTPD config to return list of FTP users and their mapped Nextcloud users."""
+    users = []
+    user_conf_dir = "/etc/vsftpd/user_conf"
+    
+    if os.path.exists(user_conf_dir):
+        try:
+            for ftp_user in os.listdir(user_conf_dir):
+                conf_path = os.path.join(user_conf_dir, ftp_user)
+                nc_user = "Unknown"
+                if os.path.isfile(conf_path):
+                    with open(conf_path, "r") as f:
+                        # We look for the comment we injected: # NC_USER=admin
+                        for line in f:
+                            if line.startswith("# NC_USER="):
+                                nc_user = line.split("=")[1].strip()
+                                break
+                    users.append({"ftp_user": ftp_user, "nc_user": nc_user})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+            
+    return jsonify(users)
+
+@app.route("/api/ftp/setup", methods=["POST"])
+def setup_ftp():
+    if current_task_status["status"] == "running":
+        return jsonify({"error": "Task running"}), 409
+
+    data = request.json
+    nc_user = data.get("nc_user")
+    ftp_user = data.get("ftp_user")
+    ftp_pass = data.get("ftp_pass")
+
+    if not all([nc_user, ftp_user, ftp_pass]):
+        return jsonify({"error": "Missing required fields"}), 400
+        
+    # Validation: FTP User should be alphanumeric
+    if not ftp_user.isalnum():
+        return jsonify({"error": "FTP Username must be alphanumeric"}), 400
+
+    # Ensure utility script is executable
+    subprocess.run(["chmod", "+x", SCRIPT_UTILITIES])
+
+    # Pass password securely? 
+    # For simplicity in this context, we pass as arg, but in high security 
+    # we would write to temp file or pipe. Since this is local root, args are acceptable-ish
+    # but strictly speaking visible in ps. 
+    # HARDENING: Use shlex to prevent injection.
+    cmd = f"bash {SCRIPT_UTILITIES} setup {shlex.quote(nc_user)} {shlex.quote(ftp_user)} {shlex.quote(ftp_pass)} >> {LOG_FILES['setup']} 2>&1"
+
+    threading.Thread(
+        target=run_background_task, args=("Setup FTP Server", cmd, "setup")
+    ).start()
+    return jsonify({"status": "started"})
+
+@app.route("/api/ftp/delete", methods=["POST"])
+def delete_ftp():
+    if current_task_status["status"] == "running":
+        return jsonify({"error": "Task running"}), 409
+
+    ftp_user = request.json.get("ftp_user")
+    if not ftp_user or not ftp_user.isalnum():
+        return jsonify({"error": "Invalid FTP username"}), 400
+
+    cmd = f"bash {SCRIPT_UTILITIES} delete {shlex.quote(ftp_user)} >> {LOG_FILES['setup']} 2>&1"
+
+    threading.Thread(
+        target=run_background_task, args=("Delete FTP User", cmd, "setup")
+    ).start()
+    return jsonify({"status": "started"})
 
 if __name__ == "__main__":
     try:
