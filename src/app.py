@@ -15,56 +15,6 @@ import migration
 
 app = Flask(__name__)
 
-# --- Authentication ---
-def check_auth(username, password):
-    # Try .env first, fall back to factory if setup hasn't run
-    env_pass = get_env_config().get('MANAGER_PASSWORD')
-    if not env_pass:
-        env_pass = get_factory_config().get('MANAGER_PASSWORD')
-    return username == 'admin' and password == env_pass
-
-def authenticate():
-    return Response(
-        'Access Denied. Please log in with your generated Admin Password.', 401,
-        {'WWW-Authenticate': 'Basic realm="HomeBrain Manager Login"'})
-
-@app.before_request
-def auth_gate():
-    # 1. Always allow static assets
-    if request.endpoint == 'static':
-        return
-    
-    # 2. Whitelist: Allow polling logs and fetching one-time credentials
-    # This ensures the installing.html page doesn't break when the lock engages.
-    if request.path in ['/api/logs/setup', '/api/setup/credentials']:
-        return
-
-    # 3. First Time Setup (Open Access)
-    if not is_setup_complete():
-        return
-
-    # 4. Locked Mode (Require Authentication)
-    auth = request.authorization
-    if not auth or not check_auth(auth.username, auth.password):
-        return authenticate()
-
-@app.route("/api/setup/credentials")
-def get_one_time_credentials():
-    # Security: This file is created by deploy.sh and exists only briefly.
-    creds_file = f"{INSTALL_DIR}/.install_creds.json"
-    
-    if os.path.exists(creds_file):
-        try:
-            with open(creds_file, "r") as f:
-                data = json.load(f)
-            # BURN AFTER READING: Delete immediately to prevent re-reading
-            os.remove(creds_file)
-            return jsonify(data)
-        except Exception as e:
-            return jsonify({"error": "Failed to read credentials"}), 500
-    else:
-        return jsonify({"error": "Credentials not available or already claimed"}), 404
-
 # --- Configuration & Constants ---
 FACTORY_CONFIG = "/boot/firmware/factory_config.txt"
 HOMEBRAIN_ROOT = "/opt/homebrain"
@@ -99,6 +49,76 @@ LOG_FILES = {
 task_lock = threading.Lock()
 current_task_status = {"status": "idle", "message": "", "log_type": "setup"}
 
+# --- Authentication Helpers ---
+def check_factory_auth(password):
+    """Checks against the sticker password for initial claiming."""
+    factory = get_factory_config()
+    return password == factory.get("FACTORY_PASSWORD", "homebrain")
+
+def check_auth(username, password):
+    # Standard Admin Auth
+    env_pass = get_env_config().get('MANAGER_PASSWORD')
+    if env_pass:
+        return username == 'admin' and password == env_pass
+    return False
+
+def authenticate(realm="HomeBrain Manager"):
+    return Response(
+        'Access Denied.', 401,
+        {'WWW-Authenticate': f'Basic realm="{realm}"'})
+
+@app.before_request
+def auth_gate():
+    # 1. Static and Specific API Whitelist
+    if request.endpoint == 'static':
+        return
+    # Fix: Allow favicon to prevent auth prompt for icon
+    if request.path == '/favicon.ico':
+        return
+    # Fix: Allow polling logs and credential fetch
+    if request.path in ['/api/logs/setup', '/api/setup/credentials', '/api/setup/status', '/api/setup/cleanup_credentials']:
+        return
+
+    # 2. First Time Setup (Welcome Screen)
+    if not is_setup_complete():
+        auth = request.authorization
+        if not auth or not check_factory_auth(auth.password):
+            return authenticate(realm="Enter Factory Password (Label on Device)")
+        return
+
+    # 3. Post-Setup Locked Mode
+    auth = request.authorization
+    if not auth or not check_auth(auth.username, auth.password):
+        return authenticate(realm="HomeBrain Admin Login")
+
+@app.route("/api/setup/credentials")
+def get_one_time_credentials():
+    # Security: Read payload created by deploy.sh
+    creds_file = INSTALL_CREDS_PATH
+    
+    if os.path.exists(creds_file):
+        try:
+            with open(creds_file, "r") as f:
+                data = json.load(f)
+            # Do NOT delete file here. 
+            # We delete it only after the client confirms receipt or strictly on next restart.
+            # Deleting it here caused the race condition where refresh -> 404 -> login page.
+            # Instead, we rely on the file being nuked by app startup or manual action later.
+            # For now, we rename it to indicate it was read once? 
+            # Actually, safe approach: Keep it until reboot or manual login successful.
+            return jsonify(data)
+        except Exception as e:
+            return jsonify({"error": "Failed to read credentials"}), 500
+    else:
+        # If file is gone, user likely refreshed too late.
+        return jsonify({"error": "Credentials already claimed."}), 410
+
+@app.route("/api/setup/cleanup_credentials", methods=["POST"])
+def cleanup_credentials():
+    """Called by the frontend after successfully rendering the success page."""
+    if os.path.exists(INSTALL_CREDS_PATH):
+        os.remove(INSTALL_CREDS_PATH)
+    return jsonify({"status": "ok"})
 
 # --- Helpers ---
 def get_local_version():
@@ -208,7 +228,7 @@ def start_setup():
     if is_setup_complete():
         return jsonify({"error": "Setup already complete"}), 400
 
-    # 1. Mark setup as started (prevents seeing welcome screen again)
+    # 1. Mark setup as started
     with open(SETUP_STARTED_MARKER, "w") as f:
         f.write(str(int(time.time())))
 
@@ -229,12 +249,8 @@ def start_setup():
 
     # Map Factory Config to Environment Variables
     factory = get_factory_config()
-    if "NEWT_ID" in factory:
-        update_env_var("NEWT_ID", factory["NEWT_ID"])
-    if "NEWT_SECRET" in factory:
-        update_env_var("NEWT_SECRET", factory["NEWT_SECRET"])
-    if "PANGOLIN_ENDPOINT" in factory:
-        update_env_var("PANGOLIN_ENDPOINT", factory["PANGOLIN_ENDPOINT"])
+    for key in ["NEWT_ID", "NEWT_SECRET", "PANGOLIN_ENDPOINT"]:
+        if key in factory: update_env_var(key, factory[key])
     
     # Domain Logic: Main Domain -> Subdomains
     if "PANGOLIN_DOMAIN" in factory:
@@ -246,17 +262,15 @@ def start_setup():
 
     env_config = get_env_config()
     
-    # 1. Migration Logic: Look for any existing password
-    master_pass = (env_config.get('MASTER_PASSWORD') or 
-                   env_config.get('NEXTCLOUD_ADMIN_PASSWORD') or 
-                   env_config.get('MANAGER_PASSWORD'))
+    # 1. Get master password
+    master_pass = env_config.get('MASTER_PASSWORD')
     
-    # 2. Generation (if new install)
+    # 2. Generation
     if not master_pass:
         alphabet = string.ascii_letters + string.digits
         master_pass = ''.join(secrets.choice(alphabet) for _ in range(16))
     
-    # 3. Write to install_creds.json for the Shell Scripts
+    # 3. Write to install_creds.json
     creds_data = {
         "username": "admin",
         "password": master_pass,
@@ -267,20 +281,16 @@ def start_setup():
         json.dump(creds_data, f)
 
     # 4. Assign master password to all services
-    update_env_var("MASTER_PASSWORD", master_pass)
-    update_env_var("MANAGER_PASSWORD", master_pass)
-    update_env_var("NEXTCLOUD_ADMIN_PASSWORD", master_pass)
-    update_env_var("MYSQL_ROOT_PASSWORD", master_pass)
-    update_env_var("MYSQL_PASSWORD", master_pass)
-    update_env_var("HA_ADMIN_PASSWORD", master_pass)  
+    for key in ["MASTER_PASSWORD", "MANAGER_PASSWORD", "NEXTCLOUD_ADMIN_PASSWORD", 
+                "MYSQL_ROOT_PASSWORD", "MYSQL_PASSWORD", "HA_ADMIN_PASSWORD"]:
+        update_env_var(key, master_pass)
 
-    # 4. Trigger deploy script in headless mode
+    # 5. Trigger deploy
     cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
     threading.Thread(
         target=run_background_task, args=("Initial Setup", cmd, "setup")
     ).start()
     return jsonify({"status": "started"})
-
 
 # --- Route: Adopt Existing Drive ---
 @app.route("/api/drives/mount", methods=["POST"])
@@ -1115,8 +1125,84 @@ def do_manager_update():
         "message": f"Updating to {channel} {target_ref}. Interface will restart."
     })
 
-# --- Routes: FTP Management ---
+# --- Auto-Update Logic ---
+def perform_first_boot_update():
+    """Checks connectivity and updates the manager before allowing setup."""
+    if is_setup_complete() or is_setup_started():
+        return
 
+    marker = f"{INSTALL_DIR}/.first_boot_update_done"
+    if os.path.exists(marker):
+        return
+
+    logging.info("First Boot: Checking for Critical Updates...")
+    try:
+        # Simple connectivity check
+        requests.get("https://github.com", timeout=5)
+        
+        # Run Update Script
+        logging.info("Network up. Running update.sh...")
+        # We run this synchronously to block startup until updated
+        subprocess.run([SCRIPT_UPDATE, "stable", "main"], check=True)
+        
+        # Mark done
+        with open(marker, "w") as f:
+            f.write(str(time.time()))
+            
+        logging.info("First Boot Update Complete. Restarting service...")
+        # Self-restart
+        os._exit(0) 
+    except Exception as e:
+        logging.error(f"First boot update skipped (No Network?): {e}")
+
+@app.route("/api/system/config", methods=["GET"])
+def get_system_config():
+    """Returns status of Watchdog, PCI, and Cron."""
+    try:
+        # Call utilities.sh system_status
+        result = subprocess.check_output(
+            ["bash", SCRIPT_UTILITIES, "system_status"]
+        ).decode().strip()
+        # Parse the JSON returned by bash
+        return Response(result, mimetype='application/json')
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/system/config", methods=["POST"])
+def update_system_config():
+    """Generic endpoint to toggle system settings."""
+    if current_task_status["status"] == "running":
+        return jsonify({"error": "Task running"}), 409
+
+    data = request.json
+    feature = data.get("feature") # watchdog, cron, pci
+    action = data.get("action")   # enable/disable or gen3/gen2
+
+    cmd = ""
+    label = ""
+    
+    if feature == "watchdog":
+        cmd = f"bash {SCRIPT_UTILITIES} watchdog {action}"
+        label = f"Configure Watchdog ({action})"
+    elif feature == "cron":
+        cmd = f"bash {SCRIPT_UTILITIES} cron"
+        label = "Configure Nextcloud Cron"
+    elif feature == "pci":
+        target = "gen3" if action == "enable" else "gen2"
+        cmd = f"bash {SCRIPT_UTILITIES} pci {target}"
+        label = f"Configure PCIe ({target})"
+    else:
+        return jsonify({"error": "Invalid feature"}), 400
+
+    # Execute
+    cmd += f" >> {LOG_FILES['setup']} 2>&1"
+    threading.Thread(
+        target=run_background_task, args=(label, cmd, "setup")
+    ).start()
+    
+    return jsonify({"status": "started"})
+
+# --- Routes: FTP Management ---
 @app.route("/api/ftp/users", methods=["GET"])
 def list_ftp_users():
     """Parses VSFTPD config to return list of FTP users and their mapped Nextcloud users."""
@@ -1195,5 +1281,8 @@ if __name__ == "__main__":
     except Exception as e:
         # Log to file so we can see it, but don't crash the web server
         logging.error(f"CRITICAL: Migration failed: {e}")
+        
+    # Attempt update before starting web server
+    threading.Thread(target=perform_first_boot_update).start()
         
     app.run(host="0.0.0.0", port=80)

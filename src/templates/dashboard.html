@@ -356,10 +356,12 @@
              <p style="color: #aaa; font-size: 0.9em;">If you need to reset credentials, use the command line tool <code>homebrain-cli</code> (Coming soon).</p>
         </div>
 
+        <!-- Tunnel Provider Toggle Logic -->
         <div class="card">
             <h3>Tunnel Configuration</h3>
 
             {% if tunnel.mode == 'pangolin' %}
+            <!-- Pangolin View -->
             <p>
                 Current Provider: <strong style="color: #2ecc71">Pangolin (Factory Default)</strong>
                 {% if tunnel.is_custom_pangolin %}(Customized){% endif %}
@@ -398,6 +400,7 @@
             <button onclick="showCloudflareForm()" style="background-color: #f39c12; color: #000;">Switch to
                 Cloudflare</button>
 
+            <!-- Hidden CF Form for switching -->
             <div id="cf-form-container"
                 style="display:none; margin-top:15px; background: #333; padding: 15px; border-radius: 5px;">
                 <h4>Cloudflare Setup</h4>
@@ -424,6 +427,7 @@
             </div>
 
             {% else %}
+            <!-- Cloudflare View -->
             <p>Current Provider: <strong style="color: #f39c12">Cloudflare</strong></p>
 
             <div>
@@ -464,6 +468,44 @@
 
     <div id="settings" class="tab-content">
         <div class="grid">
+            
+            <div class="card">
+                <h3>System Configuration</h3>
+                <p>Manage hardware features and background tasks.</p>
+
+                <table style="width:100%; border-collapse: collapse;">
+                    <tr style="border-bottom: 1px solid #333;">
+                        <td style="padding: 10px 0;">
+                            <strong>Hardware Watchdog</strong><br>
+                            <small style="color:#aaa;">Auto-reboots system if it hangs.</small>
+                        </td>
+                        <td style="text-align:right;">
+                            <span id="sys-wd-status" class="status-badge status-unknown">...</span>
+                            <button onclick="toggleSystem('watchdog')" style="margin-left:10px; padding: 5px 10px; font-size: 0.8em;">Toggle</button>
+                        </td>
+                    </tr>
+                    <tr style="border-bottom: 1px solid #333;">
+                        <td style="padding: 10px 0;">
+                            <strong>Nextcloud Cron</strong><br>
+                            <small style="color:#aaa;">Use system cron (reliable) instead of AJAX.</small>
+                        </td>
+                        <td style="text-align:right;">
+                            <span id="sys-cron-status" class="status-badge status-unknown">...</span>
+                            <button onclick="toggleSystem('cron')" style="margin-left:10px; padding: 5px 10px; font-size: 0.8em;">Enforce</button>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px 0;">
+                            <strong>PCIe Speed (Experimental)</strong><br>
+                            <small style="color:#aaa;">Enable Gen 3.0 for NVMe drives. Unstable on some cables.</small>
+                        </td>
+                        <td style="text-align:right;">
+                            <span id="sys-pci-status" class="status-badge status-unknown">...</span>
+                            <button onclick="toggleSystem('pci')" style="margin-left:10px; padding: 5px 10px; font-size: 0.8em;">Toggle</button>
+                        </td>
+                    </tr>
+                </table>
+            </div>
             
             <div class="card">
                 <h3>FTP Server (Camera Uploads)</h3>
@@ -519,6 +561,7 @@
             }
         
             // 2. Fetch Initial Data immediately (before intervals)
+            // We 'await' these so the page isn't blank on load
             try {
                 await fetchZigbeeStatus();
                 await fetchStatus(); 
@@ -568,6 +611,7 @@
                 pollLogs();
             }
             if (id === 'settings') {
+                loadSystemConfig();
                 loadSerialDevices();
                 loadFtpUsers();
             }
@@ -664,7 +708,58 @@
             }
         }
 
-        // --- FTP Functions (NEW) ---
+        // --- Settings Tab ---
+        async function loadSystemConfig() {
+            try {
+                const res = await fetch('/api/system/config');
+                const data = await res.json();
+                
+                // Watchdog
+                const wd = document.getElementById('sys-wd-status');
+                wd.innerText = data.watchdog.toUpperCase();
+                wd.className = 'status-badge status-' + (data.watchdog === 'enabled' ? 'running' : 'stopped');
+                wd.dataset.val = data.watchdog;
+    
+                // Cron
+                const cr = document.getElementById('sys-cron-status');
+                cr.innerText = data.cron.toUpperCase();
+                cr.className = 'status-badge status-' + (data.cron === 'cron' ? 'running' : 'unknown');
+    
+                // PCI
+                const pci = document.getElementById('sys-pci-status');
+                pci.innerText = data.pci.toUpperCase();
+                pci.className = 'status-badge status-' + (data.pci === 'gen3' ? 'running' : 'unknown');
+                pci.dataset.val = data.pci;
+    
+            } catch(e) { console.error("Sys Config Load Error", e); }
+        }
+
+        async function toggleSystem(feature) {
+            let action = "";
+            let confirmMsg = "";
+    
+            if (feature === 'watchdog') {
+                const current = document.getElementById('sys-wd-status').dataset.val;
+                action = current === 'enabled' ? 'disable' : 'enable';
+                confirmMsg = `${action.toUpperCase()} Hardware Watchdog?`;
+            } 
+            else if (feature === 'cron') {
+                action = 'enable'; // Only one direction really
+                confirmMsg = "Enforce System Cron for Nextcloud?";
+            }
+            else if (feature === 'pci') {
+                const current = document.getElementById('sys-pci-status').dataset.val;
+                action = current === 'gen3' ? 'disable' : 'enable'; // disable = revert to gen2
+                confirmMsg = `Switch PCIe to ${action === 'enable' ? 'GEN 3 (Experimental)' : 'Gen 2 (Stable)'}?\nA reboot will be required.`;
+            }
+    
+            if (confirm(confirmMsg)) {
+                triggerAction('/api/system/config', 'System Config', { feature: feature, action: action });
+                setTimeout(loadSystemConfig, 3000);
+            }
+        }
+
+        // --- FTP Functions ---
         async function loadFtpUsers() {
             const el = document.getElementById('ftp-user-list');
             if(!el) return;

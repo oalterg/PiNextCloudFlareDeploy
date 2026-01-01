@@ -1,6 +1,5 @@
 <!DOCTYPE html>
 <html>
-
 <head>
     <title>HomeBrain Setup</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,69 +8,107 @@
         body {
             max-width: 800px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 40px 20px;
             text-align: center;
+            background-color: #121212;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
-
+        .logo {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #fff;
+            margin-bottom: 10px;
+            letter-spacing: -1px;
+        }
+        .logo span { color: #2ecc71; }
+        
         .card {
-            background: #252525;
-            padding: 20px;
-            border-radius: 8px;
+            background: #1e1e1e;
+            padding: 30px;
+            border-radius: 12px;
             text-align: left;
-            margin-top: 20px;
+            margin-top: 30px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            border: 1px solid #333;
         }
-
+        
+        h1 { font-weight: 300; color: #eee; }
+        
+        ul { list-style: none; padding: 0; }
+        li { padding: 10px 0; border-bottom: 1px solid #333; color: #ccc; }
+        li:last-child { border-bottom: none; }
+        
         button {
             background-color: #2ecc71;
-            color: black;
-            font-size: 1.2em;
-            padding: 15px 30px;
-            margin-top: 20px;
+            color: #000;
+            font-weight: bold;
+            font-size: 1.1em;
+            padding: 18px 40px;
+            margin-top: 30px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: transform 0.2s, background-color 0.2s;
+        }
+        button:hover {
+            transform: scale(1.05);
+            background-color: #27ae60;
+        }
+        button:disabled {
+            background-color: #555;
+            color: #888;
+            transform: none;
+            cursor: not-allowed;
         }
     </style>
 </head>
-
 <body>
-    <h1>Welcome to Your Own Private Cloud</h1>
-    <p>Your device is ready to be provisioned.</p>
+    <div class="logo">Home<span>Brain</span></div>
+    <h1>Private Cloud Setup</h1>
+    <p style="color: #aaa;">Device Provisioning & Initialization</p>
 
     <div class="card">
-        <h3>Configuration Detected</h3>
+        <h3 style="margin-top:0; color:#2ecc71;">Device Identity</h3>
         <ul>
             <li><strong>Device ID:</strong> {{ config.NEWT_ID }}</li>
             <li><strong>Main Domain:</strong> {{ config.PANGOLIN_DOMAIN }}</li>
-            <li><strong>Tunnel Endpoint:</strong> {{ config.PANGOLIN_ENDPOINT }}</li>
+            <li><strong>Status:</strong> <span style="color:#2ecc71">Online & Ready</span></li>
         </ul>
-        <p style="font-size: 0.9em; color: #888; margin-top: 15px;">
-            Your secure Admin Password will be generated and displayed<br>
-            at the end of the installation process.
-        </p>
+        <div style="margin-top: 20px; padding: 15px; background: #252525; border-radius: 6px; font-size: 0.9em; color: #ddd;">
+            <strong>Note:</strong> You have successfully authenticated with the Factory Password. 
+            Clicking below will install the software stack and generate your unique 
+            <strong>Master Admin Password</strong>.
+        </div>
     </div>
 
-    <button onclick="startSetup()" id="btn">Initialize Device Now</button>
-    <p id="msg" style="color: #aaa; margin-top: 10px;"></p>
+    <button onclick="startSetup()" id="btn">Initialize System</button>
+    <p id="msg" style="color: #888; margin-top: 20px; font-size: 0.9em;"></p>
 
     <script>
         function startSetup() {
-            if (!confirm("Start automated installation? This will install Docker, Nextcloud, and Tunnel services.")) return;
+            if (!confirm("Start automated installation? This will take about 10-15 minutes.")) return;
 
             document.getElementById('btn').disabled = true;
             document.getElementById('btn').innerText = "Starting...";
-            document.getElementById('msg').innerText = "Initiating background processes. The page will reload shortly...";
+            document.getElementById('msg').innerText = "Initiating background processes. Please wait...";
 
             fetch('/start_setup', { method: 'POST' })
                 .then(res => res.json())
                 .then(data => {
                     if (data.status === 'started') {
-                        setTimeout(() => window.location.reload(), 5000);
+                        document.getElementById('msg').innerText = "Setup started. Redirecting to progress view...";
+                        setTimeout(() => window.location.reload(), 2000);
                     } else {
                         alert("Error: " + data.error);
                         document.getElementById('btn').disabled = false;
+                        document.getElementById('btn').innerText = "Initialize System";
                     }
                 })
-                .catch(e => alert("Connection failed"));
+                .catch(e => {
+                    alert("Connection failed. Check network.");
+                    document.getElementById('btn').disabled = false;
+                });
         }
     </script>
 </body>
-
 </html>

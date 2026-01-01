@@ -106,4 +106,10 @@ rfkill block bluetooth || log_error "Bluetooth could not be disabled."
 log_info "=== Deployment Complete ==="
 # Signal specifically for the UI to pick up
 echo "Deployment Complete - Ready for Handover"
+
+# Ensure permissions on creds file so app.py (if dropped privileges) can read it
+if [ -f "$INSTALL_DIR/install_creds.json" ]; then
+    chmod 644 "$INSTALL_DIR/install_creds.json"
+fi
+
 touch "$INSTALL_DIR/.setup_complete"

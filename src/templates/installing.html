@@ -1,74 +1,165 @@
 <!DOCTYPE html>
 <html>
-
 <head>
-    <title>Installing...</title>
+    <title>Installing HomeBrain...</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
-</head>
+    <style>
+        body {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            text-align: center;
+            background-color: #121212;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #eee;
+        }
+        .logo {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #fff;
+            margin-bottom: 20px;
+            letter-spacing: -1px;
+        }
+        .logo span { color: #2ecc71; }
+        
+        #logs {
+            background: #000;
+            color: #2ecc71;
+            padding: 15px;
+            height: 400px;
+            overflow: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            text-align: left;
+            box-shadow: inset 0 0 10px #000;
+        }
+        
+        .success-box {
+            background: #1e1e1e;
+            padding: 30px;
+            border-radius: 12px;
+            border: 2px solid #2ecc71;
+            box-shadow: 0 0 30px rgba(46, 204, 113, 0.15);
+            text-align: left;
+            animation: fadeIn 0.5s;
+        }
+        @keyframes fadeIn { from { opacity:0; transform: translateY(20px); } to { opacity:1; transform: translateY(0); } }
 
+        button {
+            background-color: #2ecc71;
+            color: #000;
+            font-weight: bold;
+            font-size: 1.1em;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: transform 0.2s, background-color 0.2s;
+            width: 100%;
+        }
+        button:hover {
+            transform: scale(1.02);
+            background-color: #27ae60;
+        }
+    </style>
+</head>
 <body>
-    <h1>System Installation in Progress</h1>
-    <p>Please do not unplug. This may take 15-20 minutes.</p>
-    <div id="status-container">
-        <pre id="logs" style="background:#222; color:#0f0; padding:10px; height:300px; overflow:auto; font-size: 12px;"></pre>
+    <div class="logo">Home<span>Brain</span></div>
+    <h2 id="status-title" style="font-weight: 300;">System Installation in Progress</h2>
+    <p id="status-sub" style="color:#aaa;">Please do not unplug. This can take about 15 minutes.</p>
+    
+    <div id="log-container">
+        <pre id="logs">Connecting to log stream...</pre>
     </div>
 
     <script>
         let finished = false;
+        const logsEl = document.getElementById('logs');
 
         const poller = setInterval(() => {
             if (finished) return;
 
             fetch('/api/logs/setup').then(r => r.text()).then(t => {
-                const logDiv = document.getElementById('logs');
-                logDiv.innerText = t;
-                logDiv.scrollTop = logDiv.scrollHeight;
+                logsEl.innerText = t;
+                logsEl.scrollTop = logsEl.scrollHeight;
 
-                // Check for the specific signal from deploy.sh
                 if (t.includes("Deployment Complete - Ready for Handover")) {
                     finished = true;
                     clearInterval(poller);
-                    fetchCredentials();
+                    setTimeout(fetchCredentials, 1000);
                 }
-            });
-        }, 2000);
+            }).catch(() => logsEl.innerText += "\n[Reconnecting...]");
+        }, 3000);
 
         function fetchCredentials() {
             fetch('/api/setup/credentials')
-                .then(res => res.json())
-                .then(data => {
-                    if (data.error) {
-                        document.body.innerHTML = `<h1>Installation Complete</h1><p>Please refresh to log in.</p>`;
-                    } else {
-                        showSuccess(data);
-                    }
+                .then(res => {
+                    if (!res.ok) throw new Error("Creds not found");
+                    return res.json();
                 })
-                .catch(e => location.reload()); // Fallback
+                .then(data => {
+                    showSuccess(data);
+                    // NOTE: We do NOT cleanup here. We wait for user confirmation.
+                })
+                .catch(e => {
+                    document.body.innerHTML = `
+                        <div class="logo">Home<span>Brain</span></div>
+                        <h1>Installation Finished</h1>
+                        <p>Credentials were generated but could not be retrieved automatically.</p>
+                        <button onclick="location.reload()">Go to Login</button>
+                    `;
+                });
         }
 
         function showSuccess(data) {
             document.body.innerHTML = `
-                <div style="max-width: 600px; margin: 0 auto; padding: 20px; font-family: sans-serif;">
-                    <h1 style="color: #2ecc71;">Installation Successful!</h1>
-                    <p>Your Private Cloud is ready. Please save these credentials immediately.</p>
+                <div style="max-width: 500px; margin: 0 auto; padding: 20px;">
+                    <div class="logo">Home<span>Brain</span></div>
                     
-                    <div style="background: #333; padding: 20px; border-radius: 8px; text-align: left; margin: 20px 0; border: 2px solid #f39c12;">
-                        <h3 style="margin-top:0; color: #f39c12;">ADMIN CREDENTIALS (SHOWN ONCE)</h3>
-                        <p><strong>URL (Local):</strong> http://homebrain.local</p>
-                        <p><strong>URL (Remote):</strong> https://${data.domain}</p>
-                        <hr style="border-color: #555;">
-                        <p style="font-size: 1.1em;"><strong>Username:</strong> admin</p>
-                        <p style="font-size: 1.4em; color: #fff; background: #000; padding: 10px; font-family: monospace;">${data.password}</p>
-                    </div>
+                    <div class="success-box">
+                        <h2 style="margin-top:0; color: #2ecc71; border-bottom: 1px solid #444; padding-bottom: 15px;">Setup Complete</h2>
+                        <p style="color:#ddd;">Your private cloud is ready. Save these credentials immediately.</p>
+                        
+                        <div style="background: #252525; padding: 20px; border-radius: 8px; margin: 25px 0;">
+                            <div style="margin-bottom: 15px;">
+                                <span style="color:#888; display:block; font-size:0.75em; text-transform:uppercase; letter-spacing:1px;">Master Username</span>
+                                <span style="font-size:1.2em; color:#fff;">admin</span>
+                            </div>
+                            <div>
+                                <span style="color:#888; display:block; font-size:0.75em; text-transform:uppercase; letter-spacing:1px;">Master Password</span>
+                                <div style="font-family: 'Consolas', monospace; font-size: 1.6em; color: #f39c12; word-break: break-all; margin-top:5px;">
+                                    ${data.password}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <p style="font-size: 0.9em; color: #aaa; margin-bottom: 25px;">
+                            This password provides full administrative access to your Dashboard, Nextcloud, and Home Assistant.
+                        </p>
 
-                    <p style="color: #aaa; font-size: 0.9em;">Important: This password has been generated securely on this device. It is not known to the manufacturer.</p>
-                    
-                    <button onclick="location.reload()" style="background-color: #2ecc71; color: black; font-size: 1.2em; padding: 15px 30px; border: none; cursor: pointer; border-radius: 4px;">Go to Dashboard</button>
+                        <button onclick="confirmAndLogin()">
+                            I have saved my password &rarr; Login
+                        </button>
+                    </div>
                 </div>
             `;
         }
+
+        function confirmAndLogin() {
+            // 1. Signal backend to delete the credential file
+            fetch('/api/setup/cleanup_credentials', {method: 'POST'})
+                .then(() => {
+                    // 2. Reload page to trigger auth prompt
+                    window.location.href = "/";
+                })
+                .catch(err => {
+                    // Fallback if server unreachable, just reload
+                    window.location.href = "/";
+                });
+        }
     </script>
 </body>
-
 </html>

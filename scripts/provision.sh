@@ -10,7 +10,7 @@ LOG_DIR="/var/log/homebrain"
 
 # --- Input Validation ---
 if [[ $EUID -ne 0 ]]; then echo "Run as root."; exit 1; fi
-if [ "$#" -ne 4 ]; then echo "Usage: $0 <ID> <SECRET> <MAIN_DOMAIN> <PAN_EP>"; exit 1; fi
+if [ "$#" -ne 5 ]; then echo "Usage: $0 <ID> <SECRET> <MAIN_DOMAIN> <PAN_EP> <FACTORY_PASS>"; exit 1; fi
 
 # --- 1. System Dependencies ---
 echo "Installing Application Dependencies..."
@@ -24,6 +24,7 @@ NEWT_ID=${1}
 NEWT_SECRET=${2}
 PANGOLIN_DOMAIN=${3}
 PANGOLIN_ENDPOINT=${4}
+FACTORY_PASSWORD=${5}
 EOF
 chmod 600 "$BOOT_CONFIG"
 
