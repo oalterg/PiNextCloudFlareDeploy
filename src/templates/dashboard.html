@@ -1,186 +1,274 @@
 <!DOCTYPE html>
 <html>
-
 <head>
     <title>HomeBrain Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/dark.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
     <style>
-        body {
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 20px;
+        :root {
+            --hb-green: #2ecc71;
+            --hb-green-hover: #27ae60;
+            --hb-bg: #121212;
+            --hb-card: #1e1e1e;
+            --hb-border: #333;
+            --hb-text-main: #eee;
+            --hb-text-dim: #aaa;
+            --hb-danger: #c0392b;
+            --hb-danger-hover: #e74c3c;
+            --hb-warning: #f39c12;
         }
 
+        body {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: var(--hb-bg);
+            color: var(--hb-text-main);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+        }
+
+        /* --- Header Branding --- */
         .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid #444;
-            padding-bottom: 10px;
-            margin-bottom: 20px;
+            border-bottom: 1px solid var(--hb-border);
+            padding-bottom: 20px;
+            margin-bottom: 30px;
         }
 
-        .status-badge {
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-weight: bold;
-            text-transform: uppercase;
-            font-size: 0.8em;
-        }
-
-        .status-running {
-            background: #2ecc71;
-            color: #000;
-        }
-
-        .status-stopped {
-            background: #e74c3c;
+        .logo {
+            font-size: 2em;
+            font-weight: 300;
+            letter-spacing: -1px;
             color: #fff;
+            margin: 0;
+            line-height: 1;
         }
+        .logo span { color: var(--hb-green); font-weight: 700; }
+        .logo small { font-size: 0.4em; color: var(--hb-text-dim); font-weight: 400; letter-spacing: 0; display: block; margin-top: 4px; }
 
-        .status-unknown {
-            background: #95a5a6;
-            color: #000;
-        }
+        .header-status { text-align: right; }
+        .global-status { font-weight: bold; color: var(--hb-green); font-size: 1.1em; }
+        .provider-mode { font-size: 0.85em; color: var(--hb-text-dim); margin-top: 4px; }
 
+        /* --- Navigation Tabs --- */
         .tabs {
             display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            border-bottom: 1px solid #333;
-            padding-bottom: 10px;
-            flex-wrap: wrap; /* Handle smaller screens */
+            gap: 15px;
+            margin-bottom: 25px;
+            border-bottom: 1px solid var(--hb-border);
+            padding-bottom: 0;
+            flex-wrap: wrap;
         }
 
         .tab-btn {
-            background: #222;
+            background: transparent;
             border: none;
-            padding: 10px 20px;
+            padding: 12px 20px;
             cursor: pointer;
-            color: #ccc;
-            border-radius: 5px 5px 0 0;
-            flex-grow: 1; /* Make tabs evenly distributed */
-            text-align: center;
+            color: var(--hb-text-dim);
+            font-weight: 600;
+            font-size: 1em;
+            transition: all 0.2s ease;
+            position: relative;
+            top: 1px;
+            border-bottom: 3px solid transparent;
+            border-radius: 4px 4px 0 0;
         }
 
+        .tab-btn:hover { color: #fff; background: rgba(255,255,255,0.05); }
         .tab-btn.active {
-            background: #2196F3;
-            color: white;
+            color: var(--hb-green);
+            border-bottom: 3px solid var(--hb-green);
+            background: linear-gradient(to top, rgba(46, 204, 113, 0.1), transparent);
         }
 
-        .tab-content {
-            display: none;
-        }
+        .tab-content { display: none; animation: fadeIn 0.4s ease-out; }
+        .tab-content.active { display: block; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-        .tab-content.active {
-            display: block;
-            animation: fadeIn 0.3s;
+        /* --- Cards & Grid --- */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+            gap: 25px;
         }
 
         .card {
-            background: #252525;
-            padding: 20px;
-            border-radius: 8px;
-            margin-bottom: 15px;
+            background: var(--hb-card);
+            padding: 25px;
+            border-radius: 12px;
+            border: 1px solid #2a2a2a;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            transition: transform 0.2s;
         }
+        .card:hover { border-color: #444; }
 
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-        }
-
-        .log-box {
-            background: #000;
-            color: #0f0;
-            font-family: monospace;
-            height: 300px;
-            overflow-y: scroll;
-            padding: 10px;
-            border-radius: 4px;
-            font-size: 12px;
-        }
-
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-            }
-
-            to {
-                opacity: 1;
-            }
-        }
-
-        .drive-row {
+        .card h3 {
+            margin-top: 0;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            color: #fff;
+            font-weight: 600;
+            border-bottom: 1px solid #333;
+            padding-bottom: 12px;
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            background: #333;
+            justify-content: space-between;
+        }
+
+        .card p { font-size: 0.95em; color: #ccc; margin-bottom: 15px; }
+
+        /* --- Buttons & Inputs --- */
+        button {
+            background-color: #333;
+            color: #fff;
+            border: 1px solid #444;
+            padding: 10px 18px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s;
+            font-size: 0.9em;
+        }
+        button:hover { background-color: #444; border-color: #666; transform: translateY(-1px); }
+        button:active { transform: translateY(0); }
+        button:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+
+        .btn-primary {
+            background-color: var(--hb-green);
+            color: #000;
+            font-weight: 700;
+            border: none;
+            box-shadow: 0 2px 10px rgba(46, 204, 113, 0.2);
+        }
+        .btn-primary:hover { background-color: var(--hb-green-hover); box-shadow: 0 4px 15px rgba(46, 204, 113, 0.3); }
+
+        .btn-danger { background-color: var(--hb-danger); color: white; border: none; }
+        .btn-danger:hover { background-color: var(--hb-danger-hover); }
+
+        .btn-warning { background-color: var(--hb-warning); color: #000; border: none; }
+        .btn-warning:hover { opacity: 0.9; }
+
+        input, select {
+            background: #2a2a2a;
+            color: #fff;
+            border: 1px solid #444;
             padding: 10px;
-            margin-bottom: 5px;
-            border-radius: 4px;
+            border-radius: 6px;
+            width: 100%;
+            margin-bottom: 15px;
+            font-size: 0.95em;
+            box-sizing: border-box; /* Fix width issues */
+        }
+        input:focus, select:focus { border-color: var(--hb-green); outline: none; }
+
+        label {
+            color: var(--hb-text-dim);
+            font-size: 0.85em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+            display: block;
         }
 
-        /* Progress Bar */
+        /* --- Specific UI Elements --- */
+        .status-badge {
+            padding: 4px 10px;
+            border-radius: 50px;
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.7em;
+            letter-spacing: 1px;
+            display: inline-block;
+        }
+        .status-running { background: rgba(46, 204, 113, 0.15); color: var(--hb-green); border: 1px solid rgba(46, 204, 113, 0.3); }
+        .status-stopped { background: rgba(231, 76, 60, 0.15); color: #e74c3c; border: 1px solid rgba(231, 76, 60, 0.3); }
+        .status-unknown { background: #333; color: #aaa; border: 1px solid #444; }
+        .status-starting { background: rgba(243, 156, 18, 0.15); color: var(--hb-warning); border: 1px solid rgba(243, 156, 18, 0.3); }
+
         .progress-bg {
-            background: #444;
-            height: 20px;
-            border-radius: 10px;
+            background: #2a2a2a;
+            height: 24px;
+            border-radius: 12px;
             overflow: hidden;
-            margin-top: 5px;
+            margin-top: 8px;
             position: relative;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
         }
-
         .progress-fill {
-            background: #2ecc71;
+            background: var(--hb-green);
             height: 100%;
             width: 0%;
-            transition: width 0.5s;
+            transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
         }
-
         .progress-text {
             position: absolute;
             width: 100%;
             text-align: center;
             top: 0;
-            font-size: 12px;
-            line-height: 20px;
-            text-shadow: 1px 1px 2px #000;
+            font-size: 0.8em;
+            font-weight: bold;
+            line-height: 24px;
+            color: #fff;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+            z-index: 2;
+        }
+
+        .log-box {
+            background: #000;
+            color: #aaddaa;
+            font-family: 'Consolas', 'Monaco', monospace;
+            height: 400px;
+            overflow-y: scroll;
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 13px;
+            border: 1px solid #333;
+            box-shadow: inset 0 0 15px rgba(0,0,0,0.5);
+            line-height: 1.4;
         }
 
         .stat-item {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 5px;
-            font-size: 0.9em;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
         }
+        .stat-item:last-child { border-bottom: none; }
+        .stat-item span:first-child { color: var(--hb-text-dim); }
+        .stat-item span:last-child { font-family: 'Consolas', monospace; color: #fff; }
 
-        .provider-mode {
-            text-align: right;
-            font-size: 0.8em;
-            color: #aaa;
+        table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+        th { text-align: left; padding: 10px; color: var(--hb-text-dim); border-bottom: 2px solid #333; font-weight: 600; text-transform: uppercase; font-size: 0.8em;}
+        td { padding: 12px 10px; border-bottom: 1px solid #333; vertical-align: middle; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+
+        hr { border: 0; height: 1px; background: #333; margin: 20px 0; }
+
+        .drive-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #2a2a2a;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            border: 1px solid #333;
         }
-        
-        /* Table Styles for FTP Users */
-        table {
-            border-collapse: collapse;
-            width: 100%;
-        }
-        th, td {
-            text-align: left;
-            padding: 8px;
-            border-bottom: 1px solid #444;
-        }
-        tr:nth-child(even) {background-color: #2a2a2a;}
     </style>
 </head>
 
 <body>
     <div class="header">
-        <h1>HomeBrain Manager</h1>
-        <div style="text-align:right">
-            <div id="global-status">System Active</div>
+        <h1 class="logo">Home<span>Brain</span><small>Private Cloud Manager</small></h1>
+        <div class="header-status">
+            <div id="global-status" class="global-status">System Active</div>
             <div class="provider-mode">Tunnel: {{ tunnel.mode.upper() }}</div>
         </div>
     </div>
@@ -197,58 +285,325 @@
         <div class="grid">
             <div class="card">
                 <h3>Services</h3>
-                <p>Nextcloud: <span id="st-nc" class="status-badge status-unknown">...</span></p>
-                <p>Database: <span id="st-db" class="status-badge status-unknown">...</span></p>
-                <p>Home Assistant: <span id="st-ha" class="status-badge status-unknown">...</span></p>
-                <p>Tunnel: <span id="st-tunnel" class="status-badge status-unknown">...</span></p>
-                <div style="margin-top:15px;">
-                    <a href="https://{{ nc_domain }}" target="_blank"><button>Open Nextcloud</button></a>
-                    <a href="https://{{ ha_domain }}" target="_blank"><button>Open Home Assistant</button></a>
+                <div class="stat-item"><span>Nextcloud</span> <span id="st-nc" class="status-badge status-unknown">...</span></div>
+                <div class="stat-item"><span>Database</span> <span id="st-db" class="status-badge status-unknown">...</span></div>
+                <div class="stat-item"><span>Home Assistant</span> <span id="st-ha" class="status-badge status-unknown">...</span></div>
+                <div class="stat-item"><span>Tunnel</span> <span id="st-tunnel" class="status-badge status-unknown">...</span></div>
+                
+                <div style="margin-top:25px; display:flex; gap:15px;">
+                    <a href="https://{{ nc_domain }}" target="_blank" style="flex:1"><button class="btn-primary" style="width:100%">Open Nextcloud</button></a>
+                    <a href="https://{{ ha_domain }}" target="_blank" style="flex:1"><button class="btn-primary" style="width:100%">Open Home Assistant</button></a>
                 </div>
             </div>
 
             <div class="card">
                 <h3>System Resources</h3>
-                <div class="stat-item"><span>CPU Load:</span> <span id="sys-cpu">...</span></div>
-                <div class="stat-item"><span>RAM Usage:</span> <span id="sys-ram">...</span></div>
+                <div class="stat-item"><span>CPU Load</span> <span id="sys-cpu">...</span></div>
+                <div class="stat-item"><span>RAM Usage</span> <span id="sys-ram">...</span></div>
 
-                <h4 style="margin-top: 15px; margin-bottom: 5px;">Root Filesystem</h4>
-                <div class="progress-bg">
-                    <div class="progress-fill" id="root-bar"></div>
-                    <div class="progress-text" id="root-text">Checking...</div>
+                <div style="margin-top: 20px;">
+                    <label>Root Filesystem</label>
+                    <div class="progress-bg">
+                        <div class="progress-fill" id="root-bar"></div>
+                        <div class="progress-text" id="root-text">Checking...</div>
+                    </div>
                 </div>
             </div>
 
             <div class="card">
-                <h3>Maintenance</h3>
-                <p>Mode: <span id="st-maint">Checking...</span></p>
-                <button onclick="toggleMaintenance('on')">Enable Maint. Mode</button>
-                <button onclick="toggleMaintenance('off')">Disable Maint. Mode</button>
+                <h3>Maintenance & Updates</h3>
+                <div class="stat-item"><span>Maintenance Mode</span> <span id="st-maint">Checking...</span></div>
+                <div style="display:flex; gap:10px; margin-top:10px;">
+                    <button onclick="toggleMaintenance('on')" style="flex:1">Enable</button>
+                    <button onclick="toggleMaintenance('off')" style="flex:1">Disable</button>
+                </div>
+                
                 <hr>
-                <h3>Updates</h3>
-                <div style="margin-bottom: 10px;">
-                    <label style="font-size: 0.9em; color: #aaa;">Channel:</label>
-                    <select id="update-channel" onchange="resetUpdateUI()" style="padding: 5px; background: #333; color: #fff; border: 1px solid #555;">
+                
+                <label>System Update Channel</label>
+                <div style="display:flex; gap:10px;">
+                    <select id="update-channel" onchange="resetUpdateUI()" style="margin-bottom:0; flex:2;">
                         <option value="stable">Stable (Releases)</option>
                         <option value="beta">Beta (Main Branch)</option>
                     </select>
+                    <button onclick="triggerAction('/api/upgrade', 'System Upgrade')" style="flex:1;">OS Upgrade</button>
                 </div>
-                <button onclick="triggerAction('/api/upgrade', 'System Upgrade')">System OS Upgrade</button>
-                <div style="margin-top: 10px;">
+
+                <div style="margin-top: 15px; display:flex; align-items:center; gap:10px;">
                     <button id="btn-check-update" onclick="checkManagerUpdate()">Check App Update</button>
-                    <button id="btn-do-update" onclick="doManagerUpdate()"
-                        style="display:none; background-color: #2ecc71; color: black;">Update Now</button>
-                    <span id="update-msg" style="font-size: 0.8em; margin-left: 10px;"></span>
+                    <button id="btn-do-update" class="btn-primary" onclick="doManagerUpdate()" style="display:none;">Update Now</button>
+                    <span id="update-msg" style="font-size: 0.85em; color:var(--hb-text-dim);"></span>
                 </div>
             </div>
         </div>
     </div>
 
+    <div id="backup" class="tab-content">
+        <div class="grid">
+            <div class="card">
+                <h3>Drive Management</h3>
+                <p>Manage external USB storage devices.</p>
+                <div id="drive-list" style="margin-bottom:15px;">Loading drives...</div>
+                <button onclick="loadDrives()">Scan for Drives</button>
+
+                <hr>
+                
+                <label>Backup Drive Usage</label>
+                <div id="disk-stats">
+                    <div class="progress-bg">
+                        <div class="progress-fill" id="disk-bar"></div>
+                        <div class="progress-text" id="disk-text">Not Mounted</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Backup Schedule</h3>
+                <form onsubmit="saveBackupConfig(event)">
+                    <div class="grid" style="grid-template-columns: 1fr 1fr; gap:15px;">
+                        <div>
+                            <label>Retention (Snapshots)</label>
+                            <input type="number" id="bk-retention" min="1" max="50">
+                        </div>
+                        <div>
+                            <label>Frequency</label>
+                            <select id="bk-freq" onchange="updateFreqUI()">
+                                <option value="daily">Daily</option>
+                                <option value="weekly">Weekly</option>
+                                <option value="monthly">Monthly</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div id="ui-dow" style="display:none;">
+                        <label>Day of Week</label>
+                        <select id="bk-dow">
+                            <option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option>
+                            <option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option>
+                        </select>
+                    </div>
+
+                    <div id="ui-dom" style="display:none;">
+                        <label>Day of Month</label>
+                        <input type="number" id="bk-dom" min="1" max="31" value="1">
+                    </div>
+
+                    <label>Time (24h)</label>
+                    <div style="display: flex; gap: 10px;">
+                        <select id="bk-hour"></select>
+                        <select id="bk-min"><option value="0">00</option><option value="15">15</option><option value="30">30</option><option value="45">45</option></select>
+                    </div>
+                    <button type="submit" class="btn-primary" style="width:100%; margin-top:10px;">Save Schedule</button>
+                </form>
+                
+                <hr>
+                <label>Manual Action</label>
+                <div style="display:flex; gap:10px;">
+                    <select id="backup-strategy" style="margin-bottom:0;">
+                        <option value="full">Full System (DB + Files + Config)</option>
+                        <option value="data_only">Files Only (Fast)</option>
+                    </select>
+                    <button onclick="runBackup()">Run Now</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:25px;">
+            <h3>Restore Data</h3>
+            <p>Select a backup file to restore. <strong style="color:var(--hb-danger)">Warning: This overwrites current data!</strong></p>
+            <div style="display:flex; gap:10px; align-items:center;">
+                <select id="backup-list" style="margin-bottom:0; flex-grow:1;"></select>
+                <button class="btn-danger" onclick="confirmRestore()">Restore Selected</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="connectivity" class="tab-content">
+        <div class="card" style="border-left: 4px solid var(--hb-green);">
+             <h3 style="border-bottom:none; margin-bottom:10px;">Authentication</h3>
+             <p style="margin-bottom:0;">The <strong>Master Admin Password</strong> controls access to HomeBrain Manager, Nextcloud, and Home Assistant.</p>
+        </div>
+
+        <div class="card">
+            <h3>Tunnel Configuration</h3>
+
+            {% if tunnel.mode == 'pangolin' %}
+            <div style="background:rgba(46, 204, 113, 0.1); border:1px solid var(--hb-green); padding:15px; border-radius:6px; margin-bottom:20px;">
+                <span style="color:var(--hb-green); font-weight:bold;">Active Provider: Pangolin</span>
+                {% if tunnel.is_custom_pangolin %}<span style="font-size:0.8em; margin-left:10px; opacity:0.7;">(Customized)</span>{% endif %}
+            </div>
+
+            <form onsubmit="updatePangolin(event)">
+                <div class="grid" style="grid-template-columns: 1fr 1fr; gap:15px;">
+                    <div><label>Endpoint</label><input type="text" id="tun-ep" value="{{ tunnel.current.PANGOLIN_ENDPOINT }}"></div>
+                    <div><label>Device ID</label><input type="text" id="tun-id" value="{{ tunnel.current.NEWT_ID }}"></div>
+                </div>
+                <label>Secret Key</label><input type="password" id="tun-sec" value="{{ tunnel.current.NEWT_SECRET }}">
+                
+                <hr>
+                
+                <label>Main Domain (e.g. myserver.homebrain.com)</label>
+                <input type="text" id="tun-main-domain" value="{{ main_domain }}">
+                
+                <div style="font-size: 0.85em; color: var(--hb-text-dim); padding: 10px; background: #222; border-radius: 4px; margin-bottom:15px;">
+                    <strong>Subdomain Preview:</strong><br>
+                    Manager: <span id="preview-mgr" style="color:#fff">{{ main_domain }}</span><br>
+                    Nextcloud: nc.<span id="preview-nc" style="color:#fff">{{ main_domain }}</span><br>
+                    Home Assistant: ha.<span id="preview-ha" style="color:#fff">{{ main_domain }}</span>
+                </div>
+
+                <button type="submit">Update Connection Settings</button>
+            </form>
+
+            {% if tunnel.is_custom_pangolin %}
+            <div style="margin-top:20px; text-align:right;">
+                <button class="btn-danger" onclick="revertPangolin()" style="font-size:0.8em;">Reset to Factory Defaults</button>
+            </div>
+            {% endif %}
+
+            <hr>
+            
+            <label>Switch Provider</label>
+            <p>You can switch to Cloudflare Tunnel if you have your own domain.</p>
+            <button class="btn-warning" onclick="showCloudflareForm()">Switch to Cloudflare</button>
+
+            <div id="cf-form-container" style="display:none; margin-top:20px; background: #222; padding: 20px; border-radius: 8px; border:1px solid #444;">
+                <h4 style="margin-top:0; color:var(--hb-warning)">Cloudflare Setup</h4>
+                <p style="font-size:0.9em;">Configure public hostnames in Cloudflare Dashboard pointing to <code>http://nextcloud:80</code> and <code>http://homeassistant:8123</code>.</p>
+                <form onsubmit="updateCloudflare(event, 'switch')">
+                    <label>Service</label>
+                    <select id="cf-switch-service">
+                        <option value="nc">Nextcloud</option>
+                        {% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}
+                    </select>
+                    <label>Domain (e.g. cloud.mydomain.com)</label>
+                    <input type="text" id="cf-switch-domain" required>
+                    <label>Tunnel Token</label>
+                    <input type="text" id="cf-switch-token" placeholder="eyJhIjoi..." required>
+                    <button type="submit" class="btn-warning">Activate Cloudflare</button>
+                </form>
+            </div>
+
+            {% else %}
+            <div style="background:rgba(243, 156, 18, 0.1); border:1px solid var(--hb-warning); padding:15px; border-radius:6px; margin-bottom:20px;">
+                <span style="color:var(--hb-warning); font-weight:bold;">Active Provider: Cloudflare</span>
+            </div>
+
+            <div style="margin-bottom:20px;">
+                <label>Active Tunnels</label>
+                <ul style="list-style:none; padding:0; margin:0; font-size:0.9em; color:#ccc;">
+                    <li style="padding:5px 0; border-bottom:1px solid #333;">
+                        <strong>Nextcloud:</strong> 
+                        {% if tunnel.current.CF_TOKEN_NC %}<span style="color:var(--hb-green)">Configured</span>{% else %}<span style="color:#666">Inactive</span>{% endif %}
+                    </li>
+                    <li style="padding:5px 0;">
+                        <strong>Home Assistant:</strong> 
+                        {% if tunnel.current.CF_TOKEN_HA %}<span style="color:var(--hb-green)">Configured</span>{% else %}<span style="color:#666">Inactive</span>{% endif %}
+                    </li>
+                </ul>
+            </div>
+
+            <hr>
+            <label>Update Configuration</label>
+            <form onsubmit="updateCloudflare(event, 'update')">
+                <div class="grid" style="grid-template-columns: 1fr 2fr; gap:10px;">
+                    <div><select id="cf-update-service"><option value="nc">Nextcloud</option>{% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}</select></div>
+                    <div><input type="text" id="cf-update-domain" placeholder="Domain"></div>
+                </div>
+                <input type="text" id="cf-update-token" placeholder="Tunnel Token" required>
+                <button type="submit">Save Tunnel</button>
+            </form>
+
+            <div style="margin-top:30px; text-align:center;">
+                <button class="btn-danger" onclick="revertToFactory()">Disable Cloudflare & Revert to Factory</button>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div id="settings" class="tab-content">
+        <div class="grid">
+            
+            <div class="card">
+                <h3>System Configuration</h3>
+                <p>Advanced hardware and task management.</p>
+
+                <table style="margin-top:10px;">
+                    <tr>
+                        <td>
+                            <strong>Hardware Watchdog</strong><br>
+                            <small style="color:var(--hb-text-dim);">Auto-reboots system if frozen.</small>
+                        </td>
+                        <td style="text-align:right;">
+                            <span id="sys-wd-status" class="status-badge status-unknown">...</span>
+                            <button onclick="toggleSystem('watchdog')" style="margin-left:10px; padding:4px 10px; font-size:0.8em;">Toggle</button>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>
+                            <strong>Nextcloud Cron</strong><br>
+                            <small style="color:var(--hb-text-dim);">Use system cron (Reliable).</small>
+                        </td>
+                        <td style="text-align:right;">
+                            <span id="sys-cron-status" class="status-badge status-unknown">...</span>
+                            <button onclick="toggleSystem('cron')" style="margin-left:10px; padding:4px 10px; font-size:0.8em;">Enforce</button>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>
+                            <strong>PCIe Speed</strong><br>
+                            <small style="color:var(--hb-text-dim);">Gen 3.0 (Experimental).</small>
+                        </td>
+                        <td style="text-align:right;">
+                            <span id="sys-pci-status" class="status-badge status-unknown">...</span>
+                            <button onclick="toggleSystem('pci')" style="margin-left:10px; padding:4px 10px; font-size:0.8em;">Toggle</button>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+            
+            <div class="card">
+                <h3>FTP Server (Camera Uploads)</h3>
+                <p>Create dedicated FTP accounts mapping to Nextcloud.</p>
+                
+                <form onsubmit="setupFtp(event)">
+                    <div class="grid" style="grid-template-columns: 1fr 1fr; gap:15px;">
+                        <div><label>NC User</label><input type="text" id="ftp-nc-user" placeholder="admin"></div>
+                        <div><label>FTP User</label><input type="text" id="ftp-user" placeholder="camera1"></div>
+                    </div>
+                    <label>FTP Password</label><input type="password" id="ftp-pass">
+                    
+                    <button type="submit" class="btn-primary" style="width:100%; margin-top:5px;">Create / Update User</button>
+                </form>
+        
+                <hr>
+                <label>Active FTP Users</label>
+                <div id="ftp-user-list" style="min-height:50px;">Loading...</div>
+                <button onclick="loadFtpUsers()" style="margin-top:10px; font-size:0.8em; padding:6px 12px;">Refresh List</button>
+            </div>
+
+            {% if ha_domain %}
+            <div class="card">
+                <h3>Home Assistant Hardware</h3>
+                <p>Pass-through Zigbee/Z-Wave USB dongles.</p>
+                <label>Select Serial Device</label>
+                <div style="display:flex; gap:10px;">
+                    <select id="zigbee-device" style="margin-bottom:0; flex-grow:1;">
+                        <option value="none">None</option>
+                    </select>
+                    <button onclick="updateZigbee()">Save</button>
+                </div>
+            </div>
+            {% endif %}
+
+        </div>
+    </div>
+
     <div id="logs" class="tab-content">
         <div class="card">
-            <h3>System & Service Logs</h3>
-            <div style="display:flex; gap:10px; margin-bottom: 10px;">
-                <select id="log-selector" onchange="changeLogSource(this.value)">
+            <h3>System Logs</h3>
+            <div style="display:flex; gap:15px; margin-bottom: 15px;">
+                <select id="log-selector" onchange="changeLogSource(this.value)" style="flex-grow:1; margin-bottom:0;">
                     <optgroup label="System Logs">
                         <option value="setup">Setup Log</option>
                         <option value="backup">Backup Log</option>
@@ -264,284 +619,9 @@
                         <option value="cloudflared-ha">Cloudflare (HA) Container</option>
                     </optgroup>
                 </select>
-                <button onclick="pollLogs()">Refresh</button>
+                <button onclick="pollLogs()">Refresh Now</button>
             </div>
             <div id="console-output" class="log-box">Select a log source...</div>
-        </div>
-    </div>
-
-    <div id="backup" class="tab-content">
-        <div class="grid">
-            <div class="card">
-                <h3>Drive Management</h3>
-                <p>Manage external storage.</p>
-                <div id="drive-list">Loading drives...</div>
-                <button onclick="loadDrives()">Refresh Drives</button>
-
-                <h4 style="margin-top: 20px">Backup Drive Usage</h4>
-                <div id="disk-stats">
-                    <div class="progress-bg">
-                        <div class="progress-fill" id="disk-bar"></div>
-                        <div class="progress-text" id="disk-text">Not Mounted</div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h3>Backup Settings</h3>
-                <form onsubmit="saveBackupConfig(event)">
-                    <label>Retention (Snapshots to keep):</label>
-                    <input type="number" id="bk-retention" min="1" max="50">
-
-                    <label>Frequency:</label>
-                    <select id="bk-freq" onchange="updateFreqUI()">
-                        <option value="daily">Daily</option>
-                        <option value="weekly">Weekly</option>
-                        <option value="monthly">Monthly</option>
-                    </select>
-
-                    <div id="ui-dow" style="display:none;">
-                        <label>Day of Week:</label>
-                        <select id="bk-dow">
-                            <option value="0">Sunday</option>
-                            <option value="1">Monday</option>
-                            <option value="2">Tuesday</option>
-                            <option value="3">Wednesday</option>
-                            <option value="4">Thursday</option>
-                            <option value="5">Friday</option>
-                            <option value="6">Saturday</option>
-                        </select>
-                    </div>
-
-                    <div id="ui-dom" style="display:none;">
-                        <label>Day of Month:</label>
-                        <input type="number" id="bk-dom" min="1" max="31" value="1">
-                    </div>
-
-                    <label>Time (24h):</label>
-                    <div style="display: flex; gap: 10px;">
-                        <select id="bk-hour" style="flex:1"></select>
-                        <select id="bk-min" style="flex:1">
-                            <option value="0">00</option>
-                            <option value="15">15</option>
-                            <option value="30">30</option>
-                            <option value="45">45</option>
-                        </select>
-                    </div>
-                    <button type="submit" style="margin-top: 10px;">Save Settings</button>
-                </form>
-
-                <hr>
-                <h4>Trigger Manual Backup</h4>
-                <select id="backup-strategy">
-                    <option value="full">Full System (Nextcloud + HA + DB)</option>
-                    <option value="data_only">Files Only (Nextcloud + HA, No DB)</option>
-                </select>
-                <button onclick="runBackup()">Run Backup Now</button>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3>Restore</h3>
-            <p>Select a backup file to restore. <strong>Warning: Overwrites existing data.</strong></p>
-            <select id="backup-list" style="width: 100%; margin-bottom: 10px;"></select>
-            <button style="background-color: #e74c3c;" onclick="confirmRestore()">Restore Selected</button>
-        </div>
-    </div>
-
-    <div id="connectivity" class="tab-content">
-        <div class="card" style="border-left: 5px solid #e74c3c;">
-             <h3>Authentication</h3>
-             <p>The <strong>Master Admin Password</strong> is used for HomeBrain Manager, Nextcloud, and Home Assistant.</p>
-             <p style="color: #aaa; font-size: 0.9em;">If you need to reset credentials, use the command line tool <code>homebrain-cli</code> (Coming soon).</p>
-        </div>
-
-        <!-- Tunnel Provider Toggle Logic -->
-        <div class="card">
-            <h3>Tunnel Configuration</h3>
-
-            {% if tunnel.mode == 'pangolin' %}
-            <!-- Pangolin View -->
-            <p>
-                Current Provider: <strong style="color: #2ecc71">Pangolin (Factory Default)</strong>
-                {% if tunnel.is_custom_pangolin %}(Customized){% endif %}
-            </p>
-            <form onsubmit="updatePangolin(event)">
-                <label>Endpoint:</label>
-                <input type="text" id="tun-ep" value="{{ tunnel.current.PANGOLIN_ENDPOINT }}">
-                <label>ID:</label>
-                <input type="text" id="tun-id" value="{{ tunnel.current.NEWT_ID }}">
-                <label>Secret:</label>
-                <input type="password" id="tun-sec" value="{{ tunnel.current.NEWT_SECRET }}">
-                
-                <hr style="border-color: #444; margin: 15px 0;">
-                <p style="font-size: 0.9em; color: #aaa; margin-bottom: 10px;">Domain Configuration</p>
-                
-                <label>Main Domain (e.g., myserver.homebrain.com):</label>
-                <input type="text" id="tun-main-domain" value="{{ main_domain }}">
-                
-                <div style="font-size: 0.8em; color: #888; margin-top: 5px; padding: 10px; background: #333; border-radius: 4px;">
-                    <strong>Derived Subdomains:</strong><br>
-                    Manager: <span id="preview-mgr">{{ main_domain }}</span><br>
-                    Nextcloud: nc.<span id="preview-nc">{{ main_domain }}</span><br>
-                    Home Assistant: ha.<span id="preview-ha">{{ main_domain }}</span>
-                </div>
-
-                <button type="submit" style="margin-top: 15px;">Update Connection</button>
-            </form>
-            {% if tunnel.is_custom_pangolin %}
-            <hr>
-            <button style="background-color: #e74c3c;" onclick="revertPangolin()">Reset Pangolin Defaults</button>
-            {% endif %}
-
-            <hr>
-            <h4>Switch Provider</h4>
-            <p>Switch to Cloudflare Tunnel (requires Cloudflare account). This will disable Pangolin.</p>
-            <button onclick="showCloudflareForm()" style="background-color: #f39c12; color: #000;">Switch to
-                Cloudflare</button>
-
-            <!-- Hidden CF Form for switching -->
-            <div id="cf-form-container"
-                style="display:none; margin-top:15px; background: #333; padding: 15px; border-radius: 5px;">
-                <h4>Cloudflare Setup</h4>
-                <p style="font-size:0.9em;">
-                    1. Create tunnel in Cloudflare Dashboard (Network > Tunnels).<br>
-                    2. Select "Docker" environment.<br>
-                    3. Copy the token.<br>
-                    4. <strong>Important:</strong> Configure Public Hostname service in dashboard to:<br>
-                    - Nextcloud: <code>http://nextcloud:80</code><br>
-                    - Home Assistant: <code>http://homeassistant:8123</code>
-                    <label>Domain (e.g., mycloud.example.com):</label>
-                    <input type="text" id="cf-switch-domain" placeholder="mycloud.example.com" required>
-                </p>
-                <form onsubmit="updateCloudflare(event, 'switch')">
-                    <label>Service:</label>
-                    <select id="cf-switch-service">
-                        <option value="nc">Nextcloud</option>
-                        {% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}
-                    </select>
-                    <label>Tunnel Token:</label>
-                    <input type="text" id="cf-switch-token" placeholder="eyJhIjoi...">
-                    <button type="submit">Activate Cloudflare</button>
-                </form>
-            </div>
-
-            {% else %}
-            <!-- Cloudflare View -->
-            <p>Current Provider: <strong style="color: #f39c12">Cloudflare</strong></p>
-
-            <div>
-                <h4>Active Tunnels</h4>
-                <ul>
-                    {% if tunnel.current.CF_TOKEN_NC %}
-                    <li><strong>Nextcloud:</strong> Configured (Token: {{ tunnel.current.CF_TOKEN_NC[:10] }}...)</li>
-                    {% else %}
-                    <li><strong>Nextcloud:</strong> Not Configured</li>
-                    {% endif %}
-                    {% if tunnel.current.CF_TOKEN_HA %}
-                    <li><strong>Home Assistant:</strong> Configured (Token: {{ tunnel.current.CF_TOKEN_HA[:10] }}...)
-                    </li>
-                    {% endif %}
-                </ul>
-            </div>
-
-            <hr>
-            <h4>Add/Update Tunnel</h4>
-            <form onsubmit="updateCloudflare(event, 'update')">
-                <label>Service:</label>
-                <select id="cf-update-service">
-                    <option value="nc">Nextcloud</option>
-                    {% if ha_domain %}<option value="ha">Home Assistant</option>{% endif %}
-                </select>
-                <label>Domain (e.g., mycloud.example.com):</label> <input type="text" id="cf-update-domain"
-                    placeholder="mycloud.example.com" required>
-                <label>Token (from Cloudflare Dashboard):</label>
-                <input type="text" id="cf-update-token" placeholder="eyJhIjoi..." required>
-                <button type="submit">Save Tunnel</button>
-            </form>
-
-            <hr>
-            <button style="background-color: #e74c3c;" onclick="revertToFactory()">Revert to Factory (Pangolin)</button>
-            {% endif %}
-        </div>
-    </div>
-
-    <div id="settings" class="tab-content">
-        <div class="grid">
-            
-            <div class="card">
-                <h3>System Configuration</h3>
-                <p>Manage hardware features and background tasks.</p>
-
-                <table style="width:100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #333;">
-                        <td style="padding: 10px 0;">
-                            <strong>Hardware Watchdog</strong><br>
-                            <small style="color:#aaa;">Auto-reboots system if it hangs.</small>
-                        </td>
-                        <td style="text-align:right;">
-                            <span id="sys-wd-status" class="status-badge status-unknown">...</span>
-                            <button onclick="toggleSystem('watchdog')" style="margin-left:10px; padding: 5px 10px; font-size: 0.8em;">Toggle</button>
-                        </td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #333;">
-                        <td style="padding: 10px 0;">
-                            <strong>Nextcloud Cron</strong><br>
-                            <small style="color:#aaa;">Use system cron (reliable) instead of AJAX.</small>
-                        </td>
-                        <td style="text-align:right;">
-                            <span id="sys-cron-status" class="status-badge status-unknown">...</span>
-                            <button onclick="toggleSystem('cron')" style="margin-left:10px; padding: 5px 10px; font-size: 0.8em;">Enforce</button>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 10px 0;">
-                            <strong>PCIe Speed (Experimental)</strong><br>
-                            <small style="color:#aaa;">Enable Gen 3.0 for NVMe drives. Unstable on some cables.</small>
-                        </td>
-                        <td style="text-align:right;">
-                            <span id="sys-pci-status" class="status-badge status-unknown">...</span>
-                            <button onclick="toggleSystem('pci')" style="margin-left:10px; padding: 5px 10px; font-size: 0.8em;">Toggle</button>
-                        </td>
-                    </tr>
-                </table>
-            </div>
-            
-            <div class="card">
-                <h3>FTP Server (Camera Uploads)</h3>
-                <p>Create a dedicated FTP account that maps to a Nextcloud user's <code>/uploads</code> folder. Useful for IP Cameras.</p>
-                
-                <form onsubmit="setupFtp(event)">
-                    <label>Nextcloud Username:</label>
-                    <input type="text" id="ftp-nc-user" placeholder="e.g. admin" required>
-                    
-                    <label>FTP Username (New):</label>
-                    <input type="text" id="ftp-user" placeholder="e.g. camera1" required>
-                    
-                    <label>FTP Password:</label>
-                    <input type="password" id="ftp-pass" required>
-                    
-                    <button type="submit" style="background-color: #9b59b6; margin-top: 10px;">Setup / Update FTP User</button>
-                </form>
-        
-                <hr>
-                <h4>Active FTP Users</h4>
-                <div id="ftp-user-list">Loading...</div>
-                <button onclick="loadFtpUsers()" style="background: #444; font-size: 0.8em; margin-top: 10px;">Refresh List</button>
-            </div>
-
-            {% if ha_domain %}
-            <div class="card">
-                <h3>Home Assistant Hardware</h3>
-                <p>Select a Zigbee/Z-Wave dongle to pass through to Home Assistant.</p>
-                <label>Serial Device:</label>
-                <select id="zigbee-device">
-                    <option value="none">None</option>
-                    </select>
-                <button onclick="updateZigbee()">Save & Restart HA</button>        
-            </div>
-            {% endif %}
-
         </div>
     </div>
 
@@ -549,7 +629,7 @@
         let currentLogSource = 'setup';
 
         async function init() {
-            // 1. Populate Hours (UI Setup)
+            // Populate Hours for Backup
             const hourSel = document.getElementById('bk-hour');
             if (hourSel) {
                 for (let i = 0; i < 24; i++) {
@@ -560,21 +640,19 @@
                 }
             }
         
-            // 2. Fetch Initial Data immediately (before intervals)
-            // We 'await' these so the page isn't blank on load
+            // Initial Fetch
             try {
-                await fetchZigbeeStatus();
-                await fetchStatus(); 
-                await pollTask();
+                // Parallel fetch for speed
+                await Promise.all([fetchStatus(), pollTask()]);
+                // Load heavy stuff lazily or on tab open
             } catch (err) {
                 console.error("Initial fetch failed:", err);
             }
         
-            // 3. Start Polling Intervals
+            // Start Intervals
             setInterval(fetchStatus, 5000);
             setInterval(pollTask, 2000);
             
-            // Poll logs only if on logs tab
             setInterval(() => {
                 const logsTab = document.getElementById('logs');
                 if (logsTab && logsTab.classList.contains('active')) {
@@ -588,19 +666,13 @@
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.getElementById(id).classList.add('active');
             
-            // Find the button that triggered this function (if event exists)
-            if (event && event.target && event.target.classList.contains('tab-btn')) {
-                 event.target.classList.add('active');
-            } else {
-                 // Fallback: manually find button by onclick text matching
-                 const btns = document.querySelectorAll('.tab-btn');
-                 btns.forEach(b => {
-                     if (b.getAttribute('onclick').includes(id)) {
-                         b.classList.add('active');
-                     }
-                 });
-            }
+            // Highlight button
+            const btns = document.querySelectorAll('.tab-btn');
+            btns.forEach(b => {
+                if(b.getAttribute('onclick').includes(id)) b.classList.add('active');
+            });
 
+            // Lazy load tab-specific data
             if (id === 'backup') {
                 loadDrives();
                 loadBackups();
@@ -622,11 +694,14 @@
                 const res = await fetch('/api/status');
                 const data = await res.json();
 
-                // Services
+                // Services Status
                 ['nc', 'db', 'ha', 'tunnel'].forEach(k => {
-                    if (document.getElementById('st-' + k)) setStatus('st-' + k, data[k === 'nc' ? 'nextcloud' : (k === 'tunnel' ? 'tunnel' : (k === 'ha' ? 'homeassistant' : 'db'))]);
+                    const el = document.getElementById('st-' + k);
+                    if (el) setStatus(el, data[k === 'nc' ? 'nextcloud' : (k === 'tunnel' ? 'tunnel' : (k === 'ha' ? 'homeassistant' : 'db'))]);
                 });
-                if (document.getElementById('st-maint')) document.getElementById('st-maint').innerText = (data.maintenance_mode || 'unknown').toUpperCase();
+                
+                if (document.getElementById('st-maint')) 
+                    document.getElementById('st-maint').innerText = (data.maintenance_mode || 'unknown').toUpperCase();
 
                 // Stats
                 if (data.cpu_load !== undefined) document.getElementById('sys-cpu').innerText = data.cpu_load + "%";
@@ -636,26 +711,50 @@
                 if (data.root_percent !== undefined) {
                     const bar = document.getElementById('root-bar');
                     bar.style.width = data.root_percent + '%';
-                    bar.style.backgroundColor = data.root_percent > 85 ? '#e74c3c' : '#2ecc71';
+                    bar.style.backgroundColor = data.root_percent > 85 ? 'var(--hb-danger)' : 'var(--hb-green)';
                     document.getElementById('root-text').innerText = data.root_percent + "% Used (" + data.root_free_gb + " GB Free)";
                 }
 
             } catch (e) { }
         }
 
-        function setStatus(elId, status) {
-            const el = document.getElementById(elId);
-            if (!el) return;
+        function setStatus(el, status) {
             el.className = 'status-badge status-' + (status || 'unknown');
             el.innerText = (status || 'unknown').toUpperCase();
         }
 
-        // --- Tunnel Functions ---
+        async function pollTask() {
+            try {
+                const res = await fetch('/api/task_status');
+                const data = await res.json();
+                const banner = document.getElementById('global-status');
+                
+                if(data.status === 'idle') {
+                    banner.innerText = 'System Active';
+                    banner.style.color = 'var(--hb-green)';
+                } else if (data.status === 'running') {
+                    banner.innerText = data.message;
+                    banner.style.color = 'var(--hb-warning)';
+                } else if (data.status === 'error') {
+                    banner.innerText = 'Error: ' + data.message;
+                    banner.style.color = 'var(--hb-danger)';
+                } else {
+                    banner.innerText = data.message;
+                }
+
+                // Auto switch log view if setup/update is running
+                if ((data.log_type === 'setup' || data.log_type === 'update') && data.status === 'running') {
+                     // Only switch if we aren't already looking at it to avoid annoyance
+                     // currentLogSource = data.log_type; 
+                }
+            } catch(e) {}
+        }
+
+        // --- Tunnel Logic ---
         function showCloudflareForm() {
             document.getElementById('cf-form-container').style.display = 'block';
         }
 
-        // Live preview for domain typing
         document.getElementById('tun-main-domain').addEventListener('input', function(e) {
             const val = e.target.value || '...';
             document.getElementById('preview-mgr').innerText = val;
@@ -671,7 +770,7 @@
                 secret: document.getElementById('tun-sec').value,
                 main_domain: document.getElementById('tun-main-domain').value
             };
-            if (confirm("Update Pangolin settings? This will update all service URLs.")) {
+            if (confirm("Update Pangolin settings? This will update all service URLs and restart tunnels.")) {
                 triggerAction('/api/tunnel', 'Update Tunnel', data);
                 setTimeout(() => location.reload(), 3000);
             }
@@ -687,15 +786,14 @@
         async function updateCloudflare(e, mode) {
             e.preventDefault();
             const prefix = mode === 'switch' ? 'cf-switch-' : 'cf-update-';
-            
             const token = document.getElementById(prefix + 'token').value;
             const service = document.getElementById(prefix + 'service').value;
             const domain = document.getElementById(prefix + 'domain').value;
 
             if (!token) return alert("Token required");
-            if (!domain) return alert("Domain required");
+            if (!domain && mode === 'switch') return alert("Domain required");
 
-            if (confirm("Switch/Update Cloudflare Tunnel for " + service.toUpperCase() + "? This will modify your connection settings.")) {
+            if (confirm("Switch/Update Cloudflare Tunnel?")) {
                 triggerAction('/api/tunnel/cloudflare', 'Cloudflare Update', { domain: domain, token: token, service: service });
                 setTimeout(() => location.reload(), 3000);
             }
@@ -708,48 +806,42 @@
             }
         }
 
-        // --- Settings Tab ---
+        // --- Settings Tab Logic ---
         async function loadSystemConfig() {
             try {
                 const res = await fetch('/api/system/config');
                 const data = await res.json();
                 
-                // Watchdog
-                const wd = document.getElementById('sys-wd-status');
-                wd.innerText = data.watchdog.toUpperCase();
-                wd.className = 'status-badge status-' + (data.watchdog === 'enabled' ? 'running' : 'stopped');
-                wd.dataset.val = data.watchdog;
-    
-                // Cron
-                const cr = document.getElementById('sys-cron-status');
-                cr.innerText = data.cron.toUpperCase();
-                cr.className = 'status-badge status-' + (data.cron === 'cron' ? 'running' : 'unknown');
-    
-                // PCI
-                const pci = document.getElementById('sys-pci-status');
-                pci.innerText = data.pci.toUpperCase();
-                pci.className = 'status-badge status-' + (data.pci === 'gen3' ? 'running' : 'unknown');
-                pci.dataset.val = data.pci;
-    
+                const updateBadge = (id, val, activeVal) => {
+                    const el = document.getElementById(id);
+                    el.innerText = val.toUpperCase();
+                    el.className = 'status-badge status-' + (val === activeVal ? 'running' : 'stopped');
+                    el.dataset.val = val;
+                };
+
+                updateBadge('sys-wd-status', data.watchdog, 'enabled');
+                updateBadge('sys-cron-status', data.cron, 'cron'); // cron enabled = 'cron'
+                updateBadge('sys-pci-status', data.pci, 'gen3');
+                
             } catch(e) { console.error("Sys Config Load Error", e); }
         }
 
         async function toggleSystem(feature) {
             let action = "";
             let confirmMsg = "";
+            const el = document.getElementById(feature === 'watchdog' ? 'sys-wd-status' : (feature === 'cron' ? 'sys-cron-status' : 'sys-pci-status'));
+            const current = el.dataset.val;
     
             if (feature === 'watchdog') {
-                const current = document.getElementById('sys-wd-status').dataset.val;
                 action = current === 'enabled' ? 'disable' : 'enable';
                 confirmMsg = `${action.toUpperCase()} Hardware Watchdog?`;
             } 
             else if (feature === 'cron') {
-                action = 'enable'; // Only one direction really
+                action = 'enable'; 
                 confirmMsg = "Enforce System Cron for Nextcloud?";
             }
             else if (feature === 'pci') {
-                const current = document.getElementById('sys-pci-status').dataset.val;
-                action = current === 'gen3' ? 'disable' : 'enable'; // disable = revert to gen2
+                action = current === 'gen3' ? 'disable' : 'enable'; 
                 confirmMsg = `Switch PCIe to ${action === 'enable' ? 'GEN 3 (Experimental)' : 'Gen 2 (Stable)'}?\nA reboot will be required.`;
             }
     
@@ -759,49 +851,40 @@
             }
         }
 
-        // --- FTP Functions ---
+        // --- FTP Logic ---
         async function loadFtpUsers() {
             const el = document.getElementById('ftp-user-list');
-            if(!el) return;
             el.innerText = 'Loading...';
             try {
                 const res = await fetch('/api/ftp/users');
                 const users = await res.json();
                 
                 if (users.length === 0) {
-                    el.innerHTML = '<em style="color:#777;">No FTP users configured.</em>';
+                    el.innerHTML = '<em style="color:#666;">No FTP users configured.</em>';
                     return;
                 }
                 
-                let html = '<table><thead><tr><th>FTP User</th><th>Maps To (NC)</th><th>Action</th></tr></thead><tbody>';
-                
+                let html = '<table><thead><tr><th>FTP User</th><th>Nextcloud User</th><th>Action</th></tr></thead><tbody>';
                 users.forEach(u => {
                     html += `<tr>
                         <td>${u.ftp_user}</td>
                         <td>${u.nc_user}</td>
-                        <td><button onclick="deleteFtpUser('${u.ftp_user}')" style="background:#e74c3c; padding: 2px 8px; font-size: 0.8em; margin-top:0;">Delete</button></td>
+                        <td style="text-align:right"><button class="btn-danger" onclick="deleteFtpUser('${u.ftp_user}')" style="padding:4px 8px; font-size:0.8em;">Delete</button></td>
                     </tr>`;
                 });
                 html += '</tbody></table>';
                 el.innerHTML = html;
-            } catch (e) {
-                el.innerText = 'Failed to load users.';
-            }
+            } catch (e) { el.innerText = 'Failed to load users.'; }
         }
 
         async function setupFtp(e) {
             e.preventDefault();
-            const ncUser = document.getElementById('ftp-nc-user').value;
+            const ncUser = document.getElementById('ftp-nc-user').value || 'admin';
             const ftpUser = document.getElementById('ftp-user').value;
             const ftpPass = document.getElementById('ftp-pass').value;
 
-            if(confirm(`Create FTP user '${ftpUser}' mapped to Nextcloud user '${ncUser}'?\nThis will verify the NC user exists and install FTP services if missing.`)) {
-                 triggerAction('/api/ftp/setup', 'FTP Setup', {
-                     nc_user: ncUser,
-                     ftp_user: ftpUser,
-                     ftp_pass: ftpPass
-                 });
-                 // Clear password
+            if(confirm(`Create FTP user '${ftpUser}' mapped to Nextcloud user '${ncUser}'?`)) {
+                 triggerAction('/api/ftp/setup', 'FTP Setup', { nc_user: ncUser, ftp_user: ftpUser, ftp_pass: ftpPass });
                  document.getElementById('ftp-pass').value = '';
             }
         }
@@ -813,22 +896,23 @@
             }
         }
 
-        // --- Zigbee Functions ---
+        // --- Zigbee Logic ---
         async function loadSerialDevices() {
             try {
                 const res = await fetch('/api/hardware/serial');
                 const devices = await res.json();
                 const sel = document.getElementById('zigbee-device');
-                if(!sel) return;
-
-                // Keep 'None' option and reset
-                sel.innerHTML = '<option value="none">None</option>';
                 
-                // Add "No devices" placeholder if empty, otherwise populate
+                // Save current selection if possible
+                const currentRes = await fetch('/api/manager/zigbee');
+                const currentData = await currentRes.json();
+                const activeDev = currentData.current || 'none';
+
+                sel.innerHTML = '<option value="none">None</option>';
                 if (devices.length === 0) {
                      const opt = document.createElement('option');
                      opt.disabled = true;
-                     opt.innerText = "No USB/ACM devices found";
+                     opt.innerText = "No USB Devices Found";
                      sel.appendChild(opt);
                 } else {
                     devices.forEach(d => {
@@ -838,33 +922,16 @@
                         sel.appendChild(opt);
                     });
                 }
-                
-                // Re-fetch current config to set selection
-                fetchZigbeeStatus();
+                sel.value = activeDev;
             } catch (e) {}
         }
         
         async function updateZigbee() {
             const dev = document.getElementById('zigbee-device').value;
-            const btn = document.querySelector('button[onclick="updateZigbee()"]');
-            btn.disabled = true;
-            
             triggerAction('/api/manager/zigbee', 'Zigbee Config', { device: dev });
-            btn.disabled = false;
-        }
-        
-        async function fetchZigbeeStatus() {
-            try {
-                const res = await fetch('/api/manager/zigbee');
-                const data = await res.json();
-                const sel = document.getElementById('zigbee-device');
-                if (data.current && sel) {
-                    sel.value = data.current;
-                }
-            } catch (e) {}
         }
 
-        // --- Standard Functions (Backup, Drives, Logs) ---
+        // --- Standard Helpers (Backup, Drive, Logs) ---
         async function loadDrives() {
             const el = document.getElementById('drive-list');
             el.innerHTML = 'Scanning...';
@@ -877,48 +944,35 @@
                 drives.forEach(d => {
                     const div = document.createElement('div');
                     div.className = 'drive-row';
-
-                    // Info string
-                    let label = `<span><strong>${d.path}</strong> (${d.size}) <small>${d.model}</small></span>`;
-
+                    
+                    let html = `<div><strong>${d.path}</strong> <span style="color:#aaa">(${d.size})</span> <small>${d.model}</small></div>`;
+                    
                     if (d.is_backup) {
-                        div.innerHTML = label + '<span class="status-badge status-running">Active Backup Drive</span>';
+                        html += '<span class="status-badge status-running">Backup Drive</span>';
                     } else {
-                        // Actions Container
-                        const actionDiv = document.createElement('div');
-
-                        // Button 1: Adopt (Mount without formatting)
-                        const btnMount = document.createElement('button');
-                        btnMount.innerText = "Mount (Keep Data)";
-                        btnMount.style.fontSize = "0.8em";
-                        btnMount.style.padding = "5px 10px";
-                        btnMount.style.marginRight = "10px";
-                        btnMount.style.backgroundColor = "#f39c12"; // Orange warning color
-                        btnMount.style.color = "black";
-                        btnMount.onclick = () => mountDrive(d.path);
-
-                        // Button 2: Format (Destructive)
-                        const btnFormat = document.createElement('button');
-                        btnFormat.innerText = "Format & Use";
-                        btnFormat.style.fontSize = "0.8em";
-                        btnFormat.style.padding = "5px 10px";
-                        btnFormat.style.backgroundColor = "#e74c3c"; // Red danger color
-                        btnFormat.onclick = () => formatDrive(d.path);
-
-                        actionDiv.appendChild(btnMount);
-                        actionDiv.appendChild(btnFormat);
-
-                        div.innerHTML = label;
-                        div.appendChild(actionDiv);
+                        html += `<div>
+                            <button class="btn-warning" style="font-size:0.8em; margin-right:5px;" onclick="mountDrive('${d.path}')">Mount</button>
+                            <button class="btn-danger" style="font-size:0.8em;" onclick="formatDrive('${d.path}')">Format</button>
+                        </div>`;
                     }
+                    div.innerHTML = html;
                     el.appendChild(div);
                 });
             } catch (e) { el.innerHTML = 'Error loading drives'; }
         }
 
         async function mountDrive(path) {
-            if (confirm(`Mount ${path} as the backup drive? This will update /etc/fstab but KEEP existing data.`)) {
+            if (confirm(`Mount ${path} as the backup drive? Existing data will be kept.`)) {
                 triggerAction('/api/drives/mount', 'Mount Drive', { path: path });
+            }
+        }
+
+        async function formatDrive(path) {
+            if (confirm(`DANGER: This will ERASE ALL DATA on ${path}.\n\nAre you sure?`)) {
+                const check = prompt(`Type 'FORMAT' to confirm formatting ${path}`);
+                if (check === "FORMAT") {
+                    triggerAction('/api/drives/format', 'Format Drive', { path: path });
+                }
             }
         }
 
@@ -931,34 +985,34 @@
 
                 if (d.mounted) {
                     bar.style.width = d.percent + '%';
-                    txt.innerText = d.used_gb + ' GB Used / ' + d.total_gb + ' GB Total (' + d.free_gb + ' GB Free)';
-                    bar.style.backgroundColor = d.percent > 90 ? '#e74c3c' : '#2ecc71';
+                    txt.innerText = `${d.used_gb} GB Used / ${d.total_gb} GB Total`;
+                    bar.style.backgroundColor = d.percent > 90 ? 'var(--hb-danger)' : 'var(--hb-green)';
                 } else {
                     bar.style.width = '0%';
-                    txt.innerText = 'Backup Drive Not Mounted';
+                    txt.innerText = 'Not Mounted';
                 }
             } catch (e) { }
         }
 
         async function loadBackupConfig() {
-            const res = await fetch('/api/backup/config');
-            const d = await res.json();
-            document.getElementById('bk-retention').value = d.retention;
-            document.getElementById('bk-hour').value = d.hour;
-            document.getElementById('bk-min').value = d.minute;
+            try {
+                const res = await fetch('/api/backup/config');
+                const d = await res.json();
+                document.getElementById('bk-retention').value = d.retention;
+                document.getElementById('bk-hour').value = d.hour;
+                document.getElementById('bk-min').value = d.minute;
 
-            // Logic for Frequency UI
-            let freq = 'daily';
-            if (d.day_week !== '*') {
-                freq = 'weekly';
-                document.getElementById('bk-dow').value = d.day_week;
-            } else if (d.day_month !== '*') {
-                freq = 'monthly';
-                document.getElementById('bk-dom').value = d.day_month;
-            }
-
-            document.getElementById('bk-freq').value = freq;
-            updateFreqUI();
+                let freq = 'daily';
+                if (d.day_week !== '*') {
+                    freq = 'weekly';
+                    document.getElementById('bk-dow').value = d.day_week;
+                } else if (d.day_month !== '*') {
+                    freq = 'monthly';
+                    document.getElementById('bk-dom').value = d.day_month;
+                }
+                document.getElementById('bk-freq').value = freq;
+                updateFreqUI();
+            } catch(e) {}
         }
 
         function updateFreqUI() {
@@ -970,9 +1024,7 @@
         async function saveBackupConfig(e) {
             e.preventDefault();
             const freq = document.getElementById('bk-freq').value;
-            let dow = '*';
-            let dom = '*';
-
+            let dow = '*', dom = '*';
             if (freq === 'weekly') dow = document.getElementById('bk-dow').value;
             if (freq === 'monthly') dom = document.getElementById('bk-dom').value;
 
@@ -980,66 +1032,50 @@
                 retention: document.getElementById('bk-retention').value,
                 hour: document.getElementById('bk-hour').value,
                 minute: document.getElementById('bk-min').value,
-                day_week: dow,
-                day_month: dom
+                day_week: dow, day_month: dom
             };
 
-            const res = await fetch('/api/backup/config', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-            if (res.ok) alert("Settings saved and scheduled.");
-            else alert("Error saving settings.");
-        }
-
-        async function formatDrive(path) {
-            if (confirm("DANGER: This will ERASE ALL DATA on " + path + ". Are you sure?")) {
-                if (prompt("Type 'FORMAT' to confirm destruction of data on " + path) === "FORMAT") {
-                    triggerAction('/api/drives/format', 'Format Drive', { path: path });
-                }
-            }
+            const res = await fetch('/api/backup/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+            if (res.ok) alert("Schedule Saved."); else alert("Error saving schedule.");
         }
 
         async function runBackup() {
-            const strategy = document.getElementById('backup-strategy').value;
-            triggerAction('/api/backup/now', 'Backup', { strategy: strategy });
+            const s = document.getElementById('backup-strategy').value;
+            triggerAction('/api/backup/now', 'Manual Backup', { strategy: s });
         }
 
         async function loadBackups() {
-            const res = await fetch('/api/backups/list');
-            const list = await res.json();
-            const sel = document.getElementById('backup-list');
-            sel.innerHTML = '';
-            list.forEach(b => {
-                const opt = document.createElement('option');
-                opt.value = b.name;
-                opt.innerText = b.name + ' [' + b.type + '] (' + b.size + ')';
-                sel.appendChild(opt);
-            });
+            try {
+                const res = await fetch('/api/backups/list');
+                const list = await res.json();
+                const sel = document.getElementById('backup-list');
+                sel.innerHTML = '';
+                list.forEach(b => {
+                    const opt = document.createElement('option');
+                    opt.value = b.name;
+                    opt.innerText = `${b.name} (${b.type}, ${b.size})`;
+                    sel.appendChild(opt);
+                });
+            } catch(e) {}
         }
 
         async function confirmRestore() {
             const file = document.getElementById('backup-list').value;
             if (!file) return;
-            const input = prompt("DANGER: This will WIPE ALL DATA and restore " + file + ".\n\nType 'RESTORE' (case-sensitive) to confirm:");
-            if (input === "RESTORE") {
+            const check = prompt(`DANGER: This will WIPE ALL DATA and restore ${file}.\n\nType 'RESTORE' to confirm:`);
+            if (check === "RESTORE") {
                 triggerAction('/api/restore', 'Restore', { filename: file });
-            } else if (input !== null) {
-                alert("Incorrect confirmation keyword. Restore cancelled.");
             }
         }
 
         async function triggerAction(endpoint, name, body = {}) {
             try {
                 const res = await fetch(endpoint, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
                 });
                 const data = await res.json();
                 if (data.status === 'started') {
-                    alert(name + " started.");
+                    alert(`${name} started successfully.`);
                     pollTask();
                 } else {
                     alert("Error: " + (data.error || "Unknown"));
@@ -1048,16 +1084,11 @@
         }
 
         async function toggleMaintenance(mode) {
-            await fetch('/api/maintenance/mode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: mode })
-            });
+            await fetch('/api/maintenance/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ mode: mode }) });
             setTimeout(fetchStatus, 1000);
         }
 
         let pendingUpdateTarget = "";
-
         function resetUpdateUI() {
             document.getElementById('update-msg').innerText = "";
             document.getElementById('btn-do-update').style.display = "none";
@@ -1077,12 +1108,11 @@
             try {
                const res = await fetch(`/api/manager/check_update?channel=${channel}`);
                const data = await res.json();
-               
                pendingUpdateTarget = data.target_ref;
                 
                if (data.available) {
                    msg.innerText = data.message;
-                   msg.style.color = "#2ecc71";
+                   msg.style.color = "var(--hb-green)";
                    doBtn.style.display = "inline-block";
                    doBtn.innerText = `Install ${data.target_ref}`;
                } else {
@@ -1091,7 +1121,7 @@
                }
             } catch (e) {
                 msg.innerText = "Check failed.";
-                msg.style.color = "#e74c3c";
+                msg.style.color = "var(--hb-danger)";
             } finally {
                 btn.disabled = false;
                 btn.innerText = "Check App Update";
@@ -1103,30 +1133,16 @@
             if (!confirm(`Update HomeBrain Manager to ${channel} ${pendingUpdateTarget}? The interface will restart.`)) return;
             
             const res = await fetch('/api/manager/update', { 
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ channel: channel, target_ref: pendingUpdateTarget })
             });
             const data = await res.json();
             if (data.status === 'started') {
-            alert("Update started. The page will reload in 15 seconds.");
-            document.getElementById('btn-do-update').disabled = true;
-            document.getElementById('btn-do-update').innerText = "Updating...";
-            setTimeout(() => location.reload(), 20000);
-        } else {
-            alert("Update failed to start: " + (data.error || "Unknown error"));
-        }
-    }
-
-        async function pollTask() {
-            const res = await fetch('/api/task_status');
-            const data = await res.json();
-            const banner = document.getElementById('global-status');
-            banner.innerText = data.status === 'idle' ? 'System Active' : data.message;
-            banner.style.color = data.status === 'error' ? 'red' : (data.status === 'running' ? '#2196F3' : 'white');
-
-            // Auto switch log view if setup is running
-            if (data.log_type === 'setup' && data.status === 'running') currentLogSource = 'setup';
+                alert("Update started. The page will reload in 15 seconds.");
+                setTimeout(() => location.reload(), 15000);
+            } else {
+                alert("Update failed to start: " + (data.error || "Unknown error"));
+            }
         }
 
         function changeLogSource(val) {
@@ -1135,15 +1151,16 @@
         }
 
         async function pollLogs() {
-            const res = await fetch('/api/logs/' + currentLogSource);
-            const txt = await res.text();
-            const div = document.getElementById('console-output');
-            div.innerText = txt;
-            div.scrollTop = div.scrollHeight;
+            try {
+                const res = await fetch('/api/logs/' + currentLogSource);
+                const txt = await res.text();
+                const div = document.getElementById('console-output');
+                div.innerText = txt;
+                div.scrollTop = div.scrollHeight;
+            } catch(e){}
         }
 
         init();
     </script>
 </body>
-
 </html>
