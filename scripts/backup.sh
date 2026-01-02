@@ -105,9 +105,25 @@ AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
 
 log_info "[INFO] Estimated uncompressed: $((ESTIMATED_UNCOMPRESSED_KB / 1024)) MB, Peak: $((ESTIMATED_PEAK_KB / 1024)) MB, Available: $((AVAILABLE_KB / 1024)) MB"
 
-if [ "$AVAILABLE_KB" -lt "$ESTIMATED_PEAK_KB" ]; then
-    die "Insufficient disk space. Available: $((AVAILABLE_KB / 1024)) MB, Needed (peak): $((ESTIMATED_PEAK_KB / 1024)) MB. Aborting."
-fi
+# Emergency Cleanup Loop
+# Continuously delete oldest backups if space is insufficient, even beyond retention policy.
+while [ "$AVAILABLE_KB" -lt "$ESTIMATED_PEAK_KB" ]; do
+    log_warn "Insufficient space (Avail: $((AVAILABLE_KB/1024)) MB, Need: $((ESTIMATED_PEAK_KB/1024)) MB). searching for old backups to purge..."
+    
+    # Find oldest backup, sort by timestamp asc (oldest on top)
+    OLDEST_BACKUP=$(find "$BACKUP_MOUNTDIR" -maxdepth 1 -type f \( -name "homebrain_backup*.tar.gz" -o -name "nextcloud_backup*.tar.gz" \) -printf "%T@ %p\n" | sort -n | head -n1 | awk '{print $2}')
+    
+    if [[ -z "$OLDEST_BACKUP" ]]; then
+        die "CRITICAL: No old backups remain to delete, and space is still insufficient. Aborting."
+    fi
+    
+    log_info "Emergency Prune: Deleting $OLDEST_BACKUP to free space."
+    rm -f "$OLDEST_BACKUP"
+    sync # Ensure free space is updated in kernel
+    
+    # Refresh available space
+    AVAILABLE_KB=$(df --output=avail "$BACKUP_MOUNTDIR" | tail -n1)
+done
 
 # 4. Prepare Staging
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
