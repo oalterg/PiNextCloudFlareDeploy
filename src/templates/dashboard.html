@@ -1074,8 +1074,10 @@
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
                 });
                 const data = await res.json();
-                if (data.status === 'started') {
-                    alert(`${name} started successfully.`);
+                // Fix: Accept both 'started' (async task) and 'success' (immediate/custom) status codes
+                if (data.status === 'started' || data.status === 'success') {
+                    // Use specific server message if provided, otherwise default text
+                    alert(data.message || `${name} started successfully.`);
                     pollTask();
                 } else {
                     alert("Error: " + (data.error || "Unknown"));
