@@ -7,6 +7,8 @@ INSTALL_DIR="/opt/homebrain"
 SERVICE_DIR="$INSTALL_DIR/src"
 BOOT_CONFIG="/boot/firmware/factory_config.txt"
 LOG_DIR="/var/log/homebrain"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+source "$SCRIPT_DIR/common.sh"
 
 # --- Input Validation ---
 if [[ $EUID -ne 0 ]]; then echo "Run as root."; exit 1; fi
@@ -14,8 +16,7 @@ if [ "$#" -ne 5 ]; then echo "Usage: $0 <ID> <SECRET> <MAIN_DOMAIN> <PAN_EP> <FA
 
 # --- 1. System Dependencies ---
 echo "Installing Application Dependencies..."
-apt-get update -qq
-apt-get install -y python3-flask python3-dotenv python3-requests python3-pip jq moreutils pwgen git parted
+install_deps_enable_docker
 
 # --- 2. Write Factory Config ---
 echo "Writing factory configuration..."

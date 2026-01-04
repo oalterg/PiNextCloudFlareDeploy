@@ -146,6 +146,26 @@ wait_for_healthy() {
     return 1
 }
 
+install_deps_enable_docker() {
+    # --- 0. Install Dependencies ---
+    log_info "Installing dependencies"
+    # Added -qq for quieter output in logs
+    apt-get install -y -qq ca-certificates gnupg lsb-release cron gpg rsync initramfs-tools python3-flask python3-dotenv python3-requests python3-pip jq moreutils pwgen git parted
+    apt-get update -qq
+
+    # Docker setup
+    if ! [ -f /etc/apt/keyrings/docker.gpg ]; then
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+        apt-get update -y -qq
+    fi
+    
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    log_info "Starting docker service"
+    systemctl enable --now docker
+}
+
 # --- Maintenance Mode ---
 set_maintenance_mode() {
     local mode="$1" # --on or --off
@@ -237,7 +257,7 @@ function create_ha_admin() {
         die "HA_PASSWORD not provided."
     fi
 
-    log_info "Hardening Home Assistant Admin Account..."
+    log_info "Creating Home Assistant Admin Account..."
     local HA_URL="http://127.0.0.1:8123"
     
     # 1. Wait specifically for the API to be responsive (Container health != API ready)
@@ -273,17 +293,37 @@ function create_ha_admin() {
 
     # 3. Create Account
     log_info "Creating 'admin' user..."
-    curl -s -X POST \
+     
+    # Capture response to validate success and extract Auth Token
+    local response
+    response=$(curl -s -X POST \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"Admin\", \"username\": \"admin\", \"password\": \"$HA_PASSWORD\", \"client_id\": \"http://homebrain.local/\"}" \
-        "$HA_URL/api/onboarding/users" >/dev/null || log_warn "Failed to create HA user."
-        
+        "$HA_URL/api/onboarding/users")
+ 
+    # Parse token using jq (installed in deps). If empty, creation failed.
+    local token
+    token=$(echo "$response" | jq -r '.auth_token // empty')
+ 
+    if [[ -z "$token" ]]; then
+        log_warn "Failed to create HA user. API did not return a token. Raw response: $response"
+        return 1
+    fi
+         
     # 4. Finish Onboarding (Location/etc defaults) to close the loop
-    # This prevents the 'Welcome' screen from reappearing
+    # Use the token to authenticate these requests to ensure they are accepted.
     curl -s -X POST \
+        -H "Authorization: Bearer $token" \
         -H "Content-Type: application/json" \
         -d '{"language":"en", "time_zone":"UTC", "elevation":0, "unit_system":"metric", "currency":"EUR"}' \
-        "$HA_URL/api/onboarding/core_config" >/dev/null || true
+        "$HA_URL/api/onboarding/core_config" >/dev/null
+ 
+    # 5. Finalize Onboarding (Integrations) - Critical step to mark onboarding as 'done'
+    curl -s -X POST \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d '{"client_id":"http://homebrain.local/"}' \
+        "$HA_URL/api/onboarding/integration" >/dev/null
 
     log_info "Home Assistant hardening complete."
 }
