@@ -75,8 +75,8 @@ def auth_gate():
     if request.path == '/favicon.ico':
         return
         
-    # Whitelist by endpoint name to prevent path parsing bypasses/errors
-    if request.endpoint in ['get_one_time_credentials', 'get_logs', 'cleanup_credentials', 'get_task_status']:
+    # Whitelist by path to avoid endpoint resolution issues
+    if request.path.startswith('/api/logs/') or request.path in ['/api/setup/credentials', '/api/setup/cleanup_credentials', '/api/task_status']:
         return
 
     # 2. First Time Setup (Welcome Screen)
@@ -93,36 +93,16 @@ def auth_gate():
 
 @app.route("/api/setup/credentials")
 def get_one_time_credentials():
-    # Security: Read payload created by deploy.sh
     creds_file = INSTALL_CREDS_PATH
-    data = None
-    
-    # 1. Primary Method: Read file
     if os.path.exists(creds_file):
         try:
             with open(creds_file, "r") as f:
                 data = json.load(f)
+            return jsonify(data)
         except Exception as e:
             logging.error(f"Failed to read creds file: {e}")
-
-    # 2. Robustness Fallback: Recover from .env if file read failed
-    # This handles cases where file permissions are wrong or file was wiped
-    if not data:
-        env = get_env_config()
-        master_pass = env.get("MASTER_PASSWORD")
-        if master_pass:
-            data = {
-                "username": "admin",
-                "password": master_pass,
-                "domain": env.get("PANGOLIN_DOMAIN", ""),
-                "generated_at": time.time(),
-                "recovered": True
-            }
-
-    if data:
-        return jsonify(data)
     
-    return jsonify({"error": "Credentials not found."}), 404
+    return jsonify({"error": "Credentials not found."}), 410  # Use 410 Gone for permanent absence
 
 @app.route("/api/setup/cleanup_credentials", methods=["POST"])
 def cleanup_credentials():

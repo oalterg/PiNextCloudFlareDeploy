@@ -105,6 +105,7 @@
                     // NOTE: We do NOT cleanup here. We wait for user confirmation.
                 })
                 .catch(e => {
+                    console.error(e);
                     document.body.innerHTML = `
                         <div class="logo">Home<span>Brain</span></div>
                         <h1>Installation Finished</h1>
