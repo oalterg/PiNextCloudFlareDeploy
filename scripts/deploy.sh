@@ -91,12 +91,16 @@ rfkill block wifi || log_error "WiFi could not be disabled."
 rfkill block bluetooth || log_error "Bluetooth could not be disabled."
 
 log_info "=== Deployment Complete ==="
-# Signal specifically for the UI to pick up
-echo "Deployment Complete - Ready for Handover"
 
-# Ensure permissions on creds file so app.py (if dropped privileges) can read it
+# Ensure permissions on creds file so app.py can read it
 if [ -f "$INSTALL_DIR/install_creds.json" ]; then
+    # Ensure ownership is root:root so the service can read it
+    chown root:root "$INSTALL_DIR/install_creds.json"
     chmod 644 "$INSTALL_DIR/install_creds.json"
 fi
 
+# Mark setup as complete before signaling the UI
 touch "$INSTALL_DIR/.setup_complete"
+
+# Signal specifically for the UI to pick up
+echo "Deployment Complete - Ready for Handover"

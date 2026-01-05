@@ -72,11 +72,11 @@ def auth_gate():
     # 1. Static and Specific API Whitelist
     if request.endpoint == 'static':
         return
-    # Fix: Allow favicon to prevent auth prompt for icon
     if request.path == '/favicon.ico':
         return
-    # Fix: Allow polling logs and credential fetch
-    if request.path in ['/api/logs/setup', '/api/setup/credentials', '/api/setup/status', '/api/setup/cleanup_credentials']:
+        
+    # Whitelist by endpoint name to prevent path parsing bypasses/errors
+    if request.endpoint in ['get_one_time_credentials', 'get_logs', 'cleanup_credentials', 'get_task_status']:
         return
 
     # 2. First Time Setup (Welcome Screen)
@@ -95,23 +95,34 @@ def auth_gate():
 def get_one_time_credentials():
     # Security: Read payload created by deploy.sh
     creds_file = INSTALL_CREDS_PATH
+    data = None
     
+    # 1. Primary Method: Read file
     if os.path.exists(creds_file):
         try:
             with open(creds_file, "r") as f:
                 data = json.load(f)
-            # Do NOT delete file here. 
-            # We delete it only after the client confirms receipt or strictly on next restart.
-            # Deleting it here caused the race condition where refresh -> 404 -> login page.
-            # Instead, we rely on the file being nuked by app startup or manual action later.
-            # For now, we rename it to indicate it was read once? 
-            # Actually, safe approach: Keep it until reboot or manual login successful.
-            return jsonify(data)
         except Exception as e:
-            return jsonify({"error": "Failed to read credentials"}), 500
-    else:
-        # If file is gone, user likely refreshed too late.
-        return jsonify({"error": "Credentials already claimed."}), 410
+            logging.error(f"Failed to read creds file: {e}")
+
+    # 2. Robustness Fallback: Recover from .env if file read failed
+    # This handles cases where file permissions are wrong or file was wiped
+    if not data:
+        env = get_env_config()
+        master_pass = env.get("MASTER_PASSWORD")
+        if master_pass:
+            data = {
+                "username": "admin",
+                "password": master_pass,
+                "domain": env.get("PANGOLIN_DOMAIN", ""),
+                "generated_at": time.time(),
+                "recovered": True
+            }
+
+    if data:
+        return jsonify(data)
+    
+    return jsonify({"error": "Credentials not found."}), 404
 
 @app.route("/api/setup/cleanup_credentials", methods=["POST"])
 def cleanup_credentials():
@@ -1276,6 +1287,11 @@ def delete_ftp():
     return jsonify({"status": "started"})
 
 if __name__ == "__main__":
+    # Capture logs to file (manager.log)
+    log_file = os.path.join(LOG_DIR, "manager.log")
+    logging.basicConfig(filename=log_file, level=logging.INFO, 
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+
     try:
         migration.run_migrations()
     except Exception as e:
