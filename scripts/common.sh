@@ -298,7 +298,7 @@ function create_ha_admin() {
     local response
     response=$(curl -s -X POST \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"Admin\", \"username\": \"admin\", \"password\": \"$HA_PASSWORD\", \"client_id\": \"http://homebrain.local/\"}" \
+        -d "{\"name\": \"Admin\", \"username\": \"admin\", \"password\": \"$HA_PASSWORD\", \"language\": \"en\", \"client_id\": \"http://homebrain.local/\"}" \
         "$HA_URL/api/onboarding/users")
  
     # Parse token using jq (installed in deps). If empty, creation failed.
@@ -315,7 +315,8 @@ function create_ha_admin() {
     curl -s -X POST \
         -H "Authorization: Bearer $token" \
         -H "Content-Type: application/json" \
-        -d '{"language":"en", "time_zone":"UTC", "elevation":0, "unit_system":"metric", "currency":"EUR"}' \
+        -d '{"location_name":"HomeBrain","latitude":52.52,"longitude":13.40,"elevation":0,"unit_system":"metric","time_zone":"UTC","currency":"EUR","language":"en"}' \
+         "$HA_URL/api/onboarding/core_config" >/dev/null
         "$HA_URL/api/onboarding/core_config" >/dev/null
  
     # 5. Finalize Onboarding (Integrations) - Critical step to mark onboarding as 'done'
