@@ -259,16 +259,15 @@ function create_ha_admin() {
 
     log_info "Creating Home Assistant Admin Account..."
     local HA_URL="http://127.0.0.1:8123"
-    
-    # 1. Wait specifically for the API to be responsive (Container health != API ready)
-    local retries=30  # Wait up to 60s
+    local CLIENT_ID="$HA_URL/"  # Use actual HA URL for client_id (per docs/examples)
+
+    # 1. Wait for API readiness (container health != API ready)
+    local retries=60  # Wait up to ~2min
     local api_ready=false
-    
+    local status
     while [[ $retries -gt 0 ]]; do
-        # We check /API/ (returns 401 if ready but unauth, or 200 if open)
-        # We are looking for anything NOT 'Connection refused'
-        local status=$(curl -s -o /dev/null -w "%{http_code}" "$HA_URL/manifest.json")
-        if [[ "$status" != "000" ]]; then
+        status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HA_URL/api/onboarding")
+        if [[ "$status" == "200" ]]; then
             api_ready=true
             break
         fi
@@ -277,54 +276,91 @@ function create_ha_admin() {
     done
 
     if [ "$api_ready" = false ]; then
-        log_warn "Home Assistant API did not become ready. Account creation skipped."
+        log_warn "Home Assistant onboarding API did not become ready after 2min. Account creation skipped."
         return 1
     fi
 
-    # 2. Check if onboarding is still active
-    # If /api/onboarding returns 404 or [] or similar, it's already done.
-    local onboarding_status=$(curl -s "$HA_URL/api/onboarding")
-    
-    # If the response contains "done" or is empty list, we skip
-    if echo "$onboarding_status" | grep -q '"done":\[.*"user"'; then
-        log_info "Home Assistant is already onboarded. Skipping account creation."
+    # 2. Check if onboarding is still needed (robust jq parsing)
+    local onboarding_status=$(curl -s --max-time 10 "$HA_URL/api/onboarding")
+    log_info "Onboarding status response: $onboarding_status"
+    local user_done
+    user_done=$(echo "$onboarding_status" | jq '.[] | select(.step == "user") | .done // false' 2>/dev/null) || user_done="false"
+    if [[ "$user_done" == "true" ]]; then
+        log_info "Home Assistant user onboarding already complete. Skipping account creation."
         return 0
     fi
 
-    # 3. Create Account
+    # 3. Create user account
     log_info "Creating 'admin' user..."
-     
-    # Capture response to validate success and extract Auth Token
-    local response
-    response=$(curl -s -X POST \
+    local output=$(curl -s -w "\n%{http_code}" -X POST --max-time 10 \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"Admin\", \"username\": \"admin\", \"password\": \"$HA_PASSWORD\", \"language\": \"en\", \"client_id\": \"http://homebrain.local/\"}" \
+        -d "{\"name\": \"Admin\", \"username\": \"admin\", \"password\": \"$HA_PASSWORD\", \"language\": \"en\", \"client_id\": \"$CLIENT_ID\"}" \
         "$HA_URL/api/onboarding/users")
- 
-    # Parse token using jq (installed in deps). If empty, creation failed.
-    local token
-    token=$(echo "$response" | jq -r '.auth_token // empty')
- 
-    if [[ -z "$token" ]]; then
-        log_warn "Failed to create HA user. API did not return a token. Raw response: $response"
+    local response=$(echo "$output" | head -n -1)
+    local http_code=$(echo "$output" | tail -n1)
+    
+    log_info "User creation raw response: $response (HTTP: $http_code)"
+
+    if [[ $http_code -ne 200 && $http_code -ne 201 ]]; then
+        log_warn "User creation failed with HTTP $http_code. Response: $response"
         return 1
     fi
-         
-    # 4. Finish Onboarding (Location/etc defaults) to close the loop
-    # Use the token to authenticate these requests to ensure they are accepted.
-    curl -s -X POST \
-        -H "Authorization: Bearer $token" \
-        -H "Content-Type: application/json" \
-        -d '{"location_name":"HomeBrain","latitude":52.52,"longitude":13.40,"elevation":0,"unit_system":"metric","time_zone":"UTC","currency":"EUR","language":"en"}' \
-         "$HA_URL/api/onboarding/core_config" >/dev/null
-        "$HA_URL/api/onboarding/core_config" >/dev/null
- 
-    # 5. Finalize Onboarding (Integrations) - Critical step to mark onboarding as 'done'
-    curl -s -X POST \
-        -H "Authorization: Bearer $token" \
-        -H "Content-Type: application/json" \
-        -d '{"client_id":"http://homebrain.local/"}' \
-        "$HA_URL/api/onboarding/integration" >/dev/null
 
-    log_info "Home Assistant hardening complete."
+    # Parse auth_code (used in modern HA)
+    local auth_code=$(echo "$response" | jq -r '.auth_code // empty')
+    if [[ -z "$auth_code" ]]; then
+        log_warn "Failed to create HA user. API did not return an auth_code. Raw response: $response"
+        return 1
+    fi
+
+    # 4. Exchange auth_code for access_token (required for further onboarding)
+    local token_output=$(curl -s -w "\n%{http_code}" -X POST --max-time 10 \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=authorization_code&code=$auth_code&client_id=$CLIENT_ID" \
+        "$HA_URL/auth/token")
+    local token_response=$(echo "$token_output" | head -n -1)
+    local token_http_code=$(echo "$token_output" | tail -n1)
+    
+    if [[ $token_http_code -ne 200 ]]; then
+        log_warn "Token exchange failed with HTTP $token_http_code. Response: $token_response"
+        return 1
+    fi
+    
+    local access_token=$(echo "$token_response" | jq -r '.access_token // empty')
+    if [[ -z "$access_token" ]]; then
+        log_warn "Failed to exchange auth_code for access_token. Raw response: $token_response"
+        return 1
+    fi
+
+    # 5. Complete core_config onboarding step (minimal required post-user)
+    local core_output=$(curl -s -w "\n%{http_code}" -X POST --max-time 10 \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: application/json" \
+        -d "{}" \
+        "$HA_URL/api/onboarding/core_config")
+    local core_response=$(echo "$core_output" | head -n -1)
+    local core_http_code=$(echo "$core_output" | tail -n1)
+    
+    if [[ $core_http_code -ne 200 ]]; then
+        log_warn "Core config failed with HTTP $core_http_code. Response: $core_response"
+        return 1
+    fi
+    
+    if [[ -z "$core_response" || "$core_response" != "{}" ]]; then  # Empty {} indicates success
+        log_warn "Failed to complete core_config. Raw response: $core_response"
+        return 1
+    fi
+
+    # 6. Verify overall onboarding (optional hardening: re-check status)
+    onboarding_status=$(curl -s --max-time 10 "$HA_URL/api/onboarding")
+    log_info "Post-onboarding status response: $onboarding_status"
+    user_done=$(echo "$onboarding_status" | jq '.[] | select(.step == "user") | .done // false' 2>/dev/null) || user_done="false"
+    local core_done=$(echo "$onboarding_status" | jq '.[] | select(.step == "core_config") | .done // false' 2>/dev/null) || core_done="false"
+    if [[ "$user_done" != "true" || "$core_done" != "true" ]]; then
+        log_warn "Onboarding verification failed post-creation. User done: $user_done, Core done: $core_done"
+        return 1
+    fi
+
+    log_info "Home Assistant admin user created and minimal onboarding completed successfully."
+    return 0
 }

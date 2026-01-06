@@ -44,6 +44,7 @@ LOG_FILES = {
     "backup": f"{LOG_DIR}/backup.log",
     "restore": f"{LOG_DIR}/restore.log",
     "update": f"{LOG_DIR}/manager_update.log",
+    "manager": f"{LOG_DIR}/manager.log",
 }
 
 task_lock = threading.Lock()
