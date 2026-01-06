@@ -1,3 +1,5 @@
 Flask>=2.0.0
 requests>=2.0.0
 python-dotenv
+flask-limiter
+gunicorn

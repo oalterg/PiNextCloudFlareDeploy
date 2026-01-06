@@ -1,6 +1,7 @@
 import os
 import shutil
 import logging
+import subprocess
 
 # Configuration Constants
 INSTALL_DIR = "/opt/homebrain"
@@ -94,3 +95,79 @@ def run_migrations():
     if migrated and updates:
         update_env_file(updates)
         logging.info(f"Migration: Applied {len(updates)} updates to environment.")
+
+    # --- Migration 3: Install Gunicorn if Missing ---
+    try:
+        import gunicorn
+        logging.info("Migration: Gunicorn already installed.")
+    except ImportError:
+        logging.info("Migration: Installing Gunicorn...")
+        try:
+            subprocess.run(["pip3", "install", "gunicorn"], check=True, capture_output=True)
+            logging.info("Migration: Gunicorn installed successfully.")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Migration: Failed to install Gunicorn: {e}. Manual installation required.")
+            return  # Do not proceed with service migration if install fails
+
+    # --- Migration 4: Switch Service to Gunicorn ---
+    service_file = "/etc/systemd/system/homebrain-manager.service"
+    if not os.path.exists(service_file):
+        logging.info("Migration: Service file not found. Skipping Gunicorn service migration.")
+        return
+
+    with open(service_file, "r") as f:
+        lines = f.readlines()
+
+    # Idempotency: Skip if already using Gunicorn
+    if any("gunicorn" in line for line in lines):
+        logging.info("Migration: Service already configured for Gunicorn. Skipping.")
+        return
+
+    # Backup original
+    backup_file = service_file + ".bak"
+    if not os.path.exists(backup_file):
+        shutil.copy(service_file, backup_file)
+        logging.info(f"Migration: Backup created: {backup_file}")
+
+    # Process lines for updates
+    new_lines = []
+    has_environment = any(line.startswith("Environment=") for line in lines)
+    has_restart_sec = any(line.startswith("RestartSec=") for line in lines)
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("ExecStart="):
+            # Replace any python3-based ExecStart
+            new_lines.append("ExecStart=/usr/local/bin/gunicorn --workers 3 --bind 0.0.0.0:80 --timeout 30 app:app\n")
+        elif stripped.startswith("WorkingDirectory="):
+            # Set to fixed path, regardless of previous value
+            new_lines.append("WorkingDirectory=/opt/homebrain/src\n")
+        else:
+            new_lines.append(line)
+
+    # Insert Environment if missing (after [Service])
+    if not has_environment:
+        for i, line in enumerate(new_lines):
+            if line.strip() == "[Service]":
+                new_lines.insert(i + 1, 'Environment="PATH=/usr/local/bin:/usr/bin:/bin"\n')
+                break
+
+    # Insert RestartSec if missing (after Restart=always)
+    if not has_restart_sec:
+        for i, line in enumerate(new_lines):
+            if line.strip().startswith("Restart=always"):
+                new_lines.insert(i + 1, "RestartSec=10\n")
+                break
+
+    # Write updated service file
+    with open(service_file, "w") as f:
+        f.writelines(new_lines)
+    logging.info("Migration: Service file updated for Gunicorn.")
+
+    # Reload systemd and restart service
+    try:
+        subprocess.run(["systemctl", "daemon-reload"], check=True, capture_output=True)
+        subprocess.run(["systemctl", "restart", "homebrain-manager"], check=True, capture_output=True)
+        logging.info("Migration: Systemd reloaded and service restarted successfully.")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Migration: Failed to reload/restart service: {e}. Manual intervention required (run 'systemctl daemon-reload' and 'systemctl restart homebrain-manager').")

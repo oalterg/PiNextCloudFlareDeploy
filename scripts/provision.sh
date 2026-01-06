@@ -49,12 +49,6 @@ SERVICE_FILE="$INSTALL_DIR/config/homebrain-manager.service"
 
 if [ -f "$SERVICE_FILE" ]; then
     cp "$SERVICE_FILE" /etc/systemd/system/
-    
-    # Patch the WorkingDirectory in the systemd file to point to src directory
-    sed -i "s|WorkingDirectory=.*|WorkingDirectory=$SERVICE_DIR|g" /etc/systemd/system/homebrain-manager.service
-    
-    # Patch the ExecStart to point to the app.py location
-    sed -i "s|ExecStart=.*|ExecStart=/usr/bin/python3 $SERVICE_DIR/app.py|g" /etc/systemd/system/homebrain-manager.service
 
     systemctl daemon-reload
     systemctl enable --now homebrain-manager.service

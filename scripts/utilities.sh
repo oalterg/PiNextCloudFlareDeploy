@@ -281,6 +281,22 @@ delete_ftp_user() {
     log_info "FTP User '$ftp_user' deleted."
 }
 
+# --- Action: Activate Tunnels (Post-Setup) ---
+activate_tunnels() {
+    log_info "Initializing Tunnel Activation..."
+    load_env
+    
+    local profiles=$(get_tunnel_profiles)
+    
+    if [[ -z "$profiles" ]]; then
+        log_info "No tunnel profiles configured (Local Mode). Skipping activation."
+    else
+        log_info "Activating tunnel profiles: $profiles"
+        docker compose --env-file "$ENV_FILE" $(get_compose_args) $profiles up -d --remove-orphans
+        log_info "Tunnel services started."
+    fi
+}
+
 # --- Main Dispatch ---
 case "${1:-}" in
     system_status)
@@ -300,6 +316,9 @@ case "${1:-}" in
         ;;
     delete)
         delete_ftp_user "${2}"
+        ;;
+    activate_tunnels)
+        activate_tunnels
         ;;
     *)
         echo "Usage: $0 {setup <nc_user> <ftp_user> <ftp_pass> | delete <ftp_user>}"

@@ -4,9 +4,11 @@ After=network.target
 
 [Service]
 User=root
-WorkingDirectory=$SERVICE_DIR
-ExecStart=/usr/bin/python3 $SERVICE_DIR/app.py
+WorkingDirectory=/opt/homebrain/src
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/local/bin/gunicorn --workers 3 --bind 0.0.0.0:80 --timeout 30 app:app
 Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target

@@ -12,6 +12,8 @@ import shlex
 import requests
 from flask import Flask, render_template, jsonify, request, Response
 import migration
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
 
@@ -49,6 +51,15 @@ LOG_FILES = {
 
 task_lock = threading.Lock()
 current_task_status = {"status": "idle", "message": "", "log_type": "setup"}
+
+# Initialize Limiter with memory storage
+# Uses remote IP for identification.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per minute"], # Generous default for dashboard polling
+    storage_uri="memory://"
+)
 
 # --- Authentication Helpers ---
 def check_factory_auth(password):
@@ -110,6 +121,13 @@ def cleanup_credentials():
     """Called by the frontend after successfully rendering the success page."""
     if os.path.exists(INSTALL_CREDS_PATH):
         os.remove(INSTALL_CREDS_PATH)
+        # Now, start the remaining profile tunnel containers
+        subprocess.run(["chmod", "+x", SCRIPT_UTILITIES])
+        cmd = f"bash {SCRIPT_UTILITIES} activate_tunnels >> {LOG_FILES['setup']} 2>&1"
+        threading.Thread(
+            target=run_background_task, args=("Activating Tunnels", cmd, "setup")
+        ).start()
+
     return jsonify({"status": "ok"})
 
 # --- Helpers ---
@@ -180,11 +198,18 @@ def update_env_var(key, value):
             subprocess.run(["sed", "-i", f"/^{key}=/d", ENV_FILE])
             return True
 
-        rc = subprocess.call(f"grep -q '^{key}=' {ENV_FILE}", shell=True)
+        # Avoid shell=True for grep
+        rc = subprocess.call(["grep", "-q", f"^{key}=", ENV_FILE])
+        
+        # Escape single quotes and wrap value in single quotes 
+        # to prevent execution when sourced by bash (e.g. VAR=$(payload))
+        safe_val_bash = str(value).replace("'", "'\\''")
+        quoted_val = f"'{safe_val_bash}'"
+
         if rc == 0:
-            # Use | delimiter for sed to handle complex strings
-            safe_val = value.replace("|", "\\|")
-            subprocess.run(["sed", "-i", f"s|^{key}=.*|{key}={safe_val}|", ENV_FILE])
+            # Use | delimiter for sed. Escape | in the quoted value.
+            sed_val = quoted_val.replace("|", "\\|")
+            subprocess.run(["sed", "-i", f"s|^{key}=.*|{key}={sed_val}|", ENV_FILE])
         else:
             with open(ENV_FILE, "r+") as f:
                 content = f.read()
@@ -192,7 +217,7 @@ def update_env_var(key, value):
                     f.write("\n")
             
             with open(ENV_FILE, "a") as f:
-                f.write(f"{key}={value}\n")
+                f.write(f"{key}={quoted_val}\n")
         return True
     except:
         return False
@@ -216,6 +241,7 @@ def calculate_sha256(filepath):
 
 # --- Route: Trigger Initial Setup ---
 @app.route("/start_setup", methods=["POST"])
+@limiter.limit("3 per minute") # Strict limit on setup triggering
 def start_setup():
     if is_setup_complete():
         return jsonify({"error": "Setup already complete"}), 400
@@ -286,6 +312,7 @@ def start_setup():
 
 # --- Route: Adopt Existing Drive ---
 @app.route("/api/drives/mount", methods=["POST"])
+@limiter.limit("5 per minute")
 def mount_drive():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -526,12 +553,12 @@ def get_logs(log_target):
             return "Invalid service name."
 
         # Use docker compose logs
-        cmd = f"docker compose -f {COMPOSE_FILE} logs --tail=100 {log_target}"
+        cmd_list = ["docker", "compose", "-f", COMPOSE_FILE, "logs", "--tail=100", log_target]
         output = subprocess.check_output(
-            cmd, shell=True, stderr=subprocess.STDOUT
+            cmd_list, stderr=subprocess.STDOUT
         ).decode()
         return output
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
         return "Failed to fetch docker logs. Service might not be running."
     except Exception as e:
         return f"Error: {str(e)}"
@@ -603,6 +630,7 @@ def list_drives():
 
 
 @app.route("/api/drives/format", methods=["POST"])
+@limiter.limit("3 per minute")
 def format_drive():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -611,12 +639,14 @@ def format_drive():
     if not drive_path or "mmcblk" in drive_path:
         return jsonify({"error": "Invalid drive"}), 400
 
+    # Quote drive path to prevent command injection
+    safe_path = shlex.quote(drive_path)
     cmd = (
-        f"umount {drive_path}* || true; "
-        f"wipefs -a {drive_path}; "
-        f"mkfs.ext4 -F -L 'NextcloudBackup' {drive_path}; "
+        f"umount {safe_path}* || true; "
+        f"wipefs -a {safe_path}; "
+        f"mkfs.ext4 -F -L 'NextcloudBackup' {safe_path}; "
         f"mkdir -p {BACKUP_DIR}; "
-        f"UUID=$(blkid -o value -s UUID {drive_path}); "
+        f"UUID=$(blkid -o value -s UUID {safe_path}); "
         f"sed -i '\|{BACKUP_DIR}|d' /etc/fstab; "
         f'echo "UUID=$UUID {BACKUP_DIR} ext4 defaults,nofail 0 2" >> /etc/fstab; '
         f"mount -a;"
@@ -650,6 +680,7 @@ def backup_stats():
 
 
 @app.route("/api/backup/config", methods=["GET", "POST"])
+@limiter.limit("10 per minute")
 def backup_config():
     if request.method == "GET":
         env = get_env_config()
@@ -678,7 +709,7 @@ def backup_config():
     update_env_var("BACKUP_DAY_WEEK", day_week)
     update_env_var("BACKUP_DAY_MONTH", day_month)
 
-    # Validate Inputs (Hardening)
+    # Validate Inputs
     try:
         # Ensure numeric values are integers within valid ranges
         if not (0 <= int(minute) <= 59) or not (0 <= int(hour) <= 23):
@@ -706,6 +737,7 @@ def backup_config():
 
 # --- Routes: Backup & Restore Execution ---
 @app.route("/api/backup/now", methods=["POST"])
+@limiter.limit("3 per minute")
 def trigger_backup():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -714,9 +746,14 @@ def trigger_backup():
     # 'data_only' = NC Data + HA Config (No Database, No NC Config)
     strategy = request.json.get("strategy", "full")
 
+    # Validate strategy
+    if strategy not in ["full", "data_only"]:
+        return jsonify({"error": "Invalid strategy"}), 400
+
     # We delegate strictly to the bash script to ensure locking and consistent logic
-    cmd = f"bash {SCRIPT_BACKUP} --strategy {strategy} >> {LOG_FILES['backup']} 2>&1"
-    
+    # Quote the strategy argument
+    cmd = f"bash {SCRIPT_BACKUP} --strategy {shlex.quote(strategy)} >> {LOG_FILES['backup']} 2>&1"
+
     label = "Full System Backup" if strategy == "full" else "Data-Only Backup"
     
     threading.Thread(
@@ -744,6 +781,7 @@ def list_backups():
 
 
 @app.route("/api/restore", methods=["POST"])
+@limiter.limit("3 per minute")
 def trigger_restore():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -755,7 +793,8 @@ def trigger_restore():
     full_path = os.path.join(BACKUP_DIR, filename)
 
     # restore.sh handles auto-detection of content (HA vs NC vs DB)
-    cmd = f"bash {SCRIPT_RESTORE} {full_path} --no-prompt >> {LOG_FILES['restore']} 2>&1"
+    # Quote full path
+    cmd = f"bash {SCRIPT_RESTORE} {shlex.quote(full_path)} --no-prompt >> {LOG_FILES['restore']} 2>&1"
     task_name = "System Restore"
 
     threading.Thread(
@@ -766,6 +805,7 @@ def trigger_restore():
 
 # --- Routes: Tunnel Management ---
 @app.route("/api/tunnel", methods=["POST"])
+@limiter.limit("5 per minute")
 def update_tunnel():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -814,6 +854,7 @@ def update_tunnel():
 
 # --- Routes: Tunnel Management (Cloudflare) ---
 @app.route("/api/tunnel/cloudflare", methods=["POST"])
+@limiter.limit("5 per minute")
 def update_tunnel_cloudflare():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -846,6 +887,7 @@ def update_tunnel_cloudflare():
 
 
 @app.route("/api/tunnel/revert", methods=["POST"])
+@limiter.limit("3 per minute")
 def revert_tunnel_provider():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -873,6 +915,7 @@ def revert_tunnel_provider():
 
 # --- Routes: Maintenance & Updates ---
 @app.route("/api/maintenance/mode", methods=["POST"])
+@limiter.limit("10 per minute")
 def set_maintenance():
     mode = request.json.get("mode")
     flag = "--on" if mode == "on" else "--off"
@@ -900,6 +943,7 @@ def list_serial_devices():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/manager/zigbee", methods=["GET", "POST"])
+@limiter.limit("10 per minute")
 def manage_zigbee():
     """
     GET: Returns the currently configured Zigbee device from the override file.
@@ -975,6 +1019,7 @@ services:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/upgrade", methods=["POST"])
+@limiter.limit("2 per minute") # Very expensive operation
 def trigger_upgrade():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -1088,6 +1133,7 @@ def check_manager_update():
 
 
 @app.route("/api/manager/update", methods=["POST"])
+@limiter.limit("3 per minute")
 def do_manager_update():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -1105,8 +1151,8 @@ def do_manager_update():
     subprocess.run(["chmod", "+x", SCRIPT_UPDATE])
 
     cmd = (
-        f"echo 'Starting Manager Update ({channel})...' > {LOG_FILES['update']}; "
-        f"{SCRIPT_UPDATE} {channel} {target_ref} >> {LOG_FILES['update']} 2>&1"
+        f"echo 'Starting Manager Update ({shlex.quote(channel)})...' > {LOG_FILES['update']}; "
+        f"{SCRIPT_UPDATE} {shlex.quote(channel)} {shlex.quote(target_ref)} >> {LOG_FILES['update']} 2>&1"
     )
 
     # Fire and forget thread, as the service will restart
@@ -1148,6 +1194,7 @@ def perform_first_boot_update():
         logging.error(f"First boot update skipped (No Network?): {e}")
 
 @app.route("/api/system/config", methods=["GET"])
+@limiter.limit("30 per minute")
 def get_system_config():
     """Returns status of Watchdog, PCI, and Cron."""
     try:
@@ -1161,6 +1208,7 @@ def get_system_config():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/system/config", methods=["POST"])
+@limiter.limit("5 per minute")
 def update_system_config():
     """Generic endpoint to toggle system settings."""
     if current_task_status["status"] == "running":
@@ -1170,21 +1218,28 @@ def update_system_config():
     feature = data.get("feature") # watchdog, cron, pci
     action = data.get("action")   # enable/disable or gen3/gen2
 
+    # Whitelist features and actions
+    if feature not in ["watchdog", "cron", "pci"]:
+        return jsonify({"error": "Invalid feature"}), 400
+
+    safe_action = shlex.quote(action) if action else ""
+
     cmd = ""
     label = ""
     
     if feature == "watchdog":
-        cmd = f"bash {SCRIPT_UTILITIES} watchdog {action}"
+        # Validate action for watchdog
+        if action not in ["enable", "disable"]: return jsonify({"error": "Invalid action"}), 400
+        cmd = f"bash {SCRIPT_UTILITIES} watchdog {safe_action}"
         label = f"Configure Watchdog ({action})"
     elif feature == "cron":
         cmd = f"bash {SCRIPT_UTILITIES} cron"
         label = "Configure Nextcloud Cron"
     elif feature == "pci":
-        target = "gen3" if action == "enable" else "gen2"
+        # Validate action for pci
+        target = "gen3" if action == "enable" else "gen2" 
         cmd = f"bash {SCRIPT_UTILITIES} pci {target}"
         label = f"Configure PCIe ({target})"
-    else:
-        return jsonify({"error": "Invalid feature"}), 400
 
     # Execute
     cmd += f" >> {LOG_FILES['setup']} 2>&1"
@@ -1220,6 +1275,7 @@ def list_ftp_users():
     return jsonify(users)
 
 @app.route("/api/ftp/setup", methods=["POST"])
+@limiter.limit("5 per minute")
 def setup_ftp():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -1243,7 +1299,7 @@ def setup_ftp():
     # For simplicity in this context, we pass as arg, but in high security 
     # we would write to temp file or pipe. Since this is local root, args are acceptable-ish
     # but strictly speaking visible in ps. 
-    # HARDENING: Use shlex to prevent injection.
+    # Use shlex to prevent injection.
     cmd = f"bash {SCRIPT_UTILITIES} setup {shlex.quote(nc_user)} {shlex.quote(ftp_user)} {shlex.quote(ftp_pass)} >> {LOG_FILES['setup']} 2>&1"
 
     threading.Thread(
@@ -1252,6 +1308,7 @@ def setup_ftp():
     return jsonify({"status": "started"})
 
 @app.route("/api/ftp/delete", methods=["POST"])
+@limiter.limit("5 per minute")
 def delete_ftp():
     if current_task_status["status"] == "running":
         return jsonify({"error": "Task running"}), 409
@@ -1281,5 +1338,6 @@ if __name__ == "__main__":
         
     # Attempt update before starting web server
     threading.Thread(target=perform_first_boot_update).start()
-        
-    app.run(host="0.0.0.0", port=80)
+
+    # For local dev only; in production, use Gunicorn
+    # app.run(host="0.0.0.0", port=80, debug=True)  # Keep debug=True for dev, but remove in prod    

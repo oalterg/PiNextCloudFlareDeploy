@@ -33,6 +33,14 @@ wait_for_healthy "db" 120 || die "DB failed to start. Aborting deployment."
 
 # 1c. Start Remaining Services
 profiles=$(get_tunnel_profiles)
+
+# If this is the initial setup (creds not claimed), do NOT start tunnels.
+# This prevents internet exposure before the admin password is claimed by the user.
+if [ -f "$INSTALL_DIR/install_creds.json" ]; then
+    log_info "Initial setup detected. Skipping tunnel startup for security."
+    profiles=""
+fi
+
 log_info "Starting Stack with Tunnel Profile: ${profiles:-None}"
 docker compose --env-file "$ENV_FILE" $(get_compose_args) ${profiles} up -d --remove-orphans
 
