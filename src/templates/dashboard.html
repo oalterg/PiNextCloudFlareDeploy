@@ -996,24 +996,37 @@
         }
 
         async function loadBackupConfig() {
-            try {
-                const res = await fetch('/api/backup/config');
-                const d = await res.json();
-                document.getElementById('bk-retention').value = d.retention;
-                document.getElementById('bk-hour').value = d.hour;
-                document.getElementById('bk-min').value = d.minute;
+            fetch('/api/backup/config')
+                .then(res => res.json())
+                .then(d => {
+                    d = d || {};  // Handle empty response
+                    // Apply robust defaults if keys are missing
+                    if (!d.retention) d.retention = 7;
+                    if (!d.hour) d.hour = 3;
+                    if (d.minute === undefined || d.minute === null) d.minute = 0;
+                    if (!d.day_week) d.day_week = '*';
+                    if (!d.day_month) d.day_month = '*';
+                    if (!Object.keys(d).length) {
+                        console.warn("Backup config empty; loading defaults.");
+                    }
+                    
+                    // Update Form Elements
+                    document.getElementById('bk-retention').value = d.retention;
+                    document.getElementById('bk-hour').value = d.hour;
+                    document.getElementById('bk-min').value = d.minute;
 
-                let freq = 'daily';
-                if (d.day_week !== '*') {
-                    freq = 'weekly';
-                    document.getElementById('bk-dow').value = d.day_week;
-                } else if (d.day_month !== '*') {
-                    freq = 'monthly';
-                    document.getElementById('bk-dom').value = d.day_month;
-                }
-                document.getElementById('bk-freq').value = freq;
-                updateFreqUI();
-            } catch(e) {}
+                    let freq = 'daily';
+                    if (d.day_week !== '*') {
+                        freq = 'weekly';
+                        document.getElementById('bk-dow').value = d.day_week;
+                    } else if (d.day_month !== '*') {
+                        freq = 'monthly';
+                        document.getElementById('bk-dom').value = d.day_month;
+                    }
+                    document.getElementById('bk-freq').value = freq;
+                    updateFreqUI();
+                })
+                .catch(e => console.error("Failed to load backup config:", e));
         }
 
         function updateFreqUI() {

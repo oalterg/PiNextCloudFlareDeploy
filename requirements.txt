@@ -1,5 +1,5 @@
-Flask>=2.0.0
-requests>=2.0.0
-python-dotenv
-flask-limiter
-gunicorn
+Flask==3.1.2
+requests==2.32.5
+python-dotenv==1.2.1
+flask-limiter==4.1.1
+gunicorn==23.0.0

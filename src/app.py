@@ -9,6 +9,7 @@ import json
 import hashlib
 import logging
 import shlex
+import tempfile
 import requests
 from flask import Flask, render_template, jsonify, request, Response
 import migration
@@ -41,6 +42,8 @@ SCRIPT_REDEPLOY = f"{INSTALL_DIR}/scripts/redeploy_tunnels.sh"
 SCRIPT_UTILITIES = f"{INSTALL_DIR}/scripts/utilities.sh"
 INSTALL_CREDS_PATH = f"{INSTALL_DIR}/install_creds.json"
 
+STATUS_FILE = os.path.join(tempfile.gettempdir(), "homebrain_task_status.json")
+
 LOG_FILES = {
     "setup": f"{LOG_DIR}/main_setup.log",
     "backup": f"{LOG_DIR}/backup.log",
@@ -51,6 +54,47 @@ LOG_FILES = {
 
 task_lock = threading.Lock()
 current_task_status = {"status": "idle", "message": "", "log_type": "setup"}
+
+def write_status(status):
+    try:
+        # Use mkstemp for secure file creation (prevents race conditions)
+        # Use system temp dir to ensure write permissions regardless of user (root/www-data)
+        fd, temp_path = tempfile.mkstemp(dir=tempfile.gettempdir(), text=True)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(status, f)
+        os.chmod(temp_path, 0o644)  # Set safe perms
+        os.rename(temp_path, STATUS_FILE) # Atomic replacement
+    except Exception as e:
+        logging.error(f"Failed to write status file: {e}. Using in-memory fallback.")
+        global current_task_status
+        current_task_status = status  # Fallback to global if file fails
+
+def read_status():
+    # 1. Try reading from file (Inter-Process Communication)
+    try:
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+         logging.error(f"Failed to read status file: {e}")
+    # 2. Fallback to default/memory
+    return {"status": "idle", "message": "", "log_type": "setup"}
+
+# Initialize status on startup
+try:
+    initial_status = read_status()
+    if initial_status["status"] == "running":
+        initial_status["status"] = "error"
+        initial_status["message"] = "Stale task from previous run detected."
+        write_status(initial_status)
+        logging.warning("Reset stale running task on startup.")
+except Exception as e:
+    logging.error(f"Startup status init failed: {e}. Defaulting to idle.")
+    current_task_status = {"status": "idle", "message": "", "log_type": "setup"}
+
+@app.route("/api/task_status")
+def get_task_status():
+    return jsonify(read_status())
 
 # Initialize Limiter with memory storage
 # Uses remote IP for identification.
@@ -141,32 +185,33 @@ def get_local_version():
     return {"channel": "unknown", "ref": "unknown", "updated_at": "unknown"}
 
 def run_background_task(task_name, command, log_type):
-    global current_task_status
-    with task_lock:
-        current_task_status = {
-            "status": "running",
-            "message": f"{task_name} in progress...",
-            "log_type": log_type,
-        }
+    status = {
+             "status": "running",
+             "message": f"{task_name} in progress...",
+             "log_type": log_type,
+         }
+    write_status(status)
 
     try:
         # Redirect stderr to stdout to capture errors in logs
         subprocess.run(command, shell=True, check=True)
-        with task_lock:
-            current_task_status["status"] = "success"
-            current_task_status["message"] = f"{task_name} completed successfully."
+        status["status"] = "success"
+        status["message"] = f"{task_name} completed successfully."
+        write_status(status)
     except subprocess.CalledProcessError as e:
-        with task_lock:
-            current_task_status["status"] = "error"
-            current_task_status["message"] = f"{task_name} failed. Check logs."
+        status["status"] = "error"
+        status["message"] = f"{task_name} failed. Check logs."
+        write_status(status)
     except Exception as e:
-        with task_lock:
-            current_task_status["status"] = "error"
-            current_task_status["message"] = str(e)
+        status["status"] = "error"
+        status["message"] = str(e)
+        write_status(status)
 
     time.sleep(10)
-    if current_task_status["status"] != "running":
-        current_task_status["status"] = "idle"
+    current = read_status()
+    if current["status"] != "running":
+        current["status"] = "idle"
+        write_status(current)
 
 
 def get_factory_config():
@@ -176,7 +221,14 @@ def get_factory_config():
             for line in f:
                 if "=" in line:
                     key, value = line.strip().split("=", 1)
-                    config[key] = value.strip()
+                    val_str = value.strip()
+                    if val_str.startswith(("'", '"')) and val_str.endswith(val_str[0]):
+                        inner = val_str[1:-1]
+                        if val_str[0] == "'":
+                            inner = inner.replace("'\\''", "'")
+                        config[key] = inner
+                    else:
+                        config[key] = val_str
     return config
 
 
@@ -187,7 +239,14 @@ def get_env_config():
             for line in f:
                 if "=" in line:
                     key, value = line.strip().split("=", 1)
-                    config[key] = value.strip()
+                    val_str = value.strip()
+                    if val_str.startswith(("'", '"')) and val_str.endswith(val_str[0]):
+                        inner = val_str[1:-1]
+                        if val_str[0] == "'":
+                            inner = inner.replace("'\\''", "'")
+                        config[key] = inner
+                    else:
+                        config[key] = val_str
     return config
 
 
@@ -530,12 +589,6 @@ def system_status():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     return jsonify(services)
-
-
-@app.route("/api/task_status")
-def get_task_status():
-    return jsonify(current_task_status)
-
 
 @app.route("/api/logs/<log_target>")
 def get_logs(log_target):

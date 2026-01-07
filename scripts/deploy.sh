@@ -50,7 +50,7 @@ wait_for_healthy "homeassistant" 120 || die "Homeassistant failed to start."
 
 # 1e. Create Home Assistant Admin Account
 log_info "Hardening Home Assistant Admin account..."
-create_ha_admin "$MASTER_PASSWORD" || echo "Fallback: Proceed with manual HA account creation."
+bash "$SCRIPT_DIR/utilities.sh" ha_admin "$MASTER_PASSWORD" || log_error "HA Admin creation failed."
 
 # --- 2. Post-Deploy Proxy Configuration ---
 log_info "Applying Nextcloud and Homeassistant Proxy Settings..."
