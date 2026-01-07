@@ -93,11 +93,31 @@ rsync -a --delete \
 
 # 5. Dependency Management
 log_info "Updating Python dependencies..."
-# Ensure pwgen is available for migration
-apt-get install -y -qq pwgen >> "$LOG_FILE" 2>&1
-if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-    pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages || { log_error "Pip install failed"; exit 1; }
+install_python_venv_deps
+
+# 6a. Service Synchronization (Golden Master)
+# This generalized block handles ALL service file updates (Gunicorn, Venv, or future changes).
+# It ensures the active systemd service matches the repository version exactly.
+INSTALLED_SVC="/etc/systemd/system/homebrain-manager.service"
+REPO_SVC="$INSTALL_DIR/config/homebrain-manager.service"
+
+if [ -f "$REPO_SVC" ]; then
+    # silent compare: returns 1 if different
+    if ! cmp -s "$REPO_SVC" "$INSTALLED_SVC"; then
+        log_info "Service definition drift detected. Synchronizing with repository version..."
+        
+        # Backup and atomic replace
+        [ -f "$INSTALLED_SVC" ] && cp "$INSTALLED_SVC" "${INSTALLED_SVC}.bak_$(date +%s)"
+        cp "$REPO_SVC" "$INSTALLED_SVC"
+        chmod 644 "$INSTALLED_SVC"
+        
+        systemctl daemon-reload
+        log_info "Service file synchronized."
+    fi
+else
+    log_warn "Repository service file missing ($REPO_SVC). Skipping synchronization."
 fi
+
 
 # 6. Docker Stack Update
 log_info "Updating Docker Stack..."

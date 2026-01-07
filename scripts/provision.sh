@@ -32,11 +32,7 @@ chmod 600 "$BOOT_CONFIG"
 # --- 3. Setup Python Environment ---
 echo "Provisioning HomeBrain Manager..."
 
-# Install Requirements directly from the service directory
-if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-    echo "Installing Python requirements..."
-    pip3 install -r "$INSTALL_DIR/requirements.txt" --break-system-packages
-fi
+install_python_venv_deps
 
 # 4. Ensure scripts are executable
 chmod +x "$INSTALL_DIR/scripts/"*.sh

@@ -6,7 +6,7 @@ After=network.target
 User=root
 WorkingDirectory=/opt/homebrain/src
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
-ExecStart=/usr/local/bin/gunicorn --workers 3 --bind 0.0.0.0:80 --timeout 30 app:app
+ExecStart=/opt/homebrain/venv/bin/gunicorn --workers 3 --bind 0.0.0.0:80 --timeout 30 app:app
 Restart=always
 RestartSec=10
 

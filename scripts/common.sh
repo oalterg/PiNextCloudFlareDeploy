@@ -166,6 +166,26 @@ install_deps_enable_docker() {
     systemctl enable --now docker
 }
 
+install_python_venv_deps(){
+    # Install Python dependencies in venv
+    VENV_DIR="$INSTALL_DIR/venv"
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "Creating virtualenv..."
+        python3 -m venv "$VENV_DIR"
+    fi
+    
+    # Use direct path to pip to avoid 'source' issues in strict mode (set -u)
+    local venv_pip="$VENV_DIR/bin/pip"
+    # Upgrade pip in venv
+    "$venv_pip" install --upgrade pip
+    
+    # Install requirements (no conflicts)
+    if [ -f "$INSTALL_DIR/requirements.txt" ]; then
+        echo "Installing Python dependencies..."
+        "$venv_pip" install -r "$INSTALL_DIR/requirements.txt"
+    fi
+}
+
 # --- Maintenance Mode ---
 set_maintenance_mode() {
     local mode="$1" # --on or --off

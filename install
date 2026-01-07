@@ -26,10 +26,6 @@ curl -L "$REPO_URL" | tar -xz --strip-components=1 -C "$INSTALL_DIR"
 
 # 3. Setup Permissions
 chmod +x "$INSTALL_DIR/scripts/provision.sh"
-chmod +x "$INSTALL_DIR/scripts/raspi-cloud"
-
-# 4. Symlink Binary
-ln -sf "$INSTALL_DIR/scripts/raspi-cloud" "$BIN_DIR/raspi-cloud"
 
 echo "Installation complete."
 
