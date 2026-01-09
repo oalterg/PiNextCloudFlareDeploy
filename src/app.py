@@ -52,6 +52,27 @@ LOG_FILES = {
     "manager": f"{LOG_DIR}/manager.log",
 }
 
+# --- Logging Configuration (Global & Robust) ---
+# Configure logging immediately so Gunicorn or Dev server both use it
+log_file = LOG_FILES["manager"]
+
+# 1. Define Filter to suppress noisy polling logs
+class AccessLogFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        # Filter out frequent polling endpoints to prevent log flooding
+        if any(x in msg for x in ["GET /api/task_status", "GET /api/status", "GET /api/logs/"]):
+            return False
+        return True
+
+logging.basicConfig(filename=log_file, level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Apply filter to relevant loggers
+for logger_name in ["werkzeug", "gunicorn.access", "root"]:
+    logging.getLogger(logger_name).addFilter(AccessLogFilter())
+
+
 task_lock = threading.Lock()
 current_task_status = {"status": "idle", "message": "", "log_type": "setup"}
 
@@ -615,7 +636,22 @@ def get_logs(log_target):
         return "Failed to fetch docker logs. Service might not be running."
     except Exception as e:
         return f"Error: {str(e)}"
-
+    
+@app.route("/api/logs/client", methods=["POST"])
+@limiter.limit("20 per minute") # Prevent client loops from DDOSing logs
+def client_log():
+    """Receives logs/errors from the frontend dashboard."""
+    data = request.json
+    level = data.get("level", "INFO").upper()
+    message = data.get("message", "No message")
+    
+    # Sanitize inputs
+    if level not in ["INFO", "WARNING", "ERROR", "DEBUG"]:
+        level = "INFO"
+    
+    # Log to the main manager log
+    logging.log(getattr(logging, level), f"[Frontend] {message}")
+    return jsonify({"status": "ok"})
 
 # --- Routes: Drives & Storage ---
 @app.route("/api/drives")
@@ -1385,11 +1421,6 @@ def delete_ftp():
     return jsonify({"status": "started"})
 
 if __name__ == "__main__":
-    # Capture logs to file (manager.log)
-    log_file = os.path.join(LOG_DIR, "manager.log")
-    logging.basicConfig(filename=log_file, level=logging.INFO, 
-                        format='%(asctime)s - %(levelname)s - %(message)s')
-
     try:
         migration.run_migrations()
     except Exception as e:

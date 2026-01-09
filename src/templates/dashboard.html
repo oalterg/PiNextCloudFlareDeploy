@@ -232,6 +232,12 @@
             line-height: 1.4;
         }
 
+        .log-line { margin-bottom: 2px; }
+        .log-error { color: #ff6b6b; font-weight: bold; }
+        .log-warning { color: #feca57; }
+        .log-info { color: #aaddaa; }
+        .log-debug { color: #54a0ff; }
+
         .stat-item {
             display: flex;
             justify-content: space-between;
@@ -605,11 +611,11 @@
             <div style="display:flex; gap:15px; margin-bottom: 15px;">
                 <select id="log-selector" onchange="changeLogSource(this.value)" style="flex-grow:1; margin-bottom:0;">
                     <optgroup label="System Logs">
+                        <option value="manager" selected>Manager (Dashboard App)</option>
                         <option value="setup">Setup Log</option>
                         <option value="backup">Backup Log</option>
                         <option value="restore">Restore Log</option>
                         <option value="update">Manager Update Log</option>
-                        <option value="manager">Manager (Dashboard App)</option>
                     </optgroup>
                     <optgroup label="Service Containers">
                         <option value="nextcloud">Nextcloud Container</option>
@@ -622,12 +628,38 @@
                 </select>
                 <button onclick="pollLogs()">Refresh Now</button>
             </div>
+            
+            <div style="display:flex; gap:15px; margin-bottom:10px; font-size:0.9em; align-items:center; background:#111; padding:8px; border-radius:4px; border:1px solid #333;">
+                <span style="color:#888; font-weight:bold;">FILTERS:</span>
+                <label style="display:inline; margin:0; cursor:pointer;"><input type="checkbox" id="chk-error" checked onchange="renderLogs()"> Errors</label>
+                <label style="display:inline; margin:0; cursor:pointer;"><input type="checkbox" id="chk-warn" checked onchange="renderLogs()"> Warnings</label>
+                <label style="display:inline; margin:0; cursor:pointer;"><input type="checkbox" id="chk-info" checked onchange="renderLogs()"> Info</label>
+                <label style="display:inline; margin:0; cursor:pointer;"><input type="checkbox" id="chk-debug" onchange="renderLogs()"> Debug/Raw</label>
+                <div style="flex-grow:1; text-align:right;">
+                    <small style="color:#666;" id="log-status">Ready</small>
+                </div>
+            </div>
+
             <div id="console-output" class="log-box">Select a log source...</div>
         </div>
     </div>
 
     <script>
-        let currentLogSource = 'setup';
+        let currentLogSource = 'manager';
+        let rawLogData = ""; // Store raw text for client-side filtering
+
+        // --- Global Error Capture (Client-Side Logging) ---
+        window.onerror = function(msg, url, line) {
+            // Send JS errors to backend manager log
+            fetch('/api/logs/client', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    level: 'ERROR',
+                    message: `JS Error: ${msg} (${url}:${line})`
+                })
+            }).catch(e => console.warn("Failed to ship log", e));
+        };
 
         async function init() {
             // Populate Hours for Backup
@@ -1167,13 +1199,74 @@
         }
 
         async function pollLogs() {
+            const statusEl = document.getElementById('log-status');
+            statusEl.innerText = "Fetching...";
             try {
                 const res = await fetch('/api/logs/' + currentLogSource);
                 const txt = await res.text();
-                const div = document.getElementById('console-output');
-                div.innerText = txt;
-                div.scrollTop = div.scrollHeight;
+                
+                // Only re-render if data changed
+                if (txt !== rawLogData) {
+                    rawLogData = txt;
+                    renderLogs();
+                    statusEl.innerText = "Updated " + new Date().toLocaleTimeString();
+                } else {
+                    statusEl.innerText = "No changes";
+                }
             } catch(e){}
+        }
+
+        function renderLogs() {
+            const div = document.getElementById('console-output');
+            const lines = rawLogData.split('\n');
+            
+            // Get active filters
+            const showErr = document.getElementById('chk-error').checked;
+            const showWarn = document.getElementById('chk-warn').checked;
+            const showInfo = document.getElementById('chk-info').checked;
+            const showDebug = document.getElementById('chk-debug').checked;
+
+            let html = '';
+            
+            lines.forEach(line => {
+                if (!line.trim()) return;
+                
+                let cssClass = 'log-debug';
+                let visible = false;
+
+                // Simple heuristic detection of log levels
+                const upper = line.toUpperCase();
+                
+                if (upper.includes('ERROR') || upper.includes('CRITICAL') || upper.includes('EXCEPTION') || upper.includes('TRACEBACK')) {
+                    cssClass = 'log-error';
+                    if (showErr) visible = true;
+                } else if (upper.includes('WARN')) {
+                    cssClass = 'log-warning';
+                    if (showWarn) visible = true;
+                } else if (upper.includes('INFO')) {
+                    cssClass = 'log-info';
+                    if (showInfo) visible = true;
+                } else {
+                    // Fallback for raw lines or stack traces (usually inherit or debug)
+                    if (showDebug) visible = true;
+                }
+
+                if (visible) {
+                    html += `<div class="log-line ${cssClass}">${escapeHtml(line)}</div>`;
+                }
+            });
+
+            div.innerHTML = html;
+            div.scrollTop = div.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
         }
 
         init();
