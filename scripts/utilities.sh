@@ -72,7 +72,7 @@ configure_nc_cron() {
 */5 * * * * root docker exec -u www-data \$(docker compose -f $COMPOSE_FILE ps -q nextcloud) php cron.php > /dev/null 2>&1
 EOF
     chmod 644 "$NC_CRON_FILE"
-    service cron reload
+    systemctl restart cron
     
     log_info "Nextcloud cron configured."
 }

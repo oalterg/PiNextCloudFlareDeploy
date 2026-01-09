@@ -85,3 +85,15 @@ def run_migrations():
                 logging.info("Migration: Service synchronized. Changes will apply on next restart.")
             except Exception as e:
                 logging.error(f"Migration: Failed to sync service file: {e}")
+    
+    # --- Migration 2: Rename Backup Cron File ---
+    # Moves /etc/cron.d/nextcloud-backup to /etc/cron.d/homebrain-backup to match new standard
+    legacy_cron = "/etc/cron.d/nextcloud-backup"
+    new_cron = "/etc/cron.d/homebrain-backup"
+    
+    if os.path.exists(legacy_cron) and not os.path.exists(new_cron):
+        logging.info(f"Migration: Renaming legacy backup cron to {new_cron}...")
+        try:
+            os.rename(legacy_cron, new_cron)
+        except Exception as e:
+            logging.error(f"Migration: Failed to rename backup cron: {e}")
