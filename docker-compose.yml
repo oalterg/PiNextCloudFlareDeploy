@@ -1,6 +1,6 @@
 services:
   db:
-    image: mariadb:11.4
+    image: mariadb:11.4.9
     restart: unless-stopped
     command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
     volumes:
@@ -22,7 +22,7 @@ services:
       retries: 5
   
   redis:
-    image: redis:alpine
+    image: redis:8.4.0-alpine
     restart: always
     volumes:
       - redis_data:/data
@@ -33,7 +33,7 @@ services:
       retries: 5
 
   nextcloud:
-    image: nextcloud:32-apache
+    image: nextcloud:32.0.3-apache
     restart: unless-stopped
     ports:
       - "${NEXTCLOUD_PORT:-8080}:80"
@@ -82,7 +82,7 @@ services:
   newt:
     profiles:
       - pangolin
-    image: fosrl/newt:latest
+    image: fosrl/newt:1.8.1
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -94,7 +94,7 @@ services:
   cloudflared-nc:
     profiles:
       - cloudflare-nc
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2025.11.1
     restart: unless-stopped
     command: tunnel run
     environment:
@@ -106,7 +106,7 @@ services:
   cloudflared-ha:
     profiles:
       - cloudflare-ha
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2025.11.1
     restart: unless-stopped
     command: tunnel run
     environment:
