@@ -1345,6 +1345,26 @@ def update_system_config():
     
     return jsonify({"status": "started"})
 
+@app.route("/api/redis/status")
+def redis_status():
+    try:
+        status = subprocess.check_output(["bash", SCRIPT_UTILITIES, "redis_status"]).decode().strip()
+        return jsonify({"status": status})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/api/redis/configure", methods=["POST"])
+@limiter.limit("5 per minute")
+def redis_configure():
+    if current_task_status["status"] == "running":
+        return jsonify({"error": "Task running"}), 409
+
+    cmd = f"bash {SCRIPT_UTILITIES} redis_configure >> {LOG_FILES['setup']} 2>&1"
+    threading.Thread(
+        target=run_background_task, args=("Configure Redis", cmd, "setup")
+    ).start()
+    return jsonify({"status": "started"})
+
 # --- Routes: FTP Management ---
 @app.route("/api/ftp/users", methods=["GET"])
 def list_ftp_users():

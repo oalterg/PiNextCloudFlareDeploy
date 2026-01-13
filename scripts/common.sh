@@ -150,7 +150,7 @@ install_deps_enable_docker() {
     # --- 0. Install Dependencies ---
     log_info "Installing dependencies"
     # Added -qq for quieter output in logs
-    apt-get install -y -qq ca-certificates gnupg lsb-release cron gpg rsync initramfs-tools python3-flask python3-dotenv python3-requests python3-pip jq moreutils pwgen git parted
+    apt-get install -y -qq ca-certificates gnupg lsb-release cron gpg rsync initramfs-tools python3-flask python3-dotenv python3-requests python3-pip jq moreutils pwgen git parted rfkill
     apt-get update -qq
 
     # Docker setup
@@ -269,4 +269,32 @@ configure_nc_ha_proxy_settings() {
     if [[ -n "$ha_cid" ]]; then
         configure_ha_proxy_settings "$subnet" "$ha_cid"
     fi
+}
+
+configure_nextcloud_redis() {
+    local nc_cid=$(get_nc_cid)
+    
+    if [[ -z "$nc_cid" ]]; then 
+        log_warn "Nextcloud container not found. Skipping Redis config."
+        return 1
+    fi
+
+    log_info "Configuring Redis for Nextcloud..."
+    
+    # We use '|| true' on some commands to prevent a hard failure if the config is already set,
+    # though 'occ config:system:set' is generally idempotent.
+    
+    # 1. Configure Connection Details
+    docker exec --user www-data "$nc_cid" php occ config:system:set redis host --value="redis" || return 1
+    docker exec --user www-data "$nc_cid" php occ config:system:set redis port --value=6379 --type=integer
+    
+    # 2. Configure Caching Backends
+    # Distributed cache (Redis)
+    docker exec --user www-data "$nc_cid" php occ config:system:set memcache.distributed --value="\OC\Memcache\Redis"
+    # Locking (Redis is much faster than DB locking)
+    docker exec --user www-data "$nc_cid" php occ config:system:set memcache.locking --value="\OC\Memcache\Redis"
+    # Local Cache (APCu is faster for local, but Redis is acceptable if APCu is missing. We prefer APCu)
+    docker exec --user www-data "$nc_cid" php occ config:system:set memcache.local --value="\OC\Memcache\APCu"
+
+    log_info "Redis configuration applied successfully."
 }

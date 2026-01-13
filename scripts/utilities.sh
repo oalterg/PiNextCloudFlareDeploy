@@ -429,6 +429,26 @@ case "${1:-}" in
     pci)
         configure_pci_speed "${2}"
         ;;
+    redis_status)
+        nc_cid=$(get_nc_cid)
+        # Robustness: Check if container exists AND is actually running
+        if [[ -z "$nc_cid" ]] || [[ $(docker inspect -f '{{.State.Running}}' "$nc_cid" 2>/dev/null) != "true" ]]; then
+             echo "disconnected"
+             exit 0
+        fi
+
+        # Check if the 'host' value in Nextcloud config is set to 'redis'
+        host_val=$(docker exec --user www-data "$nc_cid" php occ config:system:get redis host 2>/dev/null || echo "")
+        
+        if [[ "$host_val" == "redis" ]]; then
+            echo "connected"
+        else
+            echo "unconfigured"
+        fi
+        ;;
+    redis_configure)
+        configure_nextcloud_redis
+        ;;
     setup)
         setup_ftp_user "${2}" "${3}" "${4}"
         ;;

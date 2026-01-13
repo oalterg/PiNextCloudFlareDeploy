@@ -149,8 +149,8 @@
         .btn-danger { background-color: var(--hb-danger); color: white; border: none; }
         .btn-danger:hover { background-color: var(--hb-danger-hover); }
 
-        .btn-warning { background-color: var(--hb-warning); color: #000; border: none; }
-        .btn-warning:hover { opacity: 0.9; }
+        .btn-warning { background-color: rgba(243, 156, 18, 0.2); color: var(--hb-warning); border: 1px solid var(--hb-warning); }
+        .btn-warning:hover { background-color: var(--hb-warning); color: #121212; }
 
         input, select {
             background: #2a2a2a;
@@ -565,6 +565,16 @@
                             <button onclick="toggleSystem('pci')" style="margin-left:10px; padding:4px 10px; font-size:0.8em;">Toggle</button>
                         </td>
                     </tr>
+                    <tr>
+                        <td>
+                            <strong>Redis Caching</strong><br>
+                            <small style="color:var(--hb-text-dim);">High-performance memory caching.</small>
+                        </td>
+                        <td style="text-align:right;">
+                            <span id="sys-redis-status" class="status-badge status-unknown">...</span>
+                            <button id="btn-redis-fix" onclick="configureRedis()" style="margin-left:10px; padding:4px 10px; font-size:0.8em; display:none;" class="btn-warning">Fix Config</button>
+                        </td>
+                    </tr>
                 </table>
             </div>
             
@@ -855,6 +865,8 @@
                 updateBadge('sys-wd-status', data.watchdog, 'enabled');
                 updateBadge('sys-cron-status', data.cron, 'cron'); // cron enabled = 'cron'
                 updateBadge('sys-pci-status', data.pci, 'gen3');
+
+                checkRedisStatus();
                 
             } catch(e) { console.error("Sys Config Load Error", e); }
         }
@@ -881,6 +893,37 @@
             if (confirm(confirmMsg)) {
                 triggerAction('/api/system/config', 'System Config', { feature: feature, action: action });
                 setTimeout(loadSystemConfig, 3000);
+            }
+        }
+
+        async function checkRedisStatus() {
+            try {
+                const res = await fetch('/api/redis/status');
+                const data = await res.json();
+                const el = document.getElementById('sys-redis-status');
+                const btn = document.getElementById('btn-redis-fix');
+                
+                if (data.status === 'connected') {
+                    el.innerText = 'ACTIVE';
+                    el.className = 'status-badge status-running';
+                    btn.style.display = 'none';
+                } else if (data.status === 'unconfigured') {
+                    el.innerText = 'UNCONFIGURED';
+                    el.className = 'status-badge status-starting'; // Yellow/Orange
+                    btn.style.display = 'inline-block';
+                } else {
+                    el.innerText = 'OFFLINE';
+                    el.className = 'status-badge status-stopped';
+                    btn.style.display = 'none';
+                }
+            } catch(e) {}
+        }
+    
+        async function configureRedis() {
+            if (confirm("Configure Nextcloud to use Redis for caching/locking?")) {
+                triggerAction('/api/redis/configure', 'Redis Configuration');
+                // Poll status after a delay
+                setTimeout(checkRedisStatus, 5000);
             }
         }
 

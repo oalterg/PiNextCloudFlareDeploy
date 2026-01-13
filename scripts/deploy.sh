@@ -78,6 +78,9 @@ done
 
 configure_nc_ha_proxy_settings || die "Proxy configuration failed."
 
+log_info "Applying Nextcloud Redis Configuration..."
+configure_nextcloud_redis || log_warn "Redis configuration failed (non-fatal)."
+
 # Restart to apply proxy settings (Safe restart)
 # We do not restart DB here, only the frontends
 docker compose $(get_compose_args) restart nextcloud homeassistant
@@ -87,16 +90,19 @@ wait_for_healthy "homeassistant" 120 || die "Homeassistant failed to get healthy
 
 # --- 3. Cron Setup ---
 log_info "Configuring Cron..."
-docker exec -u www-data "$NC_CID" php occ background:cron || true
-# Use atomic write for cron file
-echo "*/5 * * * * root docker exec -u www-data \$(docker compose -f $COMPOSE_FILE ps -q nextcloud) php cron.php" > /etc/cron.d/nextcloud-cron
-chmod 644 /etc/cron.d/nextcloud-cron
-service cron reload || log_error "Nextcloud cronjob reloading failed."
+# Use the utility script to ensure consistency and use systemctl
+bash "$SCRIPT_DIR/utilities.sh" cron || log_error "Nextcloud cron configuration failed."
 
 # --- 4. Hardening ---
 log_info "Disabling Wireless interfaces..."
-rfkill block wifi || log_error "WiFi could not be disabled."
-rfkill block bluetooth || log_error "Bluetooth could not be disabled."
+
+if command -v rfkill >/dev/null 2>&1; then
+    log_info "Disabling Wireless interfaces..."
+    rfkill block wifi || log_warn "WiFi could not be disabled (possibly already disabled or unavailable)."
+    rfkill block bluetooth || log_warn "Bluetooth could not be disabled (possibly already disabled or unavailable)."
+else
+    log_warn "rfkill command not found. Wireless interfaces not disabled."
+fi
 
 log_info "=== Deployment Complete ==="
 
