@@ -48,6 +48,8 @@ All handled automatically during provisioning.
 
 Access the dashboard at your main domain (or locally via RPi IP). Manage services, monitor resources, and configure features. Initial login uses the generated master password—save it securely.
 
+![HomeBrain Manager Dashboard](res/screenshot.png)
+
 ## Privacy & Security Highlights
 
 - **End-to-End Ownership**: Data stays on your device; no cloud intermediaries.
