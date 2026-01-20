@@ -140,13 +140,65 @@
                         <p style="font-size: 0.9em; color: #aaa; margin-bottom: 25px;">
                             This password provides full administrative access to your Dashboard, Nextcloud, and Home Assistant.
                         </p>
-
+                        ${data.cloud_enabled ? `
+                        <div style="background: rgba(46, 204, 113, 0.05); border: 1px solid #2ecc71; padding: 20px; border-radius: 8px; margin-bottom: 25px;">
+                            <h3 style="margin-top:0; color: #2ecc71; font-size:1.1em;">Activate Remote Access</h3>
+                            <p style="font-size:0.9em; color:#ccc; margin-bottom:15px;">
+                                Create your cloud account to access your device securely from anywhere.
+                            </p>
+                            <div style="display:flex; gap:10px;">
+                                <input type="email" id="cloud-email" placeholder="Enter your email address" style="padding:12px; border-radius:4px; border:1px solid #444; background:#111; color:#fff; flex-grow:1; outline:none;">
+                                <button onclick="registerCloud()" id="btn-cloud" style="width:auto; padding:10px 25px; font-size:0.9em; margin:0;">Send Invite</button>
+                            </div>
+                            <p id="cloud-msg" style="margin-bottom:0; font-size:0.85em; margin-top:10px; min-height:1.2em;"></p>
+                        </div>` : ''}
                         <button onclick="confirmAndLogin()">
                             I have saved my password &rarr; Login
                         </button>
                     </div>
                 </div>
             `;
+        }
+
+        function registerCloud() {
+            const email = document.getElementById('cloud-email').value;
+            const btn = document.getElementById('btn-cloud');
+            const msg = document.getElementById('cloud-msg');
+            
+            if (!email.includes('@')) {
+                msg.innerText = "Please enter a valid email.";
+                msg.style.color = "#e74c3c";
+                return;
+            }
+
+            btn.disabled = true;
+            btn.innerText = "Sending...";
+            msg.innerText = "";
+
+            fetch('/api/cloud/register', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({email: email})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    msg.innerText = data.message;
+                    msg.style.color = "#2ecc71";
+                    btn.innerText = "Sent";
+                } else {
+                    msg.innerText = data.error || "Failed to send.";
+                    msg.style.color = "#e74c3c";
+                    btn.disabled = false;
+                    btn.innerText = "Send Invite";
+                }
+            })
+            .catch(e => {
+                msg.innerText = "Connection error.";
+                msg.style.color = "#e74c3c";
+                btn.disabled = false;
+                btn.innerText = "Send Invite";
+            });
         }
 
         function confirmAndLogin() {

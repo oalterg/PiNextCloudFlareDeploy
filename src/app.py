@@ -175,6 +175,9 @@ def get_one_time_credentials():
         try:
             with open(creds_file, "r") as f:
                 data = json.load(f)
+            # Check if cloud registration is configured in factory settings
+            factory_conf = get_factory_config()
+            data["cloud_enabled"] = bool(factory_conf.get("REGISTRAR_URL"))
             return jsonify(data)
         except Exception as e:
             logging.error(f"Failed to read creds file: {e}")
@@ -389,6 +392,48 @@ def start_setup():
         target=run_background_task, args=("Initial Setup", cmd, "setup")
     ).start()
     return jsonify({"status": "started"})
+
+@app.route('/api/cloud/register', methods=['POST'])
+@limiter.limit("5 per minute")
+def register_cloud():
+    # 1. Verify user is authenticated (Factory Password during setup, or Admin Token after)
+    # The auth_gate handles the check, ensuring only owners can trigger this.
+    
+    email = request.json.get('email')
+    if not email: return jsonify({"error": "Email is required"}), 400
+    
+    # 2. Get Device ID
+    config = get_factory_config()
+    registrar_url = config.get("REGISTRAR_URL")
+    registrar_secret = config.get("REGISTRAR_SECRET")
+    device_id = config.get("NEWT_ID", "unknown")
+    
+    if not registrar_url:
+        return jsonify({"error": "Cloud registration not configured on this device."}), 400
+
+    # 3. Call Registrar
+    try:
+        # Timeout is crucial for robustness so we don't hang the UI
+        r = requests.post(
+            registrar_url, 
+            json={"email": email, "device_id": device_id},
+            headers={"Authorization": f"Bearer {registrar_secret}"},
+            timeout=10
+        )
+        if r.status_code in [200, 201]:
+            return jsonify({"status": "success", "message": "Invitation sent! Check your email."})
+        else:
+            # Attempt to parse specific error from Worker JSON
+            try:
+                worker_error = r.json().get("error", r.text)
+            except:
+                worker_error = r.text
+            
+            logging.error(f"Registrar Error {r.status_code}: {worker_error}")
+            return jsonify({"error": f"Registration failed: {worker_error}"}), 502
+    except Exception as e:
+        logging.error(f"Registrar Connection Exception: {e}")
+        return jsonify({"error": "Could not connect to registrar service."}), 503
 
 # --- Route: Adopt Existing Drive ---
 @app.route("/api/drives/mount", methods=["POST"])
