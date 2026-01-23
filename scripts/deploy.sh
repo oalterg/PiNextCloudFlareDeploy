@@ -106,11 +106,21 @@ fi
 
 log_info "=== Deployment Complete ==="
 
-# Ensure permissions on creds file so app.py can read it
+# Block completion until the credentials file exists to prevent race condition in UI
+log_info "Waiting for credentials file generation..."
+end_time=$((SECONDS + 120))
+while [ ! -f "$INSTALL_DIR/install_creds.json" ]; do
+    if [ $SECONDS -ge $end_time ]; then
+        log_warn "Timed out waiting for credentials. UI may report partial error."
+        break
+    fi
+    sleep 2
+done
+
 if [ -f "$INSTALL_DIR/install_creds.json" ]; then
     # Ensure ownership is root:root so the service can read it
     chown root:root "$INSTALL_DIR/install_creds.json"
-    chmod 644 "$INSTALL_DIR/install_creds.json"
+    chmod 600 "$INSTALL_DIR/install_creds.json"
 fi
 
 # Mark setup as complete before signaling the UI

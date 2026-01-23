@@ -98,7 +98,14 @@ def read_status():
                 return json.load(f)
     except Exception as e:
          logging.error(f"Failed to read status file: {e}")
-    # 2. Fallback to default/memory
+    # 2. Check physical state (Persistence & Idempotence)
+    if os.path.exists(os.path.join(INSTALL_DIR, ".setup_complete")):
+        # Don't report success if credentials are missing (Race condition guard)
+        if not os.path.exists(INSTALL_CREDS_PATH):
+            return {"status": "running", "message": "Finalizing credentials...", "log_type": "setup"}
+        return {"status": "success", "message": "Setup complete"}
+
+    # 3. Fallback to default/memory
     return {"status": "idle", "message": "", "log_type": "setup"}
 
 # Initialize status on startup

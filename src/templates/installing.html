@@ -94,13 +94,21 @@
             }).catch(() => logsEl.innerText += "\n[Reconnecting...]");
         }, 3000);
 
-        function fetchCredentials() {
-            fetch('/api/setup/credentials')
-                .then(res => {
+        // Retry logic for credential fetching
+        function fetchCredentials(retries = 5) {
+            fetch('/api/setup/credentials', { cache: "no-store" })
+                 .then(res => {
+                    if (!res.ok && retries > 0) {
+                        // If file isn't ready yet (404), wait and retry
+                        console.log("Credentials not ready, retrying...");
+                        setTimeout(() => fetchCredentials(retries - 1), 2000);
+                        return null;
+                    }
                     if (!res.ok) throw new Error("Creds not found");
                     return res.json();
                 })
                 .then(data => {
+                    if (!data) return; // Retrying...
                     showSuccess(data);
                     // NOTE: We do NOT cleanup here. We wait for user confirmation.
                 })
