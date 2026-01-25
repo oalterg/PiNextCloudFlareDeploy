@@ -82,7 +82,14 @@
         const poller = setInterval(() => {
             if (finished) return;
 
-            fetch('/api/logs/setup').then(r => r.text()).then(t => {
+            fetch('/api/logs/setup').then(r => {
+                if (r.status === 401) { 
+                    console.log("Session refreshed"); 
+                    location.reload(); return null; 
+                }
+                return r.text();
+            }).then(t => {
+                if (!t) return;
                 logsEl.innerText = t;
                 logsEl.scrollTop = logsEl.scrollHeight;
 
@@ -150,19 +157,21 @@
                         </p>
                         ${data.cloud_enabled ? `
                         <div style="background: rgba(46, 204, 113, 0.05); border: 1px solid #2ecc71; padding: 20px; border-radius: 8px; margin-bottom: 25px;">
-                            <h3 style="margin-top:0; color: #2ecc71; font-size:1.1em;">Activate Remote Access</h3>
+                            <h3 style="margin-top:0; color: #2ecc71; font-size:1.1em;">Activate Remote Access (Required)</h3>
                             <p style="font-size:0.9em; color:#ccc; margin-bottom:15px;">
-                                Create your cloud account to access your device securely from anywhere.
+                                You must register your device to enable remote access and finish setup.
                             </p>
                             <div style="display:flex; gap:10px;">
                                 <input type="email" id="cloud-email" placeholder="Enter your email address" style="padding:12px; border-radius:4px; border:1px solid #444; background:#111; color:#fff; flex-grow:1; outline:none;">
-                                <button onclick="registerCloud()" id="btn-cloud" style="width:auto; padding:10px 25px; font-size:0.9em; margin:0;">Send Invite</button>
+                                <button onclick="registerCloud()" id="btn-cloud" style="width:auto; padding:10px 25px; font-size:0.9em; margin:0;">Activate</button>
                             </div>
                             <p id="cloud-msg" style="margin-bottom:0; font-size:0.85em; margin-top:10px; min-height:1.2em;"></p>
                         </div>` : ''}
-                        <button onclick="confirmAndLogin()">
-                            I have saved my password &rarr; Login
-                        </button>
+                        <div id="login-section" style="${data.cloud_enabled ? 'display:none;' : ''}">
+                            <button onclick="confirmAndLogin()">
+                                I have saved my password &rarr; Login
+                            </button>
+                        </div>
                     </div>
                 </div>
             `;
@@ -193,7 +202,9 @@
                 if (data.status === 'success') {
                     msg.innerText = data.message;
                     msg.style.color = "#2ecc71";
-                    btn.innerText = "Sent";
+                    btn.innerText = "Activated";
+                    // Unlock login button
+                    document.getElementById('login-section').style.display = 'block';
                 } else {
                     msg.innerText = data.error || "Failed to send.";
                     msg.style.color = "#e74c3c";

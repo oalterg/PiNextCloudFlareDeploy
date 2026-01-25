@@ -734,7 +734,11 @@
 
         async function fetchStatus() {
             try {
-                const res = await fetch('/api/status');
+                const res = await fetch('/api/status', { credentials: 'include' });
+                if (!res.ok) {
+                    if (res.status === 401 && !document.hidden) location.reload();
+                    return;
+                }
                 const data = await res.json();
 
                 // Services Status
@@ -768,7 +772,8 @@
 
         async function pollTask() {
             try {
-                const res = await fetch('/api/task_status');
+                const res = await fetch('/api/task_status', { credentials: 'include' });
+                if (!res.ok) return;
                 const data = await res.json();
                 const banner = document.getElementById('global-status');
                 
@@ -852,7 +857,7 @@
         // --- Settings Tab Logic ---
         async function loadSystemConfig() {
             try {
-                const res = await fetch('/api/system/config');
+                const res = await fetch('/api/system/config', { credentials: 'include' });
                 const data = await res.json();
                 
                 const updateBadge = (id, val, activeVal) => {
@@ -898,7 +903,7 @@
 
         async function checkRedisStatus() {
             try {
-                const res = await fetch('/api/redis/status');
+                const res = await fetch('/api/redis/status', { credentials: 'include' });
                 const data = await res.json();
                 const el = document.getElementById('sys-redis-status');
                 const btn = document.getElementById('btn-redis-fix');
@@ -932,7 +937,7 @@
             const el = document.getElementById('ftp-user-list');
             el.innerText = 'Loading...';
             try {
-                const res = await fetch('/api/ftp/users');
+                const res = await fetch('/api/ftp/users', { credentials: 'include' });
                 const users = await res.json();
                 
                 if (users.length === 0) {
@@ -975,12 +980,12 @@
         // --- Zigbee Logic ---
         async function loadSerialDevices() {
             try {
-                const res = await fetch('/api/hardware/serial');
+                const res = await fetch('/api/hardware/serial', { credentials: 'include' });
                 const devices = await res.json();
                 const sel = document.getElementById('zigbee-device');
                 
                 // Save current selection if possible
-                const currentRes = await fetch('/api/manager/zigbee');
+                const currentRes = await fetch('/api/manager/zigbee', { credentials: 'include' });
                 const currentData = await currentRes.json();
                 const activeDev = currentData.current || 'none';
 
@@ -1012,7 +1017,7 @@
             const el = document.getElementById('drive-list');
             el.innerHTML = 'Scanning...';
             try {
-                const res = await fetch('/api/drives');
+                const res = await fetch('/api/drives', { credentials: 'include' });
                 const drives = await res.json();
                 el.innerHTML = '';
                 if (drives.length === 0) el.innerHTML = 'No external drives found.';
@@ -1054,7 +1059,7 @@
 
         async function loadDiskStats() {
             try {
-                const res = await fetch('/api/backup/stats');
+                const res = await fetch('/api/backup/stats', { credentials: 'include' });
                 const d = await res.json();
                 const bar = document.getElementById('disk-bar');
                 const txt = document.getElementById('disk-text');
@@ -1071,7 +1076,7 @@
         }
 
         async function loadBackupConfig() {
-            fetch('/api/backup/config')
+            fetch('/api/backup/config', { credentials: 'include' })
                 .then(res => res.json())
                 .then(d => {
                     d = d || {};  // Handle empty response
@@ -1135,7 +1140,7 @@
 
         async function loadBackups() {
             try {
-                const res = await fetch('/api/backups/list');
+                const res = await fetch('/api/backups/list', { credentials: 'include' });
                 const list = await res.json();
                 const sel = document.getElementById('backup-list');
                 sel.innerHTML = '';
@@ -1162,6 +1167,10 @@
                 const res = await fetch(endpoint, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
                 });
+                if (res.status === 401) {
+                    location.reload();
+                    return;
+                }
                 const data = await res.json();
                 // Fix: Accept both 'started' (async task) and 'success' (immediate/custom) status codes
                 if (data.status === 'started' || data.status === 'success') {
@@ -1171,7 +1180,10 @@
                 } else {
                     alert("Error: " + (data.error || "Unknown"));
                 }
-            } catch (e) { alert("Request failed"); }
+            } catch (e) { 
+                console.error(e);
+                alert("Request failed. Check console for details."); 
+            }
         }
 
         async function toggleMaintenance(mode) {
@@ -1197,7 +1209,7 @@
             doBtn.style.display = "none";
  
             try {
-               const res = await fetch(`/api/manager/check_update?channel=${channel}`);
+               const res = await fetch(`/api/manager/check_update?channel=${channel}`, { credentials: 'include' });
                const data = await res.json();
                pendingUpdateTarget = data.target_ref;
                 
@@ -1245,7 +1257,8 @@
             const statusEl = document.getElementById('log-status');
             statusEl.innerText = "Fetching...";
             try {
-                const res = await fetch('/api/logs/' + currentLogSource);
+                const res = await fetch('/api/logs/' + currentLogSource, { credentials: 'include' });
+                if (!res.ok) return;
                 const txt = await res.text();
                 
                 // Only re-render if data changed

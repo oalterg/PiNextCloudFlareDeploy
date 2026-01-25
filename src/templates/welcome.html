@@ -93,8 +93,12 @@
             document.getElementById('msg').innerText = "Initiating background processes. Please wait...";
 
             fetch('/start_setup', { method: 'POST' })
-                .then(res => res.json())
+                .then(res => {
+                    if (res.status === 401) { location.reload(); return null; }
+                    return res.json();
+                })
                 .then(data => {
+                    if (!data) return;
                     if (data.status === 'started') {
                         document.getElementById('msg').innerText = "Setup started. Redirecting to progress view...";
                         setTimeout(() => window.location.reload(), 2000);
