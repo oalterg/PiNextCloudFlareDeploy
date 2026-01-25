@@ -11,7 +11,7 @@ import logging
 import shlex
 import tempfile
 import requests
-from flask import Flask, render_template, jsonify, request, Response
+from flask import Flask, render_template, jsonify, request, Response, session, abort
 import migration
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -23,6 +23,7 @@ FACTORY_CONFIG = "/boot/firmware/factory_config.txt"
 HOMEBRAIN_ROOT = "/opt/homebrain"
 INSTALL_DIR = HOMEBRAIN_ROOT # Alias for backward compatibility if needed
 SETUP_STARTED_MARKER = f"{INSTALL_DIR}/.setup_started"
+REGISTRATION_MARKER = f"{INSTALL_DIR}/.registration_complete"
 ENV_FILE = f"{INSTALL_DIR}/.env"
 ENV_TEMPLATE = f"{INSTALL_DIR}/config/.env.template"
 COMPOSE_FILE = f"{INSTALL_DIR}/docker-compose.yml"
@@ -55,6 +56,42 @@ LOG_FILES = {
 # --- Logging Configuration (Global & Robust) ---
 # Configure logging immediately so Gunicorn or Dev server both use it
 log_file = LOG_FILES["manager"]
+
+# --- Security: Factory Auth ---
+SECRET_KEY_FILE = f"{INSTALL_DIR}/.secret_key"
+
+def load_persistent_secret_key():
+    """Ensures sessions remain valid across service restarts."""
+    try:
+        if os.path.exists(SECRET_KEY_FILE):
+            with open(SECRET_KEY_FILE, 'rb') as f:
+                key = f.read()
+                if len(key) >= 32: return key # Valid key found
+    except Exception as e:
+        logging.error(f"Error reading secret key: {e}")
+    
+    # Generate new key if missing or corrupt
+    try:
+        key = secrets.token_bytes(32)
+        with open(SECRET_KEY_FILE, 'wb') as f:
+            f.write(key)
+        os.chmod(SECRET_KEY_FILE, 0o600)
+        return key
+    except Exception as e:
+        logging.error(f"Could not persist secret key: {e}. Sessions will be ephemeral.")
+        return secrets.token_bytes(32)
+
+app.secret_key = load_persistent_secret_key()
+
+def get_factory_password():
+    """Reads the factory password securely from config."""
+    try:
+        with open(FACTORY_CONFIG, 'r') as f:
+            for line in f:
+                if line.startswith("FACTORY_PASSWORD="):
+                    return line.strip().split("=", 1)[1]
+    except: pass
+    return None
 
 # 1. Define Filter to suppress noisy polling logs
 class AccessLogFilter(logging.Filter):
@@ -129,51 +166,91 @@ def get_task_status():
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["200 per minute"], # Generous default for dashboard polling
+    default_limits=["1000 per minute"], # High limit to prevent dashboard polling blocks
     storage_uri="memory://"
 )
 
-# --- Authentication Helpers ---
-def check_factory_auth(password):
-    """Checks against the sticker password for initial claiming."""
-    factory = get_factory_config()
-    return password == factory.get("FACTORY_PASSWORD", "homebrain")
 
-def check_auth(username, password):
-    # Standard Admin Auth
-    env_pass = get_env_config().get('MANAGER_PASSWORD')
-    if env_pass:
-        return username == 'admin' and password == env_pass
-    return False
-
-def authenticate(realm="HomeBrain Manager"):
-    return Response(
-        'Access Denied.', 401,
-        {'WWW-Authenticate': f'Basic realm="{realm}"'})
-
+# --- Security: Split-Horizon Auth Middleware ---
 @app.before_request
-def auth_gate():
-    # 1. Static and Specific API Whitelist
-    if request.endpoint == 'static':
+def security_middleware():
+    # 1. Static Resources & Public API Whitelist
+    if request.endpoint == 'static' or request.path == '/favicon.ico':
         return
-    if request.path == '/favicon.ico':
+    # All public APIs that must work without session (setup + dashboard polling)
+    public_api_paths = [
+        '/api/setup/credentials',
+        '/api/setup/cleanup_credentials',
+        '/api/task_status',
+        '/api/status',
+        '/api/logs/',
+        '/api/logs/client',
+        '/api/cloud/register'
+    ]
+    if any(request.path.startswith(p) for p in public_api_paths):        
         return
-        
-    # Whitelist by path to avoid endpoint resolution issues
-    if request.path.startswith('/api/logs/') or request.path in ['/api/setup/credentials', '/api/setup/cleanup_credentials', '/api/task_status']:
+    # Allow cloud registration during the handover phase (when creds are waiting to be claimed)
+    if request.path == '/api/cloud/register' and os.path.exists(INSTALL_CREDS_PATH):
         return
 
-    # 2. First Time Setup (Welcome Screen)
+    # 2. Setup Phase: Protect with Factory Password (Basic Auth for API calls during setup)
     if not is_setup_complete():
-        auth = request.authorization
-        if not auth or not check_factory_auth(auth.password):
-            return authenticate(realm="Enter Factory Password (Label on Device)")
+        # Allow installing screen + logs/status during setup
+        if is_setup_started() and (request.path == '/' or request.path.startswith('/api/logs/')):
+            return
+        if request.path in ['/start_setup', '/api/logs/setup']:
+            return
+
+        # Allow login handler
+        if request.path == '/login':
+            return
+
+        # For the initial Welcome Screen, we now Require Auth immediately.
+        # This unifies the UX: You must login with Factory Password to see the Welcome Screen.
+        if session.get('authenticated'):
+            return
+        
+        # Allow Login Handler
+        if request.path == '/login':
+            return
+            
+        # If not authenticated, fall through to 401 (Login Gate)
+        abort(401)
+
+    # 3. Post-Setup: Unified Authentication
+    # We enforce the session check for ALL traffic (Local & Tunnel).
+    # This prevents unauthorized IdP users from accessing the manager.
+    if session.get('authenticated'):
         return
 
-    # 3. Post-Setup Locked Mode
-    auth = request.authorization
-    if not auth or not check_auth(auth.username, auth.password):
-        return authenticate(realm="HomeBrain Admin Login")
+    # Allow Login Handler
+    if request.path == '/login':
+        return
+
+    # 4. Default: Block & Show Login Gate
+    abort(401)
+
+@app.route('/login', methods=['POST'])
+@limiter.limit("5 per minute") 
+def login():
+    password = request.form.get('password')
+    # Determine which password to enforce based on state
+    if is_setup_complete():
+        # Post-Setup: Secure Generated Master Password
+        env = get_env_config()
+        target_pass = env.get('MANAGER_PASSWORD')
+    else:
+        # Pre-Setup: Factory Sticker Password
+        target_pass = get_factory_password()
+
+    if target_pass and password == target_pass:
+        session['authenticated'] = True
+        session.permanent = True  # Keep session active across browser restarts
+        return jsonify({"status": "success", "redirect": "/"})
+    
+    time.sleep(2) # Mitigation against timing attacks
+    return jsonify({"error": "Invalid Password"}), 401
+
 
 @app.route("/api/setup/credentials")
 def get_one_time_credentials():
@@ -194,8 +271,17 @@ def get_one_time_credentials():
 @app.route("/api/setup/cleanup_credentials", methods=["POST"])
 def cleanup_credentials():
     """Called by the frontend after successfully rendering the success page."""
+    
+    # 1. Enforcement: Check if Registration is required but missing
+    factory_conf = get_factory_config()
+    if factory_conf.get("REGISTRAR_URL") and not os.path.exists(REGISTRATION_MARKER):
+         return jsonify({"error": "Mandatory email registration not completed."}), 403
+
+    # 2. Cleanup
     if os.path.exists(INSTALL_CREDS_PATH):
         os.remove(INSTALL_CREDS_PATH)
+    if os.path.exists(REGISTRATION_MARKER):
+        os.remove(REGISTRATION_MARKER)
         # Now, start the remaining profile tunnel containers
         subprocess.run(["chmod", "+x", SCRIPT_UTILITIES])
         cmd = f"bash {SCRIPT_UTILITIES} activate_tunnels >> {LOG_FILES['setup']} 2>&1"
@@ -428,6 +514,9 @@ def register_cloud():
             timeout=10
         )
         if r.status_code in [200, 201]:
+            # Mark registration as complete
+            with open(REGISTRATION_MARKER, 'w') as f:
+                f.write(str(int(time.time())))
             return jsonify({"status": "success", "message": "Invitation sent! Check your email."})
         else:
             # Attempt to parse specific error from Worker JSON
@@ -519,7 +608,7 @@ def mount_drive():
 @app.route("/")
 def index():
     if not is_setup_complete():
-        # Check dedicated marker file instead of log existence
+        # If setup is running, show progress (No auth required for this specific view state)
         if is_setup_started():
             return render_template("installing.html")
         return render_template("welcome.html", config=get_factory_config())
@@ -1504,3 +1593,34 @@ if __name__ == "__main__":
 
     # For local dev only; in production, use Gunicorn
     # app.run(host="0.0.0.0", port=80, debug=True)  # Keep debug=True for dev, but remove in prod    
+
+# --- Template Injection: Login Gate ---
+# We inject the login page dynamically to avoid file dependencies for this critical security feature
+from flask import render_template_string
+@app.errorhandler(401)
+def custom_401(e):
+    # Dynamic Title based on state
+    title = "🔐 Master Access" if is_setup_complete() else "🔐 Factory Access"
+    hint = "Enter your Master Admin Password." if is_setup_complete() else "Enter the Factory Password found on your device label."
+
+    resp = Response(render_template_string("""
+    <!DOCTYPE html>
+    <html><head><title>HomeBrain Access</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+    <style>body{max-width:400px;margin:10% auto;text-align:center;background:#121212;color:#eee}</style>
+    </head><body>
+    <h2>{{ title }}</h2>
+    <p>{{ hint }}</p>
+    <form onsubmit="event.preventDefault(); fetch('/login', {method:'POST', body: new FormData(this)})
+    .then(r=>r.json()).then(d=>{if(d.status=='success')location.reload();else alert(d.error)})">
+    <input type="password" name="password" placeholder="Password" required autofocus style="margin-bottom:15px; width:100%; padding:10px;">
+    <button type="submit" style="width:100%;">Unlock Manager</button>
+    </form>
+    </body></html>
+    """, title=title, hint=hint), 401)
+    
+    # Prevent browser caching of the login gate
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
