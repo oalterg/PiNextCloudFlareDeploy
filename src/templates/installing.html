@@ -78,7 +78,7 @@
     <script>
         let finished = false;
         const logsEl = document.getElementById('logs');
-
+        const handoverReady = {{ handover_ready|default('false')|lower }};
         const poller = setInterval(() => {
             if (finished) return;
 
@@ -124,10 +124,18 @@
                     document.body.innerHTML = `
                         <div class="logo">Home<span>Brain</span></div>
                         <h1>Installation Finished</h1>
-                        <p>Credentials were generated but could not be retrieved automatically.</p>
+                        <p><p>System is ready, but credentials could not be loaded.</p>
                         <button onclick="location.reload()">Go to Login</button>
                     `;
                 });
+        }
+
+        // If the backend tells us the handover is ready (e.g. after a reboot),
+        // skip log polling and fetch credentials immediately.
+        if (handoverReady) {
+            finished = true;
+            logsEl.innerText = "Resuming session... Retrieving credentials...";
+            fetchCredentials();
         }
 
         function showSuccess(data) {

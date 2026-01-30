@@ -585,6 +585,12 @@ def mount_drive():
 # --- Routes: Main UI ---
 @app.route("/")
 def index():
+    # Robustness: If credentials exist, we are in the "Handover Phase".
+    # We MUST show the installing/success view so the user can claim them,
+    # even if the setup is marked as complete.
+    if os.path.exists(INSTALL_CREDS_PATH):
+        return render_template("installing.html", handover_ready=True)
+
     if not is_setup_complete():
         # If setup is running, show progress (No auth required for this specific view state)
         if is_setup_started():
@@ -1606,3 +1612,41 @@ def custom_401(e):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     resp.headers["Pragma"] = "no-cache"
     return resp
+
+# --- Robustness: Auto-Resume Setup on Restart ---
+def resume_incomplete_setup():
+    """Checks if setup was interrupted (e.g. by reboot) and resumes it automatically."""
+    try:
+        # Simple lock to prevent multiple workers from triggering resume
+        resume_lock = os.path.join(tempfile.gettempdir(), "homebrain_resume.lock")
+        if os.path.exists(resume_lock):
+            return
+
+        if is_setup_started() and not is_setup_complete():
+            # Claim lock (cleared on reboot naturally via tmp)
+            with open(resume_lock, 'w') as f: f.write("locked")
+            
+            logging.info("Detected interrupted setup state.")
+            
+            # Robustness: If credentials don't exist, setup failed too early to resume safely.
+            # We reset the state so the user is redirected to Welcome screen to try again.
+            if not os.path.exists(INSTALL_CREDS_PATH):
+                logging.warning("Credentials missing. Resetting setup state to allow retry.")
+                try: os.remove(SETUP_STARTED_MARKER)
+                except: pass
+                return
+
+            logging.info("Resuming deployment script...")
+            # Announce resume in logs for the UI +            
+            try:
+                with open(LOG_FILES['setup'], "a") as f:
+                    f.write(f"\n\n{'='*40}\n SYSTEM RESTART DETECTED: Resuming Installation... \n{'='*40}\n\n")
+            except: pass
+            
+            cmd = f"bash {SCRIPT_DEPLOY} >> {LOG_FILES['setup']} 2>&1"
+            threading.Thread(target=run_background_task, args=("Resumed Setup", cmd, "setup")).start()
+    except Exception as e:
+        logging.error(f"Failed to resume setup: {e}")
+
+# Start resume check in background on app load
+threading.Thread(target=resume_incomplete_setup, daemon=True).start()
